@@ -1644,7 +1644,8 @@ impl TranslationCache {
     }
 
     /// A drained code write `[lo, hi)` lying inside a live instruction field
-    /// (xj-to9.46), from `Vm::handle_smc`'s recording drain. Every private
+    /// (xj-to9.46), from `Vm::handle_smc`'s recording drain or from its store site
+    /// (`live::absorb_at_store`, xj-to9.48). Every private
     /// proof over those bytes reads them when it executes (`vm/legacy/live.rs`),
     /// so if no shared unit or pending shared source covers them either, the
     /// write advances only the shared publication generation, cancelling

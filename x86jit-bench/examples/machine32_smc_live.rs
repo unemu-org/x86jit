@@ -6,7 +6,8 @@
 //! Nineteen small blocks share one 4 KiB code page at CPL 0. One block's
 //! first instruction is patched every seven iterations (about 430 retired
 //! instructions) by a store on the same page, as a renderer that patches its
-//! own inner loop does, and the loop keeps executing:
+//! own inner loop does (MACHINE32_SMC_PERIOD sets the iterations per
+//! patch), and the loop keeps executing:
 //! * imm: `MOV EAX, imm32`; a 4-byte `ADD [imm], 1` changes the immediate.
 //! * disp: `MOV EAX, [disp32]`; a 4-byte `XOR [disp], A^B` switches the
 //!   displacement between two data words.
@@ -15,6 +16,8 @@
 //! * many: 304 `MOV EAX, imm32; ADD EBX, EAX` pairs in one page, 8 of whose
 //!   immediates a loop of `ADD [ESI], 1` patches per iteration, round robin:
 //!   more patched fields than the engine keeps live, so most relift.
+//! * data (control): imm's loop, but the 4-byte `ADD [data], 1` writes a
+//!   data word on another page: the cost of the same store off code pages.
 //!
 //! Paths: flat (unpaged Flat32), seg (CS.D=1, 64 KiB segments based at the
 //! code page: Segmented), paged (Flat32 with identity paging). The guest
@@ -48,7 +51,7 @@ fn instructions() -> u64 {
 }
 
 const PATHS: [&str; 3] = ["flat", "seg", "paged"];
-const WORKS: [&str; 4] = ["imm", "disp", "opcode", "many"];
+const WORKS: [&str; 5] = ["imm", "disp", "opcode", "many", "data"];
 /// The many workload's patched fields: more than the engine keeps live.
 const FIELDS: u32 = 304;
 const GROUP: u32 = 8;
@@ -58,9 +61,16 @@ const DATA_A: u32 = CODE as u32 + 0x4000;
 const DATA_B: u32 = CODE as u32 + 0x4010;
 const WORD_A: u32 = 0x1357_9bdf;
 const WORD_B: u32 = 0x0246_8ace;
+// The data workload's counter, on the data words' page.
+const DATA_C: u32 = CODE as u32 + 0x4020;
+const IMM: u32 = 0x1111_1111;
 const BLOCKS: u32 = 19;
 const PATCHED: u32 = 9;
-const PERIOD: u32 = 7;
+/// Iterations per patch: MACHINE32_SMC_PERIOD, default 7.
+fn period() -> u32 {
+    static PERIOD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| std::env::var("MACHINE32_SMC_PERIOD").map_or(7, |s| s.parse().unwrap()))
+}
 const MEMORY: u64 = 0x20000;
 
 fn constant(i: u32) -> u32 {
@@ -80,11 +90,11 @@ fn code(work: &str, org: u64, data: u32) -> (Vec<u8>, u64) {
         let mut next = a.create_label();
         if i == PATCHED {
             match work {
-                "imm" => {
+                "imm" | "data" => {
                     // MOV EAX, imm32 (B8 id): the immediate is one byte in.
                     a.db(&[0xb8]).unwrap();
                     a.set_label(&mut field).unwrap();
-                    a.dd(&[0x1111_1111]).unwrap();
+                    a.dd(&[IMM]).unwrap();
                 }
                 "disp" => {
                     // MOV EAX, [disp32] (8B 05 disp32): two bytes in.
@@ -111,10 +121,10 @@ fn code(work: &str, org: u64, data: u32) -> (Vec<u8>, u64) {
     a.je(done).unwrap();
     a.dec(ecx).unwrap();
     a.jne(top).unwrap();
-    a.mov(ecx, PERIOD).unwrap();
+    a.mov(ecx, period()).unwrap();
     // The field's address is fixed below, after assembly.
     match work {
-        "imm" => a.add(dword_ptr(0x7fff_fff0), 1).unwrap(),
+        "imm" | "data" => a.add(dword_ptr(0x7fff_fff0), 1).unwrap(),
         "disp" => a
             .xor(dword_ptr(0x7fff_fff0), (DATA_A ^ DATA_B) as i32)
             .unwrap(),
@@ -129,7 +139,11 @@ fn code(work: &str, org: u64, data: u32) -> (Vec<u8>, u64) {
             iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
         )
         .unwrap();
-    let field = result.label_ip(&field).unwrap() - u64::from(work == "opcode");
+    let mut field = result.label_ip(&field).unwrap() - u64::from(work == "opcode");
+    if work == "data" {
+        // The counter's address as the code names it, from the segment base.
+        field = org + u64::from(DATA_C) - CODE;
+    }
     let mut bytes = result.inner.code_buffer;
     let marker = 0x7fff_fff0u32.to_le_bytes();
     let at = bytes.windows(4).position(|w| w == marker).unwrap();
@@ -223,13 +237,14 @@ fn model(work: &str, n: u64, field: u32, data: u32) -> Model {
         field,
         retired: 0,
     };
-    let mut ecx = PERIOD;
+    let mut ecx = period();
     let mut edi = n;
     loop {
         for i in 0..BLOCKS {
             if i == PATCHED {
                 match work {
                     "imm" => m.eax = m.field,
+                    "data" => m.eax = IMM,
                     "disp" => {
                         m.eax = if m.field.wrapping_add(data) == DATA_A {
                             WORD_A
@@ -256,9 +271,9 @@ fn model(work: &str, n: u64, field: u32, data: u32) -> Model {
         ecx -= 1;
         m.retired += 2;
         if ecx == 0 {
-            ecx = PERIOD;
+            ecx = period();
             m.field = match work {
-                "imm" => m.field.wrapping_add(1),
+                "imm" | "data" => m.field.wrapping_add(1),
                 "disp" => m.field ^ DATA_A ^ DATA_B,
                 _ => m.field ^ 8,
             };
@@ -330,7 +345,7 @@ fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, work: &str, field_at: u64, n: u
     for reg in [Reg::Rax, Reg::Rbx, Reg::Rdx] {
         cpu.set_reg(reg, 0);
     }
-    cpu.set_reg(Reg::Rcx, u64::from(PERIOD));
+    cpu.set_reg(Reg::Rcx, u64::from(period()));
     cpu.set_reg(Reg::Rdi, n);
     cpu.set_reg(Reg::Rsp, 0x8000);
     let exit = cpu.run(vm, None);

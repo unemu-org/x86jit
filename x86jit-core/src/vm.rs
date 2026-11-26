@@ -18,6 +18,7 @@ use crate::jit_abi::{
 pub(crate) mod device;
 mod i8086;
 mod legacy;
+pub(crate) use legacy::live::absorb_at_store;
 pub(crate) use legacy::paging_generation;
 mod nec;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
@@ -1708,7 +1709,7 @@ impl Vm {
             if RECORD
                 && self.live_fields.armed()
                 && self.mem.fetch_policy.is_none()
-                && self.live_fields.absorb(&self.cache, lo, hi)
+                && self.live_fields.absorb(&self.cache, &self.mem, lo, hi)
             {
                 continue;
             }

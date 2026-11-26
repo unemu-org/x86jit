@@ -28,12 +28,20 @@
 //!   crosses the field, is not absorbed and invalidates as before; the field
 //!   returns to normal and needs `THRESHOLD` further patches to become live.
 //!   Live proofs stay exact after a demotion, so a demotion drops nothing.
+//! * A store made during a Machine run (`StoreSite`) that would be absorbed
+//!   is absorbed where it is made (`absorb_at_store`, xj-to9.48), under the
+//!   same locks and with the same effect, so it queues no notice for any
+//!   vCPU's dispatcher and needs no drain. A store into a page with a
+//!   declared code alias, or made outside such a run, is queued and drained
+//!   as before.
 //!
 //! A live field is read once per execution of its instruction, before that
 //! instruction's own stores (the eligible MOV, LEA and ALU forms read their
 //! operands first), so it sees the bytes a relift after every earlier store
 //! would decode. A store by an earlier instruction of the same block still
-//! ends the walk (SDM Vol 3A §14.6 p. 14-18; `RunningMemory::overlap`). A
+//! ends an unpaged walk (SDM Vol 3A §14.6 p. 14-18; `RunningMemory::overlap`);
+//! a paged walk ends at the notice of a queued store, and goes on after one
+//! absorbed at its store site, whose field the later instruction reads. A
 //! store by another vCPU is seen at the patched instruction's next execution
 //! rather than at this vCPU's next block boundary. SDM Vol 3A §11.1.3
 //! pp. 11-5–11-6 makes cross-modifying code without its synchronization
@@ -67,9 +75,85 @@ pub(crate) struct LiveFields {
     armed: AtomicBool,
     /// Set by the first counted write; until then lifts take the plain path.
     active: AtomicBool,
+    /// Whether a field is live: only then can a store be absorbed. Kept with
+    /// the memory's `Memory::live_store_site` under the table lock
+    /// (`LiveFields::sync`), and cleared when the last field leaves.
+    promoted: AtomicBool,
     /// The reference for the witnesses: every write relifts, as before.
     #[cfg(test)]
     disabled: AtomicBool,
+    /// The reference for the store-site witnesses: absorbed writes are
+    /// queued and drained, as before xj-to9.48.
+    #[cfg(test)]
+    drained: AtomicBool,
+}
+
+// The VM of this thread's Machine run that may absorb a store at its store
+// site (`StoreSite`). A small code write into a memory whose VM holds no live
+// field (`Memory::live_store_site`) returns before looking it up.
+std::thread_local! {
+    static STORE_SITE: std::cell::Cell<*const crate::Vm> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// A Machine run's scope in which a store wholly inside a live field is
+/// absorbed where it is made (`absorb_at_store`, xj-to9.48), instead of being
+/// queued for the dispatcher's drain. It borrows the VM for the scope, so the
+/// pointer it publishes stays valid until it drops.
+pub(crate) struct StoreSite<'a> {
+    previous: *const crate::Vm,
+    _vm: std::marker::PhantomData<&'a crate::Vm>,
+}
+
+impl<'a> StoreSite<'a> {
+    /// While a field is live: otherwise no store can be absorbed, and the
+    /// run keeps the queued path.
+    #[inline(always)]
+    pub(crate) fn enter(vm: &'a crate::Vm) -> Option<Self> {
+        vm.live_fields
+            .promoted
+            .load(Ordering::Relaxed)
+            .then(|| Self::publish(vm))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn publish(vm: &'a crate::Vm) -> Self {
+        Self {
+            previous: STORE_SITE.with(|site| site.replace(vm)),
+            _vm: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for StoreSite<'_> {
+    fn drop(&mut self) {
+        STORE_SITE.with(|site| site.set(self.previous));
+    }
+}
+
+/// A code write `[lo, hi)` of at most four bytes into one page of `memory`
+/// that no declared code alias shares, from `Memory::note_code_write`.
+/// Returns whether this thread's `StoreSite` run absorbed it: it lies wholly
+/// inside a live field and no shared translation covers it
+/// (`LiveFields::absorb_store`), so the write needs no notice, drain or
+/// relift, and every vCPU reads the new bytes when it next executes the
+/// field's instruction. Otherwise the caller queues it as before, and the
+/// drain decides as it always did (`LiveFields::absorb`).
+#[cold]
+#[inline(never)]
+pub(crate) fn absorb_at_store(memory: &crate::Memory, lo: u64, hi: u64) -> bool {
+    let vm = STORE_SITE.with(std::cell::Cell::get);
+    if vm.is_null() {
+        return false;
+    }
+    // SAFETY: a `StoreSite` publishes the pointer while it borrows the VM
+    // and restores the previous one when it drops, on this thread only.
+    let vm = unsafe { &*vm };
+    // Fetch approvals are page-wide: a fetch policy never absorbs (`handle_smc`).
+    std::ptr::eq(&vm.mem, memory)
+        && vm.mem.fetch_policy.is_none()
+        && vm.live_fields.absorb_store(&vm.cache, &vm.mem, lo, hi)
 }
 
 #[derive(Default)]
@@ -78,6 +162,9 @@ struct Table {
     writes: BTreeMap<u64, (u64, u32)>,
     /// Live fields by first bus byte.
     live: BTreeMap<u64, Field>,
+    /// The longest instruction a live field has belonged to: a field whose
+    /// instruction a write changes starts less than this before or after it.
+    reach: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,31 +216,28 @@ impl LiveFields {
     /// invalidation.
     #[cold]
     #[inline(never)]
-    pub(crate) fn absorb(&self, cache: &TranslationCache, lo: u64, hi: u64) -> bool {
+    pub(crate) fn absorb(
+        &self,
+        cache: &TranslationCache,
+        memory: &crate::Memory,
+        lo: u64,
+        hi: u64,
+    ) -> bool {
         #[cfg(test)]
         if self.disabled.load(Ordering::Relaxed) {
             return false;
         }
         if hi <= lo || hi - lo > MAX_WRITE {
             if self.active.load(Ordering::Relaxed) {
-                self.demote_overlapping(lo, hi);
+                self.demote_overlapping(memory, lo, hi);
             }
             return false;
         }
         self.active.store(true, Ordering::Relaxed);
         let mut table = self.table.lock().unwrap();
-        let containing = table
-            .live
-            .range(..hi)
-            .next_back()
-            .filter(|(&start, field)| start <= lo && hi <= field.end)
-            .map(|(_, field)| field.instruction);
-        // Fields of other instructions this write changes return to normal.
-        table.live.retain(|_, field| {
-            Some(field.instruction) == containing
-                || !(lo < field.instruction.1 && hi > field.instruction.0)
-        });
-        if containing.is_some() {
+        let settled = table.settle(lo, hi);
+        self.sync(&table, memory);
+        if settled.is_some() {
             if cache.absorb_written(lo, hi) {
                 return true;
             }
@@ -173,13 +257,58 @@ impl LiveFields {
         false
     }
 
+    /// `absorb` at the store site (`absorb_at_store`, xj-to9.48): a write
+    /// `[lo, hi)` of at most four bytes that lies wholly inside a live field
+    /// and that no shared translation covers is absorbed, under the same
+    /// locks and with the same effect as the drain's. Any other write is
+    /// left to the drain, which counts it and demotes what it changes; a
+    /// refused write may still have demoted the fields of other instructions
+    /// it changes, which the drain would do first in any case.
     #[cold]
-    fn demote_overlapping(&self, lo: u64, hi: u64) {
-        self.table
-            .lock()
-            .unwrap()
+    #[inline(never)]
+    pub(crate) fn absorb_store(
+        &self,
+        cache: &TranslationCache,
+        memory: &crate::Memory,
+        lo: u64,
+        hi: u64,
+    ) -> bool {
+        #[cfg(test)]
+        if self.disabled.load(Ordering::Relaxed) || self.drained.load(Ordering::Relaxed) {
+            return false;
+        }
+        if hi <= lo || hi - lo > MAX_WRITE || !self.promoted.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Under the table lock, as in `absorb`: a field is absorbed only once
+        // its promotion is committed (`commit`).
+        let mut table = self.table.lock().unwrap();
+        let settled = table.settle(lo, hi);
+        self.sync(&table, memory);
+        settled.is_some() && cache.absorb_written(lo, hi)
+    }
+
+    #[cold]
+    fn demote_overlapping(&self, memory: &crate::Memory, lo: u64, hi: u64) {
+        let mut table = self.table.lock().unwrap();
+        table
             .live
             .retain(|_, field| !(lo < field.instruction.1 && hi.max(lo + 1) > field.instruction.0));
+        self.sync(&table, memory);
+    }
+
+    /// Under the table lock: whether a field is live, for `StoreSite` and
+    /// for the memory's store path (`Memory::live_store_site`), which then
+    /// skip the store-site absorb altogether once the last field has left.
+    #[inline(always)]
+    fn sync(&self, table: &Table, memory: &crate::Memory) {
+        let live = !table.live.is_empty();
+        if self.promoted.load(Ordering::Relaxed) != live {
+            self.promoted.store(live, Ordering::Relaxed);
+        }
+        if memory.live_store_site.load(Ordering::Relaxed) != live {
+            memory.live_store_site.store(live, Ordering::Relaxed);
+        }
     }
 
     /// Lift the instruction `code` at `ip`, reading its immediate or
@@ -405,6 +534,7 @@ impl LiveFields {
             }
             if table.live.len() < MAX_LIVE || table.live.contains_key(&start) {
                 table.clear_writes(start, field.end);
+                table.reach = table.reach.max(field.instruction.1 - field.instruction.0);
                 table.live.insert(start, field);
             } else {
                 // A table of live code promotes nothing more: those fields
@@ -415,18 +545,52 @@ impl LiveFields {
             }
             cache.advance_for_promotion(field.instruction.0, field.instruction.1);
         }
+        self.sync(&table, memory);
         drop(table);
         plan.demote.is_empty() && !promoted
     }
 }
 
 impl Table {
+    /// The instruction of the live field that holds all of `[lo, hi)`, if
+    /// any; the fields of other instructions the write changes return to
+    /// normal.
+    fn settle(&mut self, lo: u64, hi: u64) -> Option<(u64, u64)> {
+        let containing = self
+            .live
+            .range(..hi)
+            .next_back()
+            .filter(|(&start, field)| start <= lo && hi <= field.end)
+            .map(|(_, field)| field.instruction);
+        // A field lies inside its instruction, at most `reach` bytes long.
+        let changed: Vec<u64> = self
+            .live
+            .range(lo.saturating_sub(self.reach)..hi.saturating_add(self.reach))
+            .filter(|(_, field)| {
+                Some(field.instruction) != containing
+                    && lo < field.instruction.1
+                    && hi > field.instruction.0
+            })
+            .map(|(&start, _)| start)
+            .collect();
+        for start in changed {
+            self.live.remove(&start);
+        }
+        containing
+    }
+
     fn clear_writes(&mut self, start: u64, end: u64) {
         let inside: Vec<_> = self.writes.range(start..end).map(|(&k, _)| k).collect();
         for key in inside {
             self.writes.remove(&key);
         }
     }
+}
+
+/// This thread's published `StoreSite` VM, for the witnesses.
+#[cfg(test)]
+fn store_site_for_test() -> *const crate::Vm {
+    STORE_SITE.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1270,6 +1434,281 @@ mod tests {
                 patch(&vm, &mut a, CODE + 0x200, 9);
                 assert_eq!(run(&vm, &mut b, CODE + 3) & 0xff, 9, "{model:?} {class:?}");
                 assert_eq!(run(&vm, &mut a, CODE), 0x09b0_0002);
+            }
+        }
+    }
+
+    #[test]
+    fn a_store_site_absorb_queues_no_notice() {
+        // xj-to9.48: in a Machine run's `StoreSite` scope, a store wholly
+        // inside a live field is absorbed where it is made: nothing is queued
+        // for a drain, no vCPU relifts, and both read the new bytes at their
+        // next execution of the instruction. Queued (`drained`), the same
+        // store leaves its notice and has the same effect.
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            for class in [Class::Flat32, Class::Segmented, Class::Paged] {
+                for drained in [false, true] {
+                    let what = format!("{model:?} {class:?} drained {drained}");
+                    let (vm, mut cpu) = machine(model, class, true, MEMORY);
+                    vm.live_fields.drained.store(drained, Ordering::Relaxed);
+                    target(&vm, CODE, 0);
+                    patcher(&vm, CODE + 0x100, CODE + 1);
+                    for value in 1..=3 {
+                        patch(&vm, &mut cpu, CODE + 0x100, value);
+                        assert_eq!(run(&vm, &mut cpu, CODE), value, "{what}");
+                    }
+                    let mut other = vm.new_vcpu();
+                    other.cpu = cpu.cpu.clone();
+                    assert_eq!(run(&vm, &mut other, CODE), 3, "{what}");
+                    for value in 4..=6 {
+                        let lifted = (lifts(&cpu), lifts(&other));
+                        {
+                            let _site = super::StoreSite::enter(&vm).unwrap();
+                            vm.mem.write(CODE + 1, u64::from(value), 4).unwrap();
+                        }
+                        assert_eq!(vm.mem.has_dirty_code(), drained, "{what}");
+                        assert_eq!(run(&vm, &mut cpu, CODE), value, "{what}");
+                        assert_eq!(run(&vm, &mut other, CODE), value, "{what}");
+                        assert_eq!((lifts(&cpu), lifts(&other)), lifted, "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A real-mode vCPU of `vm` at `CS:0`; runs to HLT and returns AX.
+    fn real_ax(vm: &Vm, real: &mut Vcpu) -> u32 {
+        run(vm, real, 0) & 0xffff
+    }
+
+    fn real_vcpu(vm: &Vm, cs: u16) -> Vcpu {
+        let mut real = vm.new_vcpu();
+        let entry = crate::CpuState::legacy_real_entry([cs; 6]);
+        real.cpu.legacy = entry.legacy;
+        (real.cpu.cs, real.cpu.ds, real.cpu.es) = (cs, cs, cs);
+        (real.cpu.ss, real.cpu.fs, real.cpu.gs) = (cs, cs, cs);
+        real
+    }
+
+    #[test]
+    fn a_store_site_patch_under_a_shared_translation_invalidates_it() {
+        // xj-to9.48: a real-mode vCPU runs the field's bytes through a shared
+        // translation (MOV AX, imm16; NOP; NOP; HLT), which bakes them. A
+        // patch inside the live field is not absorbed at its store site
+        // (`TranslationCache::absorb_written`), so the shared copy drops.
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            let (vm, mut cpu) = machine(model, Class::Flat32, true, MEMORY);
+            target(&vm, CODE, 0x9090_0000);
+            patcher(&vm, CODE + 0x100, CODE + 1);
+            for value in 1..=3 {
+                patch(&vm, &mut cpu, CODE + 0x100, 0x9090_0000 | value);
+                assert_eq!(run(&vm, &mut cpu, CODE), 0x9090_0000 | value);
+            }
+            assert_eq!(vm.live_fields.live_for_test(), 1);
+            let mut real = real_vcpu(&vm, (CODE >> 4) as u16);
+            assert_eq!(real_ax(&vm, &mut real), 3);
+            for value in 4..=6 {
+                patch(&vm, &mut cpu, CODE + 0x100, 0x9090_0000 | value);
+                assert_eq!(real_ax(&vm, &mut real), value, "{model:?}");
+                assert_eq!(run(&vm, &mut cpu, CODE), 0x9090_0000 | value);
+            }
+        }
+    }
+
+    #[test]
+    fn a_store_site_patch_reaches_a_declared_code_alias() {
+        // xj-to9.48: with a code alias declared on the field's page, a patch
+        // is queued with its alias range, which drops the proof another vCPU
+        // made of the alias view. Its lift baked the field: no write had
+        // reached the alias before the declaration.
+        const ALIAS: u64 = CODE + 0x2000;
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            let (vm, mut cpu) = machine(model, Class::Flat32, true, MEMORY);
+            target(&vm, CODE, 0);
+            target(&vm, ALIAS, 0);
+            patcher(&vm, CODE + 0x3000, CODE + 1);
+            for value in 1..=3 {
+                patch(&vm, &mut cpu, CODE + 0x3000, value);
+                assert_eq!(run(&vm, &mut cpu, CODE), value);
+            }
+            assert_eq!(vm.live_fields.live_for_test(), 1);
+            let mut view = vm.new_vcpu();
+            view.cpu = cpu.cpu.clone();
+            assert_eq!(run(&vm, &mut view, ALIAS), 0);
+            vm.mem.declare_code_alias(CODE, ALIAS, 0x1000).unwrap();
+            // After two writes reach it, the alias view's field reads live too.
+            for value in 4..=5 {
+                let lifted = lifts(&view);
+                patch(&vm, &mut cpu, CODE + 0x3000, value);
+                assert_eq!(run(&vm, &mut cpu, CODE), value);
+                // The backing does not alias: the view keeps its bytes.
+                assert_eq!(run(&vm, &mut view, ALIAS), 0);
+                assert!(lifts(&view) > lifted, "{model:?} {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_store_site_patch_revokes_a_fetch_approval() {
+        // xj-to9.48: a fetch policy's approvals are page-wide, so no patch is
+        // absorbed at its store site once one is set: the next fetch from the
+        // written page asks the policy again.
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            let (mut vm, mut cpu) = machine(model, Class::Flat32, true, MEMORY);
+            target(&vm, CODE, 0);
+            patcher(&vm, CODE + 0x3000, CODE + 1);
+            for value in 1..=3 {
+                patch(&vm, &mut cpu, CODE + 0x3000, value);
+                assert_eq!(run(&vm, &mut cpu, CODE), value);
+            }
+            assert_eq!(vm.live_fields.live_for_test(), 1);
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let count = asked.clone();
+            vm.set_fetch_policy(Box::new(move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+                crate::FetchVerdict::Allow
+            }));
+            assert_eq!(run(&vm, &mut cpu, CODE), 3);
+            for value in 4..=6 {
+                patch(&vm, &mut cpu, CODE + 0x3000, value);
+                let before = asked.load(Ordering::Relaxed);
+                assert_eq!(run(&vm, &mut cpu, CODE), value);
+                assert!(asked.load(Ordering::Relaxed) > before, "{model:?} {value}");
+            }
+        }
+    }
+
+    /// A machine whose field at `CODE + 1` (`MOV EAX, imm32; HLT`) is live,
+    /// patched by `MOV [CODE+1], ECX; HLT` at `CODE + 0x100`.
+    fn live_machine(model: CpuModel, class: Class, drained: bool) -> (Vm, Vcpu) {
+        let (vm, mut cpu) = machine(model, class, true, MEMORY);
+        vm.live_fields.drained.store(drained, Ordering::Relaxed);
+        target(&vm, CODE, 0x9090_0000);
+        patcher(&vm, CODE + 0x100, CODE + 1);
+        for value in 1..=3 {
+            patch(&vm, &mut cpu, CODE + 0x100, 0x9090_0000 | value);
+            assert_eq!(run(&vm, &mut cpu, CODE), 0x9090_0000 | value);
+        }
+        assert_eq!(vm.live_fields.live_for_test(), 1);
+        (vm, cpu)
+    }
+
+    #[test]
+    fn an_absorbed_patch_is_reported_by_take_dirty_code() {
+        // xj-to9.48: a store absorbed at its store site queues no range, but
+        // `Memory::take_dirty_code` still reports its page, as it reports a
+        // queued store's (`drained`); once.
+        for class in [Class::Flat32, Class::Segmented, Class::Paged] {
+            for drained in [false, true] {
+                // The vCPU holds the proofs whose registrations tag the page.
+                let (vm, _cpu) = live_machine(CpuModel::I80486Dx, class, drained);
+                vm.mem.take_dirty_code();
+                {
+                    let _site = super::StoreSite::enter(&vm).unwrap();
+                    vm.mem.write(CODE + 1, 0x9090_0004, 4).unwrap();
+                }
+                let what = format!("{class:?} drained {drained}");
+                assert_eq!(vm.mem.has_dirty_code(), drained, "{what}");
+                assert_eq!(vm.mem.take_dirty_code(), vec![CODE >> 12], "{what}");
+                assert!(vm.mem.take_dirty_code().is_empty(), "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_demoted_field_ends_the_store_site() {
+        // xj-to9.48: once no field is live, small code stores take the
+        // ordinary path again: no `StoreSite`, no store-site absorb.
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            let (vm, mut cpu) = live_machine(model, Class::Flat32, false);
+            assert!(vm.mem.live_store_site.load(Ordering::Relaxed));
+            assert!(super::StoreSite::enter(&vm).is_some());
+            // MOV EAX -> MOV ECX: the opcode store demotes the field.
+            vm.write_bytes(CODE, b"\xb9").unwrap();
+            run(&vm, &mut cpu, CODE);
+            assert_eq!(vm.live_fields.live_for_test(), 0);
+            assert!(!vm.mem.live_store_site.load(Ordering::Relaxed), "{model:?}");
+            assert!(super::StoreSite::enter(&vm).is_none(), "{model:?}");
+        }
+    }
+
+    #[test]
+    fn a_store_into_another_vms_memory_is_not_absorbed_by_this_one() {
+        // xj-to9.48: two VMs with the same live field; the second also runs
+        // it through a shared real-mode translation. A store into the
+        // second's memory made in the first's `StoreSite` scope (as a device
+        // callback during its run would) is the second's to settle: it is
+        // queued, and the shared copy drops.
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            let (vm1, _cpu1) = live_machine(model, Class::Flat32, false);
+            let (vm2, mut cpu2) = live_machine(model, Class::Flat32, false);
+            let mut real = real_vcpu(&vm2, (CODE >> 4) as u16);
+            assert_eq!(real_ax(&vm2, &mut real), 3);
+            for value in 4..=6 {
+                {
+                    let _site = super::StoreSite::enter(&vm1).unwrap();
+                    vm2.mem
+                        .write(CODE + 1, u64::from(0x9090_0000 | value), 4)
+                        .unwrap();
+                }
+                assert!(vm2.mem.has_dirty_code(), "{model:?}");
+                assert_eq!(real_ax(&vm2, &mut real), value, "{model:?}");
+                assert_eq!(run(&vm2, &mut cpu2, CODE), 0x9090_0000 | value);
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_restores_the_store_site_it_found() {
+        // xj-to9.48: a Machine run publishes its VM for the store-site absorb
+        // only while it runs, after a HLT, a budget or a fault alike, and
+        // restores the scope around it.
+        let (vm, mut cpu) = live_machine(CpuModel::I80486Dx, Class::Flat32, false);
+        assert!(super::store_site_for_test().is_null());
+        run(&vm, &mut cpu, CODE);
+        assert!(super::store_site_for_test().is_null());
+        cpu.cpu.rip = CODE;
+        let exit = cpu.run(&vm, Some(1));
+        assert!(matches!(exit, Exit::BudgetExhausted), "{exit:?}");
+        assert!(super::store_site_for_test().is_null());
+        // UD2 at the patcher's HLT.
+        vm.write_bytes(CODE + 0x106, b"\x0f\x0b").unwrap();
+        cpu.cpu.rip = CODE + 0x100;
+        let exit = cpu.run(&vm, None);
+        assert!(!matches!(exit, Exit::Hlt), "{exit:?}");
+        assert!(super::store_site_for_test().is_null());
+        let other = Vm::new(VmConfig::flat(0x1000));
+        {
+            let _outer = super::StoreSite::publish(&other);
+            run(&vm, &mut cpu, CODE);
+            assert!(std::ptr::eq(super::store_site_for_test(), &other));
+        }
+        assert!(super::store_site_for_test().is_null());
+    }
+
+    #[test]
+    fn a_paged_code_store_that_is_not_absorbed_ends_its_block() {
+        // xj-to9.48: a paged block's store into its own next instruction's
+        // opcode takes the fast lane once the TLB holds the page dirty; it
+        // is queued (no live field), its notice ends the block, and the
+        // patched instruction executes as rewritten (INC EAX -> INC ECX).
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            let (vm, mut cpu) = live_machine(model, Class::Paged, false);
+            // MOV byte [CODE+0x207], 41h; INC EAX; HLT at CODE + 0x200.
+            let at = CODE + 0x200;
+            let mut code = b"\xc6\x05".to_vec();
+            code.extend_from_slice(&(at as u32 + 7).to_le_bytes());
+            code.extend_from_slice(b"\x41\x40\xf4");
+            for round in 0..3 {
+                vm.write_bytes(at, &code).unwrap();
+                cpu.cpu.gpr[0] = 0;
+                cpu.cpu.gpr[1] = 0;
+                run(&vm, &mut cpu, at);
+                assert_eq!(
+                    (cpu.cpu.gpr[0], cpu.cpu.gpr[1]),
+                    (0, 1),
+                    "{model:?} round {round}"
+                );
             }
         }
     }

@@ -586,3 +586,61 @@ fn uncached_block_tags_end_with_its_lift_without_aliases() {
     });
     assert!(!first.mem.is_code_page(page));
 }
+
+/// A protected Flat32 vCPU at CPL 0 over flat 4 GiB segments.
+fn flat32_vcpu(vm: &Vm) -> Vcpu {
+    let mut cpu = vm.new_vcpu();
+    cpu.set_a20_enabled(true);
+    cpu.cpu.legacy.cr0 = 1;
+    cpu.cpu.legacy.cpl = 0;
+    cpu.cpu.gpr[4] = 0x9f00;
+    for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+        cache.base = 0;
+        cache.limit = u32::MAX;
+        // D/B set: 32-bit code and stack.
+        cache.attributes = (if i == 0 { 0x9b } else { 0x93 }) | 0x4000;
+        cache.unusable = 0;
+    }
+    cpu
+}
+
+fn run_at(vm: &Vm, cpu: &mut Vcpu, rip: u64) {
+    cpu.cpu.rip = rip;
+    let exit = x86jit_core::with_barrier_success(|| cpu.run(vm, None));
+    assert!(matches!(exit, Exit::Hlt), "{exit:?}");
+}
+
+#[test]
+fn a_live_field_patched_through_one_view_is_fetched_through_the_other() {
+    // xj-to9.48: a protected vCPU reads the immediate of `MOV EAX, imm32`
+    // live through the first view after repeated patches through that
+    // view. A real-mode vCPU fetches the same bytes through the second view
+    // (MOV AX, imm16; NOP; NOP; HLT), through a translation of its own. A
+    // later patch is noted through the declared alias, not absorbed where it
+    // is made, so the second vCPU executes the patched bytes.
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        let vm = alias_vm(Path::Real(model));
+        let target = u64::from(VIEWS[0] + u32::from(BASE));
+        let mut code = vec![0xb8];
+        code.extend_from_slice(&0x9090_0000u32.to_le_bytes());
+        code.push(0xf4);
+        vm.write_bytes(target, &code).unwrap();
+        // MOV [target+1], ECX; HLT, outside both views.
+        let patcher = 0xa000u64;
+        let mut store = b"\x89\x0d".to_vec();
+        store.extend_from_slice(&(target as u32 + 1).to_le_bytes());
+        store.push(0xf4);
+        vm.write_bytes(patcher, &store).unwrap();
+        let mut cpu = flat32_vcpu(&vm);
+        let mut real = vcpu(&vm, Path::Real(model), VIEWS[1], VIEWS[1]);
+        for value in 1..=8u32 {
+            cpu.cpu.gpr[1] = u64::from(0x9090_0000 | value);
+            run_at(&vm, &mut cpu, patcher);
+            run_at(&vm, &mut cpu, target);
+            assert_eq!(cpu.cpu.gpr[0] as u32, 0x9090_0000 | value, "{model:?}");
+            run_at(&vm, &mut real, u64::from(BASE));
+            assert_eq!(cpu.cpu.gpr[0] as u16, value as u16);
+            assert_eq!(real.cpu.gpr[0] as u16, value as u16, "{model:?} {value}");
+        }
+    }
+}

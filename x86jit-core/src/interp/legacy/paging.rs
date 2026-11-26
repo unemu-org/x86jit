@@ -2787,10 +2787,11 @@ fn fast_window(
     }
     let physical = (entry.translation.physical & FRAME) | (linear as u32 & 0xfff);
     let (bus, part) = legacy::physical_span(cpu, u32::MAX, u64::from(physical), size);
-    if part != size
-        || memory.region_kind(bus, size) != Ok(crate::RegionKind::Ram)
-        || (access == AccessKind::Write && memory.is_code_page(bus >> 12))
-    {
+    // A store into a code page takes this window too (xj-to9.48): it is
+    // performed and noted through `Memory::write`, as the transaction's
+    // commit performs it (`commit_ram`), and its notice ends the block at the
+    // instruction's boundary (`BlockPass::commit`).
+    if part != size || memory.region_kind(bus, size) != Ok(crate::RegionKind::Ram) {
         return None;
     }
     Some(Window {
@@ -3841,16 +3842,23 @@ mod tests {
                             AccessKind::Read
                         )
                         .is_none());
+                        // A store into a code page takes the window too, and
+                        // its write is noted as the transaction's commit notes
+                        // it (xj-to9.48).
                         vm.mem.mark_code(0x4000, 1);
-                        assert!(fast_operand(
+                        mem.paging.fast_operand = fast_operand(
                             &cpu,
                             &vm.mem,
                             &tlb.borrow(),
                             0x1000,
                             4,
-                            AccessKind::Write
-                        )
-                        .is_none());
+                            AccessKind::Write,
+                        );
+                        assert!(mem.paging.fast_operand.is_some());
+                        assert!(!vm.mem.has_dirty_code());
+                        write(&mut cpu, &mem, 0x1000, 4, 43).unwrap();
+                        assert!(vm.mem.has_dirty_code());
+                        mem.paging.fast_operand = None;
                         assert!(fast_operand(
                             &cpu,
                             &vm.mem,

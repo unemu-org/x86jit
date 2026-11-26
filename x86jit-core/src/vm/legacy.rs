@@ -2958,6 +2958,13 @@ impl Vcpu {
                 .then(|| super::device::InBlock::new(vm, self.device_cpu().id))
         });
         let _in_block_scope = in_block.get().map(super::device::InBlock::publish);
+        // Stores wholly inside live fields are absorbed where they are made
+        // (`live::absorb_at_store`, xj-to9.48).
+        let _store_site = if KIND == MACHINE_DISPATCH {
+            live::StoreSite::enter(vm)
+        } else {
+            None
+        };
         // Successor links (`links.rs`), for Machine runs of more than one
         // step. Set by an ordinary completed block whose last transfer is
         // direct or a near RET (`IrBlock::link_exit`), and taken by the next

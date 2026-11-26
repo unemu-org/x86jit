@@ -965,6 +965,15 @@ pub struct Memory {
     code_range: AtomicU64,
     dirty: Mutex<Vec<(u64, u64)>>,
     dirty_flag: AtomicBool,
+    /// A VM over this memory holds a live instruction field: a small code
+    /// write may be absorbed at its store site (xj-to9.48, `vm::absorb_at_store`).
+    pub(crate) live_store_site: AtomicBool,
+    /// Code pages written by stores absorbed at their store site, which queue
+    /// no `dirty` range, for `take_dirty_code`; and the last page recorded
+    /// since its last call (`u64::MAX`: none), so a patch loop records its
+    /// page once.
+    absorbed: Mutex<Vec<u64>>,
+    absorbed_last: AtomicU64,
     dispatch_words: Mutex<Vec<Weak<AtomicU64>>>,
     // Distinguishes this instance from every other Memory of the process, so
     // a vCPU notices a replaced `Vm::mem` and registers its word again.
@@ -1641,6 +1650,9 @@ impl Memory {
             code_range: AtomicU64::new(0),
             dirty: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),
+            live_store_site: AtomicBool::new(false),
+            absorbed: Mutex::new(Vec::new()),
+            absorbed_last: AtomicU64::new(u64::MAX),
             dispatch_words: Mutex::new(Vec::new()),
             dispatch_identity: NEXT_DISPATCH_IDENTITY.fetch_add(1, Ordering::Relaxed),
             child_dispatch: crate::child::ChildDispatch::default(),
@@ -2166,6 +2178,15 @@ impl Memory {
     #[cold]
     #[inline(never)]
     fn note_code_write(&self, lo: u64, hi: u64, observer: &impl InterpreterMemory) {
+        // A VM over this memory holds a live instruction field (xj-to9.48):
+        // one relaxed load for every other memory.
+        if self.live_store_site.load(Ordering::Relaxed)
+            && hi - lo <= 4
+            && self.note_live_code_write(lo, hi)
+        {
+            observer.note_block_write(lo, (hi - lo) as usize);
+            return;
+        }
         // Alias expansion and dirty-range growth reach the embedder's allocator.
         let _fp = crate::jit_abi::fp::DefaultEnvironment::enter();
         let aliases = self.code_aliases.lock().unwrap();
@@ -2195,6 +2216,51 @@ impl Memory {
                 false
             }
         });
+    }
+
+    /// `note_code_write`, first, for a store of at most four bytes while a
+    /// VM over this memory holds a live instruction field (xj-to9.48).
+    /// Returns `true` when the store needs no notice: this thread's Machine
+    /// run absorbed it (`vm::absorb_at_store`), or no translation tracks its
+    /// page; the caller then notes it to its own running block only. A store
+    /// into a page with a declared alias, or one not absorbed, returns
+    /// `false` and is noted by the caller as any other.
+    #[cold]
+    #[inline(never)]
+    fn note_live_code_write(&self, lo: u64, hi: u64) -> bool {
+        // The absorb's write log reaches the embedder's allocator.
+        let _fp = crate::jit_abi::fp::DefaultEnvironment::enter();
+        let page = lo >> CODE_PAGE_BITS;
+        let aliases = self.code_aliases.lock().unwrap();
+        if aliases.registrations.contains_key(&page) {
+            return false;
+        }
+        let tracked = aliases.translated.contains(&page)
+            || aliases.lifting.contains_key(&page)
+            || aliases.fetching.contains(&page);
+        // The VM's absorb takes the cache's spans lock, which publication
+        // holds while it takes this one (`register_code_sources`).
+        drop(aliases);
+        if !tracked {
+            return true;
+        }
+        let absorbed = crate::vm::absorb_at_store(self, lo, hi);
+        if absorbed {
+            self.note_absorbed(page);
+        }
+        absorbed
+    }
+
+    /// Record a code page an absorbed store wrote, for `take_dirty_code`.
+    fn note_absorbed(&self, page: u64) {
+        if self.absorbed_last.load(Ordering::Acquire) == page {
+            return;
+        }
+        let mut pages = self.absorbed.lock().unwrap();
+        if !pages.contains(&page) {
+            pages.push(page);
+        }
+        self.absorbed_last.store(page, Ordering::Release);
     }
 
     /// This instance's identity among the process's Memory instances, never
@@ -2397,14 +2463,31 @@ impl Memory {
     pub fn take_dirty_code(&self) -> Vec<u64> {
         // Common case (nothing self-modified): shared loads, not a swap — the
         // latter takes the cache line exclusive on every dispatch even when clean.
-        if !self.has_dirty_code() {
+        let absorbed = self.absorbed_last.load(Ordering::Acquire) != u64::MAX;
+        if !self.has_dirty_code() && !absorbed {
             return Vec::new();
         }
-        let _words = self.dispatch_words.lock().unwrap();
-        self.take_dirty_code_locked()
-            .into_iter()
-            .map(|(lo, _)| lo >> CODE_PAGE_BITS)
-            .collect()
+        let mut pages: Vec<u64> = if self.has_dirty_code() {
+            let _words = self.dispatch_words.lock().unwrap();
+            self.take_dirty_code_locked()
+                .into_iter()
+                .map(|(lo, _)| lo >> CODE_PAGE_BITS)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if absorbed {
+            // Stores a live instruction field absorbed (xj-to9.48) queued no
+            // range, and the dispatcher never drains these.
+            let mut written = self.absorbed.lock().unwrap();
+            self.absorbed_last.store(u64::MAX, Ordering::Release);
+            for page in written.drain(..) {
+                if !pages.contains(&page) {
+                    pages.push(page);
+                }
+            }
+        }
+        pages
     }
 
     /// Serialize invalidation and this vcpu's acknowledgement with notifications
