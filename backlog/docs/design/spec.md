@@ -2739,6 +2739,16 @@ write-protected descriptor page) precedes every store, as on the
 transaction path. A near RET's Segmented or V86 CS target check runs after its
 proved stack load, which can fault only before any effect.
 
+The RAM-free lane also takes a near JMP to an immediate or register target
+(xj-to9.34). Its CS target check reads the retained CS cache, raises #GP(0)
+beyond the limit before EIP changes (SDM Vol 2A JMP pp. 3-507, 3-510; 80386
+PRM §17 JMP pp. 17-83, 17-87) and touches no memory; a register write before
+a faulting op carries the instruction checkpoint, as for Jcc. A near CALL
+checks its target before the push (SDM Vol 2A CALL p. 3-125) and takes the
+proved-window store lane; a target beyond the limit, a stack-limit fault, an
+unproved, read-only, clean or code-page stack slot and a slot across a page
+keep the transaction path. The target's fetch belongs to the next block.
+
 PG=0 keeps its statically selected unpaged adapter;
 paged walks, transactions and proofs live in cold, non-inlined functions.
 

@@ -2280,42 +2280,83 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
 /// The caller excludes the 486 alignment-refusal regime before this lane.
 /// New IR operations default to the existing transaction path.
 fn register_effects(ops: &[IrOp]) -> bool {
+    ops.iter().all(register_effect)
+}
+
+#[inline(always)]
+fn register_effect(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::InsnStart { .. }
+            | IrOp::ReadReg { .. }
+            | IrOp::WriteReg { .. }
+            | IrOp::ReadSelector { .. }
+            | IrOp::Add { .. }
+            | IrOp::Adc { .. }
+            | IrOp::Sub { .. }
+            | IrOp::Sbb { .. }
+            | IrOp::And { .. }
+            | IrOp::Or { .. }
+            | IrOp::Xor { .. }
+            | IrOp::Shl { .. }
+            | IrOp::Shr { .. }
+            | IrOp::Sar { .. }
+            | IrOp::Rol { .. }
+            | IrOp::Ror { .. }
+            | IrOp::Rcl { .. }
+            | IrOp::Rcr { .. }
+            | IrOp::DoubleShift { .. }
+            | IrOp::Sext { .. }
+            | IrOp::Mul { .. }
+            | IrOp::GetCond { .. }
+            | IrOp::Jump { .. }
+            | IrOp::Branch { .. }
+            | IrOp::BitScan { .. }
+            | IrOp::Bt { .. }
+            | IrOp::Bswap { .. }
+            | IrOp::SetCf { .. }
+            | IrOp::SetDf { .. }
+            | IrOp::Lahf
+            | IrOp::Sahf
+            | IrOp::Legacy(L::Checkpoint | L::ReadSelector { .. } | L::I486Gate)
+    )
+}
+
+/// The register lane: `register_effects` plus the CS check of a near JMP
+/// target (`check_target`). That check reads only the retained CS cache and
+/// a temporary, and raises #GP(0) for a target beyond the CS limit before
+/// the `Jump` changes EIP (SDM Vol 2A JMP, Operation p. 3-507 and Protected
+/// Mode Exceptions p. 3-510; 80386 PRM §17 JMP pp. 17-83, 17-87). No
+/// instruction of this lane accesses memory, so a fault leaves RAM as it was;
+/// a register write before a faulting op carries the lift's checkpoint, which
+/// `execute_instruction` restores, as for the Jcc and JMP target checks of
+/// `Branch` and `Jump`. The check stays out of `register_effects`, whose
+/// other caller, `fast_instruction`, admits a CS check only after a load and
+/// never after a store.
+fn register_lane(ops: &[IrOp]) -> bool {
     ops.iter().all(|op| {
-        matches!(
-            op,
-            IrOp::InsnStart { .. }
-                | IrOp::ReadReg { .. }
-                | IrOp::WriteReg { .. }
-                | IrOp::ReadSelector { .. }
-                | IrOp::Add { .. }
-                | IrOp::Adc { .. }
-                | IrOp::Sub { .. }
-                | IrOp::Sbb { .. }
-                | IrOp::And { .. }
-                | IrOp::Or { .. }
-                | IrOp::Xor { .. }
-                | IrOp::Shl { .. }
-                | IrOp::Shr { .. }
-                | IrOp::Sar { .. }
-                | IrOp::Rol { .. }
-                | IrOp::Ror { .. }
-                | IrOp::Rcl { .. }
-                | IrOp::Rcr { .. }
-                | IrOp::DoubleShift { .. }
-                | IrOp::Sext { .. }
-                | IrOp::Mul { .. }
-                | IrOp::GetCond { .. }
-                | IrOp::Jump { .. }
-                | IrOp::Branch { .. }
-                | IrOp::BitScan { .. }
-                | IrOp::Bt { .. }
-                | IrOp::Bswap { .. }
-                | IrOp::SetCf { .. }
-                | IrOp::SetDf { .. }
-                | IrOp::Lahf
-                | IrOp::Sahf
-                | IrOp::Legacy(L::Checkpoint | L::ReadSelector { .. } | L::I486Gate)
-        )
+        register_effect(op)
+            || matches!(
+                op,
+                IrOp::Legacy(
+                    L::Flat32Address {
+                        segment: SegmentId::Cs,
+                        bytes: 1,
+                        access: AccessKind::Execute,
+                        ..
+                    } | L::SegmentedAddress {
+                        segment: SegmentId::Cs,
+                        bytes: 1,
+                        access: AccessKind::Execute,
+                        ..
+                    } | L::Address {
+                        segment: SegmentId::Cs,
+                        bytes: 1,
+                        access: AccessKind::Execute,
+                        ..
+                    }
+                )
+            )
     })
 }
 
@@ -2908,7 +2949,7 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
             && !(cpu.legacy.cpl == 3
                 && cpu.legacy.cr0 & (1 << 18) != 0
                 && cpu.rflags_system & (1 << 18) != 0);
-        let registers_only = once && register_effects(view.ops);
+        let registers_only = once && register_lane(view.ops);
         if once && !registers_only {
             mem.paging.fast_operand =
                 fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps, context);

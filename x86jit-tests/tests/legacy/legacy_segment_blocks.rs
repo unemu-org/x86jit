@@ -993,3 +993,605 @@ fn in_guest_delivery_after_an_in_block_reload_matches_checked() {
         }
     }
 }
+
+/// A near transfer at `ip` in code of operand width `wide` (CS.D), with an
+/// optional 66h override: JMP rel, JMP reg (AX/EAX), JMP [DS:40h], CALL rel,
+/// CALL reg, Jcc rel (JZ), RET and RET imm16 (xj-to9.34). `target` is the
+/// intended destination; a register, memory or stack operand holds it in
+/// full, so a 16-bit operand size truncates it (SDM Vol 2A JMP p. 3-507:
+/// "tempEIP := tempEIP AND 0000FFFFH").
+#[derive(Clone, Copy, Debug)]
+enum Near {
+    Jmp,
+    JmpReg,
+    JmpMem,
+    Call,
+    CallReg,
+    Jz,
+    Ret,
+    RetImm,
+}
+
+fn near(form: Near, ip: u32, wide: bool, override66: bool, target: u32) -> Vec<u8> {
+    let operand32 = wide != override66;
+    let mut code = if override66 { vec![0x66] } else { vec![] };
+    let relative = |code: &mut Vec<u8>, opcode: &[u8]| {
+        code.extend(opcode);
+        let next = ip + (code.len() + if operand32 { 4 } else { 2 }) as u32;
+        let rel = target.wrapping_sub(next);
+        if operand32 {
+            code.extend(rel.to_le_bytes());
+        } else {
+            code.extend((rel as u16).to_le_bytes());
+        }
+    };
+    match form {
+        Near::Jmp => relative(&mut code, &[0xe9]),
+        Near::Call => relative(&mut code, &[0xe8]),
+        Near::Jz => relative(&mut code, &[0x0f, 0x84]),
+        Near::JmpReg => code.extend([0xff, 0xe0]),
+        Near::CallReg => code.extend([0xff, 0xd0]),
+        Near::JmpMem if wide => code.extend([0xff, 0x25, 0x40, 0, 0, 0]),
+        Near::JmpMem => code.extend([0xff, 0x26, 0x40, 0]),
+        Near::Ret => code.push(0xc3),
+        Near::RetImm => code.extend([0xc2, 4, 0]),
+    }
+    code
+}
+
+/// The near-transfer witnesses' Segmented state: `seg16`, with CS.D = SS.B
+/// = 1 when `wide` (the 32seg shape of `legacy_seg32.rs`).
+fn near_seg(model: CpuModel, code: &[u8], cpl: u8, wide: bool, checked: bool) -> (Vm, Vcpu) {
+    let (vm, mut cpu) = seg16(model, code, cpl, true, checked);
+    if wide {
+        cpu.cpu.legacy.segments[0].attributes |= 0x4000;
+        cpu.cpu.legacy.segments[3].attributes |= 0x4000;
+    }
+    assert_eq!(
+        class(&cpu),
+        if checked {
+            SegmentClass::Checked
+        } else {
+            SegmentClass::Segmented
+        }
+    );
+    (vm, cpu)
+}
+
+/// INC BX (or EBX); PUSH AX; POP AX; MOV CX,[40h]: ZF for JZ, and TLB
+/// entries for the stack page (with D set) and the DS page, so that CALL,
+/// RET and JMP [mem] are candidates of the proved-window lane.
+fn near_warm(wide: bool) -> Vec<u8> {
+    let mut code = vec![0x43, 0x50, 0x58, 0x8b];
+    if wide {
+        code.extend([0x0d, 0x40, 0, 0, 0]);
+    } else {
+        code.extend([0x0e, 0x40, 0]);
+    }
+    code
+}
+
+/// Place `target` where each form reads it: AX/EAX, DS:40h (DS base A000h)
+/// and the top of the stack (SS base 7000h, SP 1004h: the warm-up PUSH and
+/// a two- or four-byte CALL push share the page 8000h with the RET frame).
+fn near_operands(vm: &Vm, cpu: &mut Vcpu, target: u32) {
+    cpu.cpu.gpr[4] = 0x1004;
+    cpu.cpu.gpr[0] = u64::from(target);
+    vm.write_bytes(0xa040, &target.to_le_bytes()).unwrap();
+    let sp = cpu.cpu.gpr[4] & 0xffff;
+    vm.write_bytes(0x7000 + sp, &target.to_le_bytes()).unwrap();
+}
+
+const NEAR_FORMS: [Near; 8] = [
+    Near::Jmp,
+    Near::JmpReg,
+    Near::JmpMem,
+    Near::Call,
+    Near::CallReg,
+    Near::Jz,
+    Near::Ret,
+    Near::RetImm,
+];
+
+#[test]
+fn paged_near_transfers_match_checked_at_and_past_the_cs_limit() {
+    // SDM Vol 2A JMP pp. 3-507, 3-510, CALL p. 3-125, Jcc p. 3-503; Vol 2B
+    // RET pp. 4-572, 4-580; 80386 PRM §17 JMP pp. 17-83, 17-87: a near
+    // target beyond the CS limit is #GP(0) before any effect (no push, no
+    // EIP change), a 16-bit operand size truncates EIP to 16 bits first,
+    // and a target at the limit itself executes. CS is 08h, base 1000h,
+    // limit 1FFFh; HLT waits at 1FFFh, at 1100h (the next linear page) and
+    // at 10h; the paged lane runs against the Checked transaction path.
+    for model in MODELS {
+        for cpl in [0u8, 3] {
+            for wide in [false, true] {
+                for override66 in [false, true] {
+                    for form in NEAR_FORMS {
+                        for target in [0x1fffu32, 0x2000, 0x1100, 0x0001_0010, 0xffff_0010] {
+                            let mut code = near_warm(wide);
+                            let ip = 0x100 + code.len() as u32;
+                            code.extend(near(form, ip, wide, override66, target));
+                            code.push(0x43);
+                            let operand32 = wide != override66;
+                            let effective = if operand32 { target } else { target & 0xffff };
+                            let what = format!(
+                                "{model:?} CPL{cpl} D={wide} 66={override66} {form:?} \
+                                 {target:#x} -> {effective:#x}"
+                            );
+                            for budget in [1, 4, 5, 6, 10] {
+                                let (avm, mut a) = near_seg(model, &code, cpl, wide, false);
+                                let (bvm, mut b) = near_seg(model, &code, cpl, wide, true);
+                                for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                                    // INC BX or INC EBX wraps to 0: ZF for JZ.
+                                    cpu.cpu.gpr[3] = 0xffff_ffff;
+                                    near_operands(vm, cpu, target);
+                                    for hlt in [0x2fffu64, 0x2100, 0x1010] {
+                                        vm.write_bytes(hlt, &[0xf4]).unwrap();
+                                    }
+                                }
+                                let what = format!("{what} budget={budget}");
+                                let run = lane_against_checked(
+                                    (&avm, &mut a),
+                                    (&bvm, &mut b),
+                                    budget,
+                                    &what,
+                                );
+                                if budget != 10 {
+                                    continue;
+                                }
+                                if effective <= 0x1fff {
+                                    // HLT at CPL 3 is #GP(0) (SDM Vol 2A HLT).
+                                    let expected = u64::from(effective) + u64::from(cpl == 0);
+                                    assert_eq!(a.cpu.rip, expected, "{what}");
+                                } else {
+                                    assert!(
+                                        matches!(exit(&run), Exit::Exception { vector: 13, .. }),
+                                        "{what}: {run:?}"
+                                    );
+                                    assert_eq!(a.cpu.rip, u64::from(ip), "{what}");
+                                    assert_eq!(a.cpu.gpr[4], 0x1004, "{what}: no push");
+                                    assert_eq!(
+                                        exit(&run).fault_metadata().unwrap().error_code(),
+                                        ErrorCode::bits(0, 0xffff),
+                                        "{what}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_near_call_whose_push_faults_matches_checked() {
+    // SDM Vol 2A CALL p. 3-125 (Operation, near relative call): the target
+    // check (#GP(0)) precedes the stack check (#SS(0)), and both precede
+    // the push and the EIP change. SDM Vol 3A §§5.6.1, 5.7 pp. 5-37–38: a
+    // push to a not-present page is #PF with CR2 = the first byte not
+    // translated; a user write to a read-only page, or a supervisor one
+    // with CR0.WP = 1 on the Intel486 (Intel486 PRM §4.1.3 p. 4-7), is #PF
+    // with P = 1. SS is 18h, base 7000h, limit 1FFFh; page 7 is 7000h,
+    // page 8 is 8000h. `warm` reads the stack first (MOV BP,SP; MOV
+    // CX,[BP+0]), which leaves a TLB entry for the lane to consult.
+    #[derive(Clone, Copy, Debug)]
+    enum Page {
+        Present,
+        Missing(u64),
+        ReadOnly(u64),
+    }
+    for model in MODELS {
+        for cpl in [0u8, 3] {
+            for wide in [false, true] {
+                let push = if wide { 4u64 } else { 2 };
+                for (sp, page, warm) in [
+                    (0x1004u64, Page::Present, true),
+                    (0x1004, Page::Present, false),
+                    (0x0000, Page::Present, false),
+                    (0x0001, Page::Present, false),
+                    (0x2001, Page::Present, false),
+                    (0x2000 + push - 1, Page::Present, false),
+                    (0x1004, Page::Missing(8), false),
+                    (0x1002, Page::Missing(7), true),
+                    (0x1004, Page::ReadOnly(8), true),
+                    (0x1004, Page::ReadOnly(8), false),
+                ] {
+                    for target in [0x1100u32, 0x2000] {
+                        // INC BX; [MOV BP,SP; MOV CX,[BP+0]]; CALL target; INC BX.
+                        let mut code = vec![0x43];
+                        if warm {
+                            code.extend([0x89, 0xe5, 0x8b, if wide { 0x4d } else { 0x4e }, 0]);
+                        }
+                        let ip = 0x100 + code.len() as u32;
+                        code.extend(near(Near::Call, ip, wide, false, target));
+                        code.push(0x43);
+                        for budget in [1, 2, 3, 4, 10] {
+                            let (avm, mut a) = near_seg(model, &code, cpl, wide, false);
+                            let (bvm, mut b) = near_seg(model, &code, cpl, wide, true);
+                            for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                                cpu.cpu.gpr[4] = sp;
+                                vm.write_bytes(0x2100, &[0xf4]).unwrap();
+                                if model == CpuModel::I80486Dx {
+                                    cpu.cpu.legacy.cr0 |= 1 << 16;
+                                }
+                                match page {
+                                    Page::Present => {}
+                                    Page::Missing(n) => {
+                                        vm.write_bytes(0x1f000 + 4 * n, &0u32.to_le_bytes())
+                                            .unwrap();
+                                    }
+                                    Page::ReadOnly(n) => {
+                                        let pte = (n as u32) << 12 | 5;
+                                        vm.write_bytes(0x1f000 + 4 * n, &pte.to_le_bytes())
+                                            .unwrap();
+                                    }
+                                }
+                            }
+                            let what = format!(
+                                "{model:?} CPL{cpl} D={wide} SP={sp:#x} {page:?} warm={warm} \
+                                 {target:#x} budget={budget}"
+                            );
+                            let run =
+                                lane_against_checked((&avm, &mut a), (&bvm, &mut b), budget, &what);
+                            if budget != 10 {
+                                continue;
+                            }
+                            let slot = sp.wrapping_sub(push)
+                                & if wide { u64::from(u32::MAX) } else { 0xffff };
+                            let vector = if target == 0x2000 {
+                                Some(13)
+                            } else if slot + push > 0x2000 {
+                                Some(12)
+                            } else {
+                                match page {
+                                    Page::Present => None,
+                                    Page::Missing(n) => {
+                                        let first = 0x7000 + slot;
+                                        (first >> 12 == n || (first + push - 1) >> 12 == n)
+                                            .then_some(14)
+                                    }
+                                    Page::ReadOnly(_) => {
+                                        (cpl == 3 || model == CpuModel::I80486Dx).then_some(14)
+                                    }
+                                }
+                            };
+                            match vector {
+                                None => {
+                                    assert_eq!(a.cpu.rip, 0x1100 + u64::from(cpl == 0), "{what}");
+                                    assert_eq!(a.cpu.gpr[4], slot, "{what}");
+                                }
+                                Some(vector) => {
+                                    assert!(
+                                        matches!(exit(&run), Exit::Exception { vector: v, .. } if *v == vector),
+                                        "{what}: {run:?}"
+                                    );
+                                    assert_eq!(a.cpu.rip, u64::from(ip), "{what}");
+                                    assert_eq!(a.cpu.gpr[4], sp, "{what}: no push");
+                                    if let (14, Page::Missing(n)) = (vector, page) {
+                                        let first = (0x7000 + slot).max(n << 12);
+                                        assert_eq!(u64::from(a.cpu.legacy.cr2), first, "{what}");
+                                    } else if vector == 14 {
+                                        assert_eq!(
+                                            u64::from(a.cpu.legacy.cr2),
+                                            0x7000 + slot,
+                                            "{what}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_near_call_pushing_into_code_runs_the_new_bytes() {
+    // SDM Vol 3A §11.6 p. 11-21: a write to a code byte that is later
+    // executed takes effect for that execution. SS is based with CS at
+    // 1000h, so CALL 110h's return address 0103h (03h 01h) lands on the
+    // NOPs at 108h: ADD AX,[BX+DI] after the return. The block at 108h is
+    // executed (and cached) first. CALL 110h; INC BX; JMP short 108h; HLT;
+    // HLT; NOP; NOP; HLT; ...; 110h: RET.
+    let mut code = vec![
+        0xe8, 0x0d, 0x00, 0x43, 0xeb, 0x02, 0xf4, 0xf4, 0x90, 0x90, 0xf4,
+    ];
+    code.resize(0x10, 0xf4);
+    code.push(0xc3);
+    for model in MODELS {
+        for cpl in [0u8, 3] {
+            for budget in [1, 2, 3, 4, 5, 6, 10] {
+                let (avm, mut a) = near_seg(model, &code, cpl, false, false);
+                let (bvm, mut b) = near_seg(model, &code, cpl, false, true);
+                for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                    cpu.cpu.legacy.segments[3].base = 0x1000;
+                    cpu.cpu.gpr[4] = 0x10a;
+                    vm.write_bytes(0xa001, &0x1234u16.to_le_bytes()).unwrap();
+                    cpu.cpu.rip = 0x108;
+                    fixture::steps(cpu, vm, 2);
+                    cpu.cpu.rip = 0x100;
+                }
+                let what = format!("{model:?} CPL{cpl} budget={budget}");
+                let run = lane_against_checked((&avm, &mut a), (&bvm, &mut b), budget, &what);
+                if budget == 10 {
+                    assert_eq!(a.cpu.gpr[0] & 0xffff, 0x1234, "{what}: {run:?}");
+                    assert_eq!(a.cpu.rip, 0x10a + u64::from(cpl == 0), "{what}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn near_transfers_to_a_missing_page_fault_on_the_fetch() {
+    // SDM Vol 3A §§5.7 pp. 5-37–38: an instruction fetch from a
+    // not-present page is #PF with CR2 = the linear address fetched and
+    // I/D = 0 on these models; the transfer itself retired (its push and
+    // EIP are kept, and the fault reports the target). Target CS:1100h is
+    // linear 2100h, page 2.
+    for model in MODELS {
+        for cpl in [0u8, 3] {
+            for wide in [false, true] {
+                for form in NEAR_FORMS {
+                    let mut code = near_warm(wide);
+                    let ip = 0x100 + code.len() as u32;
+                    code.extend(near(form, ip, wide, false, 0x1100));
+                    for budget in [4, 5, 6, 10] {
+                        let (avm, mut a) = near_seg(model, &code, cpl, wide, false);
+                        let (bvm, mut b) = near_seg(model, &code, cpl, wide, true);
+                        for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                            cpu.cpu.gpr[3] = 0xffff_ffff;
+                            near_operands(vm, cpu, 0x1100);
+                            vm.write_bytes(0x1f008, &0u32.to_le_bytes()).unwrap();
+                        }
+                        let what = format!("{model:?} CPL{cpl} D={wide} {form:?} budget={budget}");
+                        let run =
+                            lane_against_checked((&avm, &mut a), (&bvm, &mut b), budget, &what);
+                        if budget == 10 {
+                            assert!(
+                                matches!(exit(&run), Exit::Exception { vector: 14, .. }),
+                                "{what}: {run:?}"
+                            );
+                            assert_eq!(a.cpu.legacy.cr2, 0x2100, "{what}");
+                            assert_eq!(a.cpu.rip, 0x1100, "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A loop of near transfers at `base` in code of width `wide`: INC AX; CALL
+/// sub; DEC CX; JZ done; MOV DX,back; JMP DX; back: JMP base; done: HLT;
+/// sub: ADD BX,AX; RET. CX = 5 runs five iterations; done is base + 3Fh.
+fn near_loop(base: u32, wide: bool) -> Vec<u8> {
+    let imm = if wide { 4 } else { 2 };
+    let at = |code: &Vec<u8>| base + code.len() as u32;
+    let mut code = vec![0x40];
+    // sub sits 0x40 bytes after base, done just before it.
+    let (done, sub) = (base + 0x3f, base + 0x40);
+    let call = near(Near::Call, at(&code), wide, false, sub);
+    code.extend(call);
+    code.push(0x49);
+    let jz = near(Near::Jz, at(&code), wide, false, done);
+    code.extend(jz);
+    let back = at(&code) + 1 + imm + 2;
+    code.push(0xba);
+    code.extend(&back.to_le_bytes()[..imm as usize]);
+    code.extend([0xff, 0xe2]);
+    let jmp = near(Near::Jmp, at(&code), wide, false, base);
+    code.extend(jmp);
+    code.resize(0x3f, 0x90);
+    code.extend([0xf4, 0x01, 0xc3, 0xc3]);
+    code
+}
+
+fn near_census(
+    done: u32,
+    (avm, a): (&Vm, &mut Vcpu),
+    (bvm, b): (&Vm, &mut Vcpu),
+    tf: bool,
+    what: &str,
+    same_state: impl Fn(&Vcpu, &mut Vcpu, &str),
+) {
+    for cpu in [&mut *a, &mut *b] {
+        cpu.cpu.gpr[1] = 5;
+        if tf {
+            cpu.cpu.rflags_system |= 1 << 8;
+        }
+    }
+    // Every budget from one step, then the rest of the loop in slices
+    // (with TF each slice stops at its single-step trap).
+    let mut traps = 0;
+    for round in 0..80 {
+        let budget = if round == 0 { 1 } else { 1 + round % 5 };
+        let before = a.cpu.rip;
+        let ar = a.run_steps(avm, budget, StepOptions::default()).unwrap();
+        let br = b.run_steps(bvm, budget, StepOptions::default()).unwrap();
+        let what = format!("{what} TF={tf} round={round}");
+        assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what}");
+        same_state(a, b, &what);
+        if let StepStop::Exit(Exit::Exception { vector: 1, .. }) = ar.stop() {
+            traps += 1;
+        } else if !matches!(ar.stop(), StepStop::Exit(Exit::BudgetExhausted)) {
+            // HLT (at CPL 3 its #GP(0)).
+            break;
+        }
+        if tf && before == u64::from(done) {
+            // HLT retired and trapped.
+            break;
+        }
+    }
+    assert_eq!(
+        a.cpu.gpr[3] & 0xffff,
+        15,
+        "{what}: ADD BX,AX over five iterations"
+    );
+    // One trap after each instruction that began with TF set.
+    let traps_expected = if tf { a.retired_instructions() } else { 0 };
+    assert_eq!(traps, traps_expected, "{what}");
+}
+
+#[test]
+fn near_transfer_loops_match_the_reference_on_every_paged_class() {
+    // The census: near CALL, RET, JZ, JMP reg and JMP rel in Segmented
+    // (CS.D = 0 and 1), Flat32 and V86 paged loops, at CPL 0 and 3, step by
+    // step and under TF (SDM Vol 3B §18.3.1.4 p. 18-12: a trap follows each
+    // instruction that began with TF set), against the Checked class, or
+    // the unpaged V86 singletons.
+    for model in MODELS {
+        for tf in [false, true] {
+            for cpl in [0u8, 3] {
+                for wide in [false, true] {
+                    let code = near_loop(0x100, wide);
+                    let (avm, mut a) = near_seg(model, &code, cpl, wide, false);
+                    let (bvm, mut b) = near_seg(model, &code, cpl, wide, true);
+                    let what = format!("{model:?} Segmented CPL{cpl} D={wide}");
+                    near_census(
+                        0x13f,
+                        (&avm, &mut a),
+                        (&bvm, &mut b),
+                        tf,
+                        &what,
+                        |a, b, what| same(a, b, &avm, &bvm, 0x20000, what),
+                    );
+                    assert_eq!(class(&a), SegmentClass::Segmented);
+                }
+                let code = near_loop(0x1000, true);
+                let (avm, mut a) = flat32_at(model, &code, cpl, false);
+                let (bvm, mut b) = flat32_at(model, &code, cpl, true);
+                let what = format!("{model:?} Flat32 CPL{cpl}");
+                near_census(
+                    0x103f,
+                    (&avm, &mut a),
+                    (&bvm, &mut b),
+                    tf,
+                    &what,
+                    |a, b, what| {
+                        b.cpu.legacy.segments[2].limit += 1;
+                        b.cpu.legacy.segments[5].attributes |= 0x80;
+                        assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu), "{what}");
+                        b.cpu.legacy.segments[2].limit -= 1;
+                        b.cpu.legacy.segments[5].attributes &= !0x80;
+                        assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
+                    },
+                );
+                assert_eq!(class(&a), SegmentClass::Flat32);
+            }
+            let code = near_loop(0x100, false);
+            let (avm, mut a) = v86(model, &code, true);
+            let (bvm, mut b) = v86(model, &code, false);
+            let what = format!("{model:?} V86");
+            near_census(
+                0x13f,
+                (&avm, &mut a),
+                (&bvm, &mut b),
+                tf,
+                &what,
+                |a, b, what| {
+                    b.cpu.legacy.cr0 |= 0x8000_0000;
+                    assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu), "{what}");
+                    b.cpu.legacy.cr0 &= !0x8000_0000;
+                    assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn v86_near_targets_beyond_ffffh_fault_like_the_singletons() {
+    // SDM Vol 3B §23.1.1; Vol 2A JMP p. 3-510 and CALL p. 3-125: in V86 the
+    // CS limit is FFFFh, so a 32-bit near target above it (66h) is #GP(0)
+    // before any effect, and a 16-bit one truncates first.
+    for model in MODELS {
+        for override66 in [false, true] {
+            for form in NEAR_FORMS {
+                for target in [0xffffu32, 0x0001_0010] {
+                    let mut code = near_warm(false);
+                    let ip = 0x100 + code.len() as u32;
+                    code.extend(near(form, ip, false, override66, target));
+                    for budget in [1, 4, 5, 6] {
+                        let (avm, mut a) = v86(model, &code, true);
+                        let (bvm, mut b) = v86(model, &code, false);
+                        for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                            cpu.cpu.gpr[3] = 0xffff_ffff;
+                            cpu.cpu.gpr[0] = u64::from(target);
+                            // DS 0A00h:40h and SS 0700h:1004h.
+                            vm.write_bytes(0xa040, &target.to_le_bytes()).unwrap();
+                            cpu.cpu.gpr[4] = 0x1004;
+                            vm.write_bytes(0x8004, &target.to_le_bytes()).unwrap();
+                            vm.write_bytes(0x10fff, &[0xf4]).unwrap();
+                            vm.write_bytes(0x1010, &[0xf4]).unwrap();
+                        }
+                        let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                        let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                        let what = format!(
+                            "{model:?} 66={override66} {form:?} {target:#x} budget={budget}"
+                        );
+                        assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what}");
+                        b.cpu.legacy.cr0 |= 0x8000_0000;
+                        assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu), "{what}");
+                        let mut am = vec![0; 0x1e000];
+                        let mut bm = vec![0; 0x1e000];
+                        avm.read_bytes(0, &mut am).unwrap();
+                        bvm.read_bytes(0, &mut bm).unwrap();
+                        assert!(am == bm, "{what}: memory");
+                        if budget == 6 && override66 && target > 0xffff {
+                            assert!(
+                                matches!(exit(&ar), Exit::Exception { vector: 13, .. }),
+                                "{what}: {ar:?}"
+                            );
+                            assert_eq!(a.cpu.rip, u64::from(ip), "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `flat32` at `cpl`: at CPL 3 the caches carry DPL 3 and every page table
+/// entry is a user page.
+fn flat32_at(model: CpuModel, code: &[u8], cpl: u8, checked: bool) -> (Vm, Vcpu) {
+    let (vm, mut cpu) = flat32(model, code, true, checked);
+    if cpl == 3 {
+        cpu.cpu.legacy.cpl = 3;
+        for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+            cache.attributes |= 0x60;
+            if i == 5 && checked {
+                cache.attributes &= !0x80;
+            }
+        }
+        for selector in [
+            &mut cpu.cpu.cs,
+            &mut cpu.cpu.ds,
+            &mut cpu.cpu.es,
+            &mut cpu.cpu.ss,
+        ] {
+            *selector |= 3;
+        }
+        vm.write_bytes(0x1e000, &0x1f007u32.to_le_bytes()).unwrap();
+        for page in 0..0x240u32 {
+            vm.write_bytes(
+                0x1f000 + u64::from(page * 4),
+                &((page * 4096) | 7).to_le_bytes(),
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(
+        class(&cpu),
+        if checked {
+            SegmentClass::Checked
+        } else {
+            SegmentClass::Flat32
+        }
+    );
+    (vm, cpu)
+}
