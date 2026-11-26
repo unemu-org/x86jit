@@ -4313,3 +4313,49 @@ marks a derived estimate.
 
 Items 1–5 are where the PC-class embedder's ceilings are lowest (80286 protected 3045, 386
 paged 2046); items 6–8 lift real mode, which is already the cheapest regime.
+
+## Interpreter flag liveness, xj-to9.28 — MEASURED 2026-11-26
+
+Not applied: the gain is real on register-heavy real-mode loops, but computing it at lift costs
+more than the +0.3 % limit on the self-modifying-code cells, and keeping the flags exact
+needs more than lift-time narrowing. Tree `da16ccf0`, default release profile, host
+instructions per guest step (`real16_loops` divisor 8, three rounds, all paths per process;
+`machine32_loops` 100,000 iterations, three rounds, median), on a loaded shared host.
+Throwaway switch, reverted; the switch costs one `OnceLock` load per lifted block.
+
+The switch narrowed the ALU masks of the interpreter's IR (application `lift_block`, the
+twenty-bit block assembly) with the JIT's backward liveness, all flags live at block end, in
+three variants: **v1** block end only (the study's experiment); **v2** also all flags live
+before every op that can leave the walk or observe state (anything but register, ALU,
+`GetCond`, `SetCf`, `LAHF`/`SAHF`, `Jump`, `Branch`) and at the start of its instruction,
+which is what exact flags at faults, MMIO exits, deliveries and rollbacks require, leaving
+cuts at a plain `InsnStart` (budget, IRQ, TF, exit word, lockstep) to a cold recovery;
+**v3** all flags live at every `InsnStart` (no recovery needed).
+
+| Workload, paths | v1 | v2 | v3 |
+|---|---:|---:|---:|
+| `alu`, alias / I80286, I80386 / twenty-bit | −4.5 / −4.4 / −4.1 % | same | 0 |
+| `load`, `load-odd`, all paths | −2.0..−2.4 % | same | 0 |
+| `straight-line`, alias and Direct / twenty-bit | −2.5..−2.8 / −1.6..−1.9 % | same | 0 |
+| `dos-mixed`, alias and Direct / twenty-bit | −1.8 / −1.2 % | −1.8 / −1.0 % | 0 |
+| `store`, `push-pop`, `call-ret`, `rep-movsw`, `ip-boundary-*`, `data-next-to-*` | 0 (±0.2 %) | 0 | 0 |
+| `machine32_loops` `register`: `application-interp32` / `machine-real16` | −4.9 / −4.6 % | same | 0 |
+| `machine32_loops` `memory` `application-interp32` | −1.3 % | 0 | 0 |
+| every protected, paged and V86 path, every workload | 0 (±0.15 %) | 0 | 0 |
+| SMC cells (`smc-next-1/64`, `smc-rmw-64`), alias / twenty-bit | +3.2..+4.3 / +1.7..+2.4 % | +3.8..+5.0 / +2.0..+2.7 % | +3.7..+4.8 / +2.0..+2.5 % |
+| the same, allocation-free single-pass v2 | | +1.7..+2.0 / +0.34..+1.1 % | |
+
+- **The gain** is cross-instruction only (v3 is zero) and survives the fault barriers (v2
+  equals v1 except `dos-mixed` twenty-bit and interp32 `memory`). The protected and paged
+  walks gain nothing: their IR is full of `Legacy` ops, which read all flags.
+- **The cost** is the pass at lift: the SMC cells relift a block after every store, and even
+  the allocation-free pass adds 70–190 host instructions per step there (I80286/I80386 0:
+  they relift one Checked instruction). A shippable version adds a copy of the original masks
+  on top, so eager narrowing at lift cannot meet +0.3 %.
+- **What a version within the limit needs:** narrowing on a later hit of a block, not at lift
+  (the SMC blocks run once), kept beside the architectural IR, not in it, because JIT tier-up
+  takes `ir.ops` as the original masks for its own exit recovery and `retry_instruction`
+  slices one instruction out of a block; plus recovery of the omitted flags at every
+  `InsnStart` cut, from the writer's inputs (nothing checks that temps are assigned once, so that
+  needs a check or a saved recipe). That is a new `IrBlock` member and changes in lift, dispatch and
+  `walk_ops`, for at most the v2 column.
