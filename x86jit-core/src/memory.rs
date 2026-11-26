@@ -942,6 +942,9 @@ pub struct Memory {
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: CodePages,
     code_aliases: Arc<Mutex<CodeAliases>>,
+    // Any declaration is live: gates the walks' alias expansion of stores made
+    // without an observer (`InterpreterMemory::note_unobserved_write`).
+    code_aliases_declared: AtomicBool,
     code_tag_epoch: AtomicU64,
     code_barrier_epoch: AtomicU64,
     pub(crate) source_barrier: crate::process_barrier::ProcessBarrier,
@@ -1620,6 +1623,7 @@ impl Memory {
             trap_intervals: Vec::new(),
             code_page,
             code_aliases,
+            code_aliases_declared: AtomicBool::new(false),
             code_tag_epoch: AtomicU64::new(0),
             code_barrier_epoch: AtomicU64::new(0),
             source_barrier,
@@ -1786,6 +1790,7 @@ impl Memory {
         if !aliases.pairs.insert(pair) {
             return Ok(());
         }
+        self.code_aliases_declared.store(true, Ordering::Relaxed);
         let mut affected = BTreeSet::new();
         CodeAliases::edges(a, b, len, |a, b| {
             *aliases.pages.entry(a).or_default().entry(b).or_default() += 1;
@@ -1815,6 +1820,9 @@ impl Memory {
         let pair = (a.min(b), a.max(b), len);
         if !aliases.pairs.remove(&pair) {
             return false;
+        }
+        if aliases.pairs.is_empty() {
+            self.code_aliases_declared.store(false, Ordering::Relaxed);
         }
         let mut affected = BTreeSet::new();
         CodeAliases::edges(a, b, len, |a, b| {
@@ -2181,6 +2189,39 @@ impl Memory {
     /// for every guest that does not modify its own code.
     pub fn has_dirty_code(&self) -> bool {
         self.dirty_flag.load(Ordering::Relaxed) || self.child_dispatch.dirty.load(Ordering::Acquire)
+    }
+
+    /// Whether any code alias is declared ([`Self::declare_code_alias`]).
+    #[inline(always)]
+    pub(crate) fn has_code_aliases(&self) -> bool {
+        self.code_aliases_declared.load(Ordering::Relaxed)
+    }
+
+    /// Every declared view of the written bytes `addr..addr + len` on a code
+    /// page, the written range included, as `(lo, hi)` ranges; `visit` sees
+    /// each. A byte on a page with no code tag is not expanded: an alias of
+    /// live code shares its tag (`refresh_code_aliases`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn visit_code_alias_views(
+        &self,
+        addr: u64,
+        len: usize,
+        mut visit: impl FnMut(u64, u64),
+    ) {
+        let end = addr.saturating_add(len.max(1) as u64);
+        let mut aliases = None;
+        for page in code_page_range(addr, len as u64) {
+            if !self.is_code_page(page) {
+                continue;
+            }
+            let lo = addr.max(page << CODE_PAGE_BITS);
+            let hi = end.min((page + 1) << CODE_PAGE_BITS);
+            let aliases = aliases.get_or_insert_with(|| self.code_aliases.lock().unwrap());
+            for (lo, hi) in aliases.written_ranges(lo, hi) {
+                visit(lo, hi);
+            }
+        }
     }
 
     /// Whether page `p` currently backs translated code — the precise test behind the
@@ -5775,6 +5816,13 @@ pub(crate) trait InterpreterMemory {
     fn normal(&self) -> &Memory;
     fn note_block_write(&self, _addr: u64, _len: usize) {}
     fn note_host_block_write(&self, _host: u64, _addr: u64, _len: usize) {}
+    /// A store made through [`Self::normal`], whose code-page notification
+    /// reached `Memory` rather than this provider: report the written bytes
+    /// and, when the provider tracks a running block, their declared aliases.
+    #[inline(always)]
+    fn note_unobserved_write(&self, addr: u64, len: usize) {
+        self.note_block_write(addr, len)
+    }
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap>;
     fn write<const ROUTED: bool>(&self, addr: u64, value: u64, size: u8) -> Result<(), MemTrap>;
     fn write_preflighted<const ROUTED: bool>(
@@ -5972,6 +6020,20 @@ impl InterpreterMemory for RunningMemory<'_> {
             self.overlap(addr, len);
         }
     }
+    // An observed store's code-page path expands aliases before it calls
+    // `note_block_write`; a store made through `Memory` has only its own
+    // view here, so another view of the running block is expanded here.
+    // One relaxed load keeps the expansion off a store with no alias declared.
+    #[inline(always)]
+    fn note_unobserved_write(&self, addr: u64, len: usize) {
+        if addr < self.end && addr.saturating_add(len as u64) > self.start {
+            self.overlap(addr, len);
+        } else if self.memory.has_code_aliases() {
+            self.memory.visit_code_alias_views(addr, len, |lo, hi| {
+                self.note_block_write(lo, (hi - lo) as usize)
+            });
+        }
+    }
     // The interpreter walk's transfers are containment-only. A miss over adjacent
     // regions ends the attempt with its usual exit; the instruction is then
     // re-executed through `SplitMemory` (`interp::split_block`).
@@ -6071,6 +6133,10 @@ impl<M: InterpreterMemory> InterpreterMemory for SplitMemory<'_, M> {
     #[inline(always)]
     fn note_host_block_write(&self, host: u64, addr: u64, len: usize) {
         self.0.note_host_block_write(host, addr, len)
+    }
+    #[inline(always)]
+    fn note_unobserved_write(&self, addr: u64, len: usize) {
+        self.0.note_unobserved_write(addr, len)
     }
     #[inline(always)]
     fn read<const ROUTED: bool>(&self, addr: u64, size: u8) -> Result<u64, MemTrap> {

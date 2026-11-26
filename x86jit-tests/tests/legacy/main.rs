@@ -11,6 +11,7 @@ mod legacy_alias;
 mod legacy_boundary_events;
 mod legacy_bus_width;
 mod legacy_census_386;
+mod legacy_code_alias_smc;
 mod legacy_contract;
 mod legacy_debug_test;
 mod legacy_delivery_liveness;
