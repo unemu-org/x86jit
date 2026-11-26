@@ -4570,3 +4570,25 @@ of the ring-0 stack page), the post-return V86 PUSH's transaction ~10,000 (an or
 TLB miss, not specific to V86), the monitor's instructions ~15,000, context reselection on
 both transfers. Letting the ordinary paged lane walk on a TLB miss instead of taking the
 transaction is the next item for this workload and for any paged loop with conflicting pages.
+
+## Machine vs Compat32 instruction rate — MEASURED 2026-11-26
+
+J0 of decision-23 §8, recorded in decision-27, Amendment of 2026-11-26, § Measurement (method there). Tree ef36cb3c,
+`machine32_loops 2000000 1 PATH WORKLOAD`, I80386, three fresh processes per cell
+(`perf_campaign.run_process`, ASLR off), host instructions per guest step
+(`proc_pid_rusage` `ri_instructions`), medians; spread under 0.2 %. Load average 9–15, so
+no wall time.
+
+| Path | register | memory | callret | register (perf) | memory (perf) | callret (perf) |
+|---|---:|---:|---:|---:|---:|---:|
+| `machine-protected32` | 426.2 | 567.1 | 1050.1 | 422.2 | 569.3 | 1039.8 |
+| `machine-protected32-cpl3` | 426.1 | 566.8 | 1050.0 | 422.1 | 569.2 | 1039.8 |
+| `machine-paged32` | 595.0 | 889.5 | 1491.1 | 582.4 | 877.0 | 1453.9 |
+| `machine-paged32-cpl3` | 598.3 | 892.3 | 1494.6 | 585.5 | 880.1 | 1456.9 |
+| `application-interp32` | 276.7 | 299.2 | 472.9 | 280.8 | 308.8 | 468.9 |
+| `application-jit32` | 18.5 | 41.9 | 69.0 | 18.6 | 42.1 | 69.5 |
+
+The Machine Flat32 interpreter is 13.5–23× the Compat32 JIT on the same bytes, and paged
+21–32×. Decision-29 derives an expected compiled Machine range of 50–102 (register),
+77–133 (memory) and 166–326 (callret) unpaged, under stated per-turn and TLB-probe
+assumptions.

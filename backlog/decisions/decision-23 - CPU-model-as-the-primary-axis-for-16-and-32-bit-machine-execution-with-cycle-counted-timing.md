@@ -621,6 +621,16 @@ context pays a TLB probe that Application code does not. A Machine guest will be
 slower than the same code under Application Compat32. How much is a J0/J3
 measurement, not a claim made here.
 
+**Amendment (stage plan, 2026-11-26, accepted by the maintainer).** The amendment of
+2026-11-26 to decision-27 refines this stage plan: the library keeps one JIT mechanism
+for every mode, and Machine differences are parameters of it; J3 and J4 merge into one
+stage (paged flat code at CPL 0 and 3, user/supervisor rights in the TLB probe from the
+start); an optional J2b adds compiled-to-compiled chaining once J2's per-turn cost is
+measured; J5 stays last, and 16-bit protected code and V86 stay interpreted until then.
+Compiled Machine code reads write-checked memory through the software TLB and finds
+code-page stores through the Application JIT's code-range watermark rather than by never
+installing write entries for tagged pages. The table above keeps its original text.
+
 ## Timing model
 
 Three levels. Level 1 exists and is the default. Level 2 is added by this record
