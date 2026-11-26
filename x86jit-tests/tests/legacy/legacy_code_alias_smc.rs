@@ -4,15 +4,23 @@
 //! fetch of the bytes it changed, inside the running block too (spec.md §10;
 //! decision-23 excludes a prefetch queue), on the twenty-bit models, the
 //! 80286 and 80386 in real mode, protected 16-bit code (80286 Segmented and
-//! Checked, 80386) and 80386/80486 paged 16-bit code, for every budget slicing.
+//! Checked, 80386), 80386/80486 paged 16-bit code and the Application Real16
+//! personality, for every budget slicing; for a block that never entered the
+//! cache too (a failed source barrier), with three views, and for a store
+//! that spans two pages.
 #![cfg(unix)]
 
 use std::os::fd::{AsRawFd, FromRawFd};
-use x86jit_core::{CpuModel, Exit, Prot, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig};
+use x86jit_core::{
+    CpuMode, CpuModel, Exit, Prot, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig,
+};
 
 const LEN: usize = 0x20000;
 /// The two views of one 16 KiB shared file.
 const VIEWS: [u32; 2] = [0x4000, 0x18000];
+/// Three views of it, declared as a chain: the first and the last are
+/// aliases only through the middle one.
+const VIEWS3: [u32; 3] = [0x4000, 0xc000, 0x18000];
 const VIEW_LEN: usize = 0x4000;
 /// The code's offset in either view, and its segment offset.
 const BASE: u16 = 0x3c00;
@@ -25,8 +33,13 @@ const N: u8 = 40;
 enum Path {
     Twenty(CpuModel),
     Real(CpuModel),
-    Protected16 { model: CpuModel, checked: bool },
+    Protected16 {
+        model: CpuModel,
+        checked: bool,
+    },
     Paged16(CpuModel),
+    /// The Application personality's Real16 mode: no CPU model.
+    Application,
 }
 
 const PATHS: [Path; 11] = [
@@ -73,7 +86,15 @@ fn shared_file() -> std::fs::File {
 
 /// A Machine VM whose RAM at both `VIEWS` is one shared page set, declared
 /// to the engine as a code alias.
-fn alias_vm(model: CpuModel) -> Vm {
+fn alias_vm(path: Path) -> Vm {
+    views_vm(path, &VIEWS, &[(0, 1)])
+}
+
+/// A VM for `path` whose RAM at every view in `views` is one shared page
+/// set; each `(i, j)` declares views `i` and `j` a code alias. The process
+/// barrier is constructed available, so `with_barrier_flush_failure` keeps
+/// every newly lifted block out of the cache.
+fn views_vm(path: Path, views: &[u32], pairs: &[(usize, usize)]) -> Vm {
     let file = shared_file();
     // SAFETY: a fresh anonymous reservation; MAP_FIXED replaces only pages
     // inside it with two views of the same file.
@@ -87,7 +108,7 @@ fn alias_vm(model: CpuModel) -> Vm {
             0,
         );
         assert_ne!(ptr, libc::MAP_FAILED);
-        for view in VIEWS {
+        for &view in views {
             let at = ptr.cast::<u8>().add(view as usize).cast();
             assert_eq!(
                 libc::mmap(
@@ -113,17 +134,24 @@ fn alias_vm(model: CpuModel) -> Vm {
         }),
         protect: None,
     };
-    let mut vm = Vm::with_backend_host_ram(
-        VmConfig::reserved(LEN as u64),
-        Box::new(x86jit_core::InterpreterBackend),
-        ram,
-    )
+    let mut vm = x86jit_core::with_barrier_success(|| {
+        Vm::with_backend_host_ram(
+            VmConfig::reserved(LEN as u64),
+            Box::new(x86jit_core::InterpreterBackend),
+            ram,
+        )
+    })
     .unwrap();
-    vm.set_cpu_model(model);
+    match model(path) {
+        Some(model) => vm.set_cpu_model(model),
+        None => vm.set_cpu_mode(CpuMode::Real16),
+    }
     vm.map(0, LEN, Prot::RWX, RegionKind::Ram).unwrap();
-    vm.mem
-        .declare_code_alias(u64::from(VIEWS[0]), u64::from(VIEWS[1]), VIEW_LEN)
-        .unwrap();
+    for &(i, j) in pairs {
+        vm.mem
+            .declare_code_alias(u64::from(views[i]), u64::from(views[j]), VIEW_LEN)
+            .unwrap();
+    }
     vm
 }
 
@@ -134,7 +162,7 @@ fn vcpu(vm: &Vm, path: Path, code: u32, data: u32) -> Vcpu {
     cpu.cpu.rip = u64::from(BASE);
     cpu.cpu.gpr[4] = 0x3000;
     match path {
-        Path::Twenty(_) => {
+        Path::Twenty(_) | Path::Application => {
             cpu.cpu.cs = (code >> 4) as u16;
             cpu.cpu.ds = (data >> 4) as u16;
             cpu.cpu.ss = (data >> 4) as u16;
@@ -182,6 +210,18 @@ fn vcpu(vm: &Vm, path: Path, code: u32, data: u32) -> Vcpu {
         }
     }
     cpu
+}
+
+/// Run to HLT in `slice`-step slices; `uncached` fails every source
+/// barrier, so each block runs once, uncached. Otherwise the barrier
+/// succeeds without a host command, on every host.
+fn run_as(vm: &Vm, cpu: &mut Vcpu, slice: u64, uncached: bool) {
+    if !uncached {
+        return x86jit_core::with_barrier_success(|| run(vm, cpu, slice));
+    }
+    let before = vm.memory_stats().source_barrier_uncached_executions;
+    x86jit_core::with_barrier_flush_failure(|| run(vm, cpu, slice));
+    assert!(vm.memory_stats().source_barrier_uncached_executions > before);
 }
 
 fn run(vm: &Vm, cpu: &mut Vcpu, slice: u64) {
@@ -251,19 +291,32 @@ fn cases() -> Vec<(&'static str, Vec<u8>, u8)> {
     ]
 }
 
-#[test]
-fn store_through_one_view_is_fetched_through_the_other() {
+/// Every ordered pair of distinct views.
+fn directions(views: &[u32]) -> Vec<(u32, u32)> {
+    let mut pairs = Vec::new();
+    for &code in views {
+        for &data in views {
+            if code != data {
+                pairs.push((code, data));
+            }
+        }
+    }
+    pairs
+}
+
+/// The loop cases on `paths`, with the views of `views_vm(_, views, pairs)`.
+fn loops(paths: &[Path], views: &[u32], pairs: &[(usize, usize)], uncached: bool, slices: &[u64]) {
     let mut failed = Vec::new();
-    for path in PATHS {
-        let vm = alias_vm(model(path));
-        for (code_view, data_view) in [(VIEWS[0], VIEWS[1]), (VIEWS[1], VIEWS[0])] {
+    for &path in paths {
+        let vm = views_vm(path, views, pairs);
+        for (code_view, data_view) in directions(views) {
             for (name, body, dl) in cases() {
                 let code = looped(&body);
-                for slice in [u64::MAX, 1, 3] {
+                for &slice in slices {
                     vm.write_bytes(u64::from(code_view + u32::from(BASE)), &code)
                         .unwrap();
                     let mut cpu = vcpu(&vm, path, code_view, data_view);
-                    run(&vm, &mut cpu, slice);
+                    run_as(&vm, &mut cpu, slice, uncached);
                     let got = cpu.cpu.gpr[2] as u8;
                     if got != dl {
                         failed.push(format!(
@@ -278,10 +331,52 @@ fn store_through_one_view_is_fetched_through_the_other() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-fn model(path: Path) -> CpuModel {
+#[test]
+fn store_through_one_view_is_fetched_through_the_other() {
+    loops(&PATHS, &VIEWS, &[(0, 1)], false, &[u64::MAX, 1, 3]);
+}
+
+/// The paths whose blocks consult the source barrier before they enter the
+/// cache, the Application personality included: the 80286 Checked and the
+/// paged walks lift without it.
+fn uncached_paths() -> Vec<Path> {
+    let mut paths: Vec<_> = PATHS
+        .into_iter()
+        .filter(|path| {
+            !matches!(
+                path,
+                Path::Protected16 { checked: true, .. } | Path::Paged16(_)
+            )
+        })
+        .collect();
+    paths.push(Path::Application);
+    paths
+}
+
+#[test]
+fn uncached_block_sees_a_store_through_the_other_view() {
+    // A block the failed source barrier kept out of the cache: its lift
+    // ends before its walk starts (spec.md §10).
+    loops(&uncached_paths(), &VIEWS, &[(0, 1)], true, &[u64::MAX, 3]);
+}
+
+#[test]
+fn store_through_a_third_view_is_fetched_through_the_first() {
+    loops(&PATHS, &VIEWS3, &[(0, 1), (1, 2)], false, &[u64::MAX]);
+    loops(
+        &uncached_paths(),
+        &VIEWS3,
+        &[(0, 1), (1, 2)],
+        true,
+        &[u64::MAX],
+    );
+}
+
+fn model(path: Path) -> Option<CpuModel> {
     match path {
-        Path::Twenty(model) | Path::Real(model) | Path::Paged16(model) => model,
-        Path::Protected16 { model, .. } => model,
+        Path::Twenty(model) | Path::Real(model) | Path::Paged16(model) => Some(model),
+        Path::Protected16 { model, .. } => Some(model),
+        Path::Application => None,
     }
 }
 
@@ -304,7 +399,7 @@ fn system_table_store_through_one_view_is_fetched_through_the_other() {
         if matches!(path, Path::Twenty(_)) {
             continue;
         }
-        let vm = alias_vm(model(path));
+        let vm = alias_vm(path);
         for (code_view, data_view) in [(VIEWS[0], VIEWS[1]), (VIEWS[1], VIEWS[0])] {
             for slice in [u64::MAX, 1] {
                 vm.write_bytes(u64::from(code_view + u32::from(BASE)), &code)
@@ -312,7 +407,7 @@ fn system_table_store_through_one_view_is_fetched_through_the_other() {
                 let mut cpu = vcpu(&vm, path, code_view, data_view);
                 cpu.cpu.legacy.idtr.limit = 0x2ab2;
                 cpu.cpu.legacy.idtr.base = 0x02eb;
-                run(&vm, &mut cpu, slice);
+                run_as(&vm, &mut cpu, slice, false);
                 let got = cpu.cpu.gpr[2] as u8;
                 if got != 0x2a {
                     failed.push(format!(
@@ -331,23 +426,33 @@ fn system_table_store_through_one_view_is_fetched_through_the_other() {
 /// MOV DX,1234h, so DX equals the stored word only if that instruction ran
 /// its new bytes.
 fn one_shot(code: &[u8], imm: u16, sp: u16, paths: impl Fn(Path) -> bool) {
+    let paths: Vec<_> = PATHS.into_iter().filter(|&path| paths(path)).collect();
+    one_shot_at(&paths, BASE, code, imm, sp, false);
+}
+
+/// `one_shot` with the code at offset `base` of either view, on `paths`;
+/// `uncached` keeps every block out of the cache. AX holds 0BEEFh.
+fn one_shot_at(paths: &[Path], base: u16, code: &[u8], imm: u16, sp: u16, uncached: bool) {
     let mut failed = Vec::new();
-    for path in PATHS.into_iter().filter(|&path| paths(path)) {
-        let vm = alias_vm(model(path));
+    for &path in paths {
+        let vm = alias_vm(path);
         for (code_view, data_view) in [(VIEWS[0], VIEWS[1]), (VIEWS[1], VIEWS[0])] {
             for slice in [u64::MAX, 1] {
-                vm.write_bytes(u64::from(code_view + u32::from(BASE)), code)
+                vm.write_bytes(u64::from(code_view + u32::from(base)), code)
                     .unwrap();
                 let mut cpu = vcpu(&vm, path, code_view, data_view);
+                cpu.cpu.rip = u64::from(base);
+                cpu.cpu.gpr[0] = 0xbeef;
                 cpu.cpu.gpr[4] = u64::from(sp);
-                run(&vm, &mut cpu, slice);
-                let at = u64::from(code_view + u32::from(BASE + imm));
+                run_as(&vm, &mut cpu, slice, uncached);
+                let at = u64::from(code_view + u32::from(base + imm));
                 let stored = vm.mem.read(at, 2).unwrap();
                 let got = cpu.cpu.gpr[2] as u16;
                 if u64::from(got) != stored || stored == 0x1234 {
                     failed.push(format!(
                         "{path:?}: code at {code_view:#x}, stores through \
-                         {data_view:#x}, slice {slice}: DX {got:#x}, stored {stored:#x}"
+                         {data_view:#x}, slice {slice}, uncached {uncached}: \
+                         DX {got:#x}, stored {stored:#x}"
                     ));
                 }
             }
@@ -376,4 +481,108 @@ fn x87_store_through_one_view_is_fetched_through_the_other() {
         0x3000,
         |path| matches!(path, Path::Twenty(_) | Path::Real(_)),
     );
+}
+
+#[test]
+fn application_stack_store_through_one_view_is_fetched_through_the_other() {
+    // The Application Real16 personality runs PUSHF through its shared
+    // helper on the raw memory. PUSHF; MOV DX,1234h; HLT
+    for uncached in [false, true] {
+        one_shot_at(
+            &[Path::Application],
+            BASE,
+            &[0x9c, 0xba, 0x34, 0x12, 0xf4],
+            2,
+            BASE + 4,
+            uncached,
+        );
+    }
+}
+
+#[test]
+fn store_spanning_two_pages_is_fetched_through_the_other_view() {
+    // The block crosses a page edge of either view; the word store writes
+    // the next instruction's immediate, one byte on each page.
+    // MOV [P-1],AX; MOV DX,1234h; HLT, with P = 3000h the page edge.
+    const AT: u16 = 0x3000 - 5;
+    let [lo, hi] = (AT + 4).to_le_bytes();
+    let code = [0xa3, lo, hi, 0xba, 0x34, 0x12, 0xf4];
+    let mut paths = PATHS.to_vec();
+    paths.push(Path::Application);
+    one_shot_at(&paths, AT, &code, 4, 0x3000, false);
+    one_shot_at(&uncached_paths(), AT, &code, 4, 0x3000, true);
+}
+
+#[test]
+fn views_follow_the_memory_across_threads_and_vms() {
+    // The walk maps a running block's views per thread
+    // (`Memory::running_view_reach`): two memories with different views at
+    // the same addresses, and a vCPU moved to another thread mid-loop, each
+    // see only their own declarations.
+    let path = Path::Twenty(CpuModel::I8086);
+    let two = views_vm(path, &VIEWS, &[(0, 1)]);
+    // A second, unrelated declaration: both memories have made as many.
+    two.mem.declare_code_alias(0x1000, 0x2000, 0x100).unwrap();
+    let three = views_vm(path, &VIEWS3, &[(0, 1), (1, 2)]);
+    let (_, body, dl) = cases().remove(0);
+    let code = looped(&body);
+    let start = |vm: &Vm, code_view: u32, data_view: u32| {
+        vm.write_bytes(u64::from(code_view + u32::from(BASE)), &code)
+            .unwrap();
+        vcpu(vm, path, code_view, data_view)
+    };
+    let finish = |vm: &Vm, mut cpu: Vcpu| {
+        run_as(vm, &mut cpu, 3, false);
+        cpu.cpu.gpr[2] as u8
+    };
+    // Part of the loop here, the rest on another thread.
+    let half = |vm: &Vm, cpu: &mut Vcpu| {
+        for _ in 0..N / 2 {
+            let r = x86jit_core::with_barrier_success(|| {
+                cpu.run_steps(vm, 3, StepOptions::default()).unwrap()
+            });
+            assert!(matches!(r.stop(), StepStop::Exit(Exit::BudgetExhausted)));
+        }
+    };
+    let mut a = start(&two, VIEWS[0], VIEWS[1]);
+    half(&two, &mut a);
+    let mut b = start(&three, VIEWS3[0], VIEWS3[2]);
+    half(&three, &mut b);
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| finish(&two, a));
+        let b = scope.spawn(|| finish(&three, b));
+        assert_eq!(a.join().unwrap(), dl);
+        assert_eq!(b.join().unwrap(), dl);
+    });
+    // The same block, on one thread, in either memory.
+    assert_eq!(finish(&two, start(&two, VIEWS[0], VIEWS[1])), dl);
+    assert_eq!(finish(&three, start(&three, VIEWS3[0], VIEWS3[1])), dl);
+}
+
+#[test]
+fn uncached_block_tags_end_with_its_lift_without_aliases() {
+    // With no alias declared, a block that never entered the cache leaves no
+    // code tag once its lift ends, whatever the thread runs next.
+    let path = Path::Twenty(CpuModel::I8086);
+    let first = views_vm(path, &VIEWS, &[]);
+    let second = views_vm(path, &VIEWS, &[]);
+    let (_, body, dl) = cases().remove(0);
+    let code = looped(&body);
+    let page = u64::from(VIEWS[0] + u32::from(BASE)) >> 12;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                for (vm, uncached) in [(&first, true), (&second, false)] {
+                    vm.write_bytes(u64::from(VIEWS[0] + u32::from(BASE)), &code)
+                        .unwrap();
+                    let mut cpu = vcpu(vm, path, VIEWS[0], VIEWS[0]);
+                    run_as(vm, &mut cpu, u64::MAX, uncached);
+                    assert_eq!(cpu.cpu.gpr[2] as u8, dl);
+                }
+                assert!(!first.mem.is_code_page(page));
+            })
+            .join()
+            .unwrap();
+    });
+    assert!(!first.mem.is_code_page(page));
 }

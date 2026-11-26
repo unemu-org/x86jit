@@ -1352,6 +1352,25 @@ pub(crate) fn qualify_lifted_exit(exit: Exit, ir: &IrBlock) -> Exit {
     crate::fault::qualify_lifted(exit, infos.iter().find(|i| i.rip == rip))
 }
 
+/// Report a twenty-bit x87 store of `bytes` bytes from bus tag `tag`, made
+/// through `Memory`, to the walk: one range when the bytes are consecutive
+/// (no offset or bus wrap), else byte by byte. The running block reaches the
+/// same verdict for the range as for its bytes. Out of line: the coprocessor
+/// path stays off the walk's frame.
+#[cold]
+#[inline(never)]
+fn note_x87_store(mem: &impl InterpreterMemory, tag: u64, bytes: usize) {
+    let first = i8086::physical(tag, 0);
+    let last = bytes - 1;
+    if i8086::physical(tag, last as u8) == first + last as u64 {
+        mem.note_unobserved_write(first, bytes);
+    } else {
+        for i in 0..bytes {
+            mem.note_unobserved_write(i8086::physical(tag, i as u8), 1);
+        }
+    }
+}
+
 // Keep helper-only scans and ordering state out of the ordinary op walk.
 #[cold]
 #[inline(never)]
@@ -1606,12 +1625,7 @@ fn walk_ops<
                         } = op
                         {
                             if let Some(bytes) = crate::x87::mem_write_bytes(*kind) {
-                                for i in 0..bytes {
-                                    mem.0.note_unobserved_write(
-                                        i8086::physical(read_val(*addr, temps), i as u8),
-                                        1,
-                                    );
-                                }
+                                note_x87_store(&mem.0, read_val(*addr, temps), bytes);
                             }
                         }
                     }

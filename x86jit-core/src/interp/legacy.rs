@@ -3769,7 +3769,7 @@ pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
             memory.0.normal().region_kind(addr, size),
             Ok(crate::RegionKind::Rom)
         ) {
-            memory.0.note_block_write(addr, usize::from(size));
+            memory.0.note_unobserved_write(addr, usize::from(size));
         }
     };
     // The alias keeps its 32-bit address formation (decision-23 §6).

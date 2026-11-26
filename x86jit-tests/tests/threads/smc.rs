@@ -1382,12 +1382,14 @@ fn code_alias_lifecycle_preserves_other_views() {
     assert!(!mem.is_code_page(4));
     assert!(mem.is_code_page(8));
     assert!(!mem.remove_code_alias(0x8000, 0x4000, 0x1000));
+    // A declared view keeps its tag once code ran on it, through every
+    // clear, until its last declaration goes (spec.md §10).
     mem.clear_code_page(9);
-    assert!(!mem.is_code_page(8));
+    assert!(mem.is_code_page(8));
     mem.mark_code(0x9000, 1);
     assert!(mem.is_code_page(8));
     mem.clear_all_code_pages();
-    assert!(!mem.is_code_page(8));
+    assert!(mem.is_code_page(8));
     mem.mark_code(0x9000, 1);
     assert!(mem.remove_code_alias(0x9000, 0x8000, 0x1000));
     assert!(!mem.is_code_page(8));

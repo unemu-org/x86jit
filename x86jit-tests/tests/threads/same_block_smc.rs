@@ -282,9 +282,10 @@ fn another_vcpu_clears_tag_before_running_block_patches_itself() {
     });
 }
 
+/// A flat 64 KiB VM whose RAM at 0x4000 and 0xc000 is one shared 16 KiB
+/// file, declared to the engine as a code alias.
 #[cfg(unix)]
-#[test]
-fn serialized_store_through_declared_alias_refetches_running_block() {
+fn alias_vm(prot: [Prot; 2]) -> Vm {
     use std::os::fd::{AsRawFd, FromRawFd};
 
     let mut name = std::env::temp_dir()
@@ -346,18 +347,28 @@ fn serialized_store_through_declared_alias_refetches_running_block() {
     )
     .unwrap();
     vm.set_tier_up_after(None);
-    vm.map(0x4000, 0x4000, Prot::RX, RegionKind::Ram).unwrap();
-    vm.map(0xc000, 0x4000, Prot::RW, RegionKind::Ram).unwrap();
+    vm.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0x4000, 0x4000, prot[0], RegionKind::Ram).unwrap();
+    vm.map(0x8000, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.map(0xc000, 0x4000, prot[1], RegionKind::Ram).unwrap();
     vm.mem.declare_code_alias(0x4000, 0xc000, 0x4000).unwrap();
+    vm
+}
+
+#[cfg(unix)]
+#[test]
+fn serialized_store_through_declared_alias_refetches_running_block() {
+    let vm = alias_vm([Prot::RX, Prot::RW]);
     // SDM Vol 3A §14.6: CPUID resynchronizes code fetched through another
     // linear address. mov byte [rdi],42h; cpuid; target: mov al,0; hlt
     vm.write_bytes(0x4000, &[0xc6, 0x07, 0x42, 0x0f, 0xa2, 0xb0, 0, 0xf4])
         .unwrap();
-    // Alias expansion is reached through the store page's shared code tag.
+    // Alias expansion is reached through the store page's shared code tag,
+    // which a declared view keeps once code ran on it, cleared or not.
     vm.mem.mark_code(0x4000, 8);
     assert!(vm.mem.is_code_page(0xc));
     vm.mem.clear_code_page(4);
-    assert!(!vm.mem.is_code_page(0xc));
+    assert!(vm.mem.is_code_page(0xc));
     let mut cpu = vm.new_vcpu();
     cpu.set_reg(Reg::Rip, 0x4000);
     cpu.set_reg(Reg::Rdi, 0xc006);
@@ -415,4 +426,82 @@ fn helper_stores_cut_before_later_decoded_instructions() {
         assert_eq!(cpu.reg(Reg::Rbx), 0, "{kind}");
         assert_eq!(cpu.retired_instructions(), 1, "{kind}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn another_vcpu_clears_tag_before_running_block_patches_itself_through_an_alias() {
+    use std::io::{self, Write};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use x86jit_core::lockstep::{Trace, TraceOptions};
+
+    struct PauseAfterStore {
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    impl Write for PauseAfterStore {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // As `another_vcpu_clears_tag_before_running_block_patches_itself`, with
+    // the second store made through the other declared view: B's drain
+    // clears the running block's own tag before A stores into its next
+    // instruction. SDM Vol 3A §14.6: CPUID resynchronizes code fetched
+    // through another linear address.
+    // mov byte [rbx],17h; mov byte [rdi],42h; cpuid; mov al,0; hlt
+    let mut vm = alias_vm([Prot::RWX, Prot::RWX]);
+    vm.set_cpu_mode(CpuMode::Long64);
+    vm.write_bytes(
+        0x4000,
+        &[
+            0xc6, 0x03, 0x17, 0xc6, 0x07, 0x42, 0x0f, 0xa2, 0xb0, 0, 0xf4,
+        ],
+    )
+    .unwrap();
+    let mut a = vm.new_vcpu();
+    a.set_reg(Reg::Rip, 0x4000);
+    a.set_reg(Reg::Rbx, 0x4002);
+    a.set_reg(Reg::Rdi, 0xc009);
+    vm.write_bytes(0x9000, &[0xf4]).unwrap();
+    let mut b = vm.new_vcpu();
+    b.set_reg(Reg::Rip, 0x9000);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    vm.set_lockstep_trace(Some(Arc::new(Trace::new(
+        PauseAfterStore {
+            entered: entered_tx,
+            resume: resume_rx,
+        },
+        TraceOptions {
+            window: Some((0x4000, 0x400b)),
+            max_records: Some(1),
+        },
+    ))));
+
+    std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            let exit = a.run(&vm, None);
+            (exit, a)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let tagged_before = vm.mem.is_code_page(4);
+        let dirty_before = vm.mem.has_dirty_code();
+        let b_exit = b.run(&vm, None);
+        resume_tx.send(()).unwrap();
+        let (exit, a) = running.join().unwrap();
+        assert!(tagged_before && dirty_before);
+        assert!(matches!(b_exit, Exit::Hlt));
+        assert!(matches!(exit, Exit::Hlt));
+        assert_eq!(vm.mem.read(0x4009, 1).unwrap(), 0x42);
+        assert_eq!(a.reg(Reg::Rax) & 0xff, 0x42);
+        assert_eq!(a.retired_instructions(), 5);
+    });
 }
