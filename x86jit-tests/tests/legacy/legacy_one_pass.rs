@@ -581,10 +581,12 @@ fn rebuild(world: World, vm: &Vm, code: &[u8]) {
 #[test]
 fn a_warm_block_is_one_op_walk_and_a_budget_cut_keeps_it_one() {
     // A loop of register instructions, then one of the mixed prefix of the
-    // fault witness, each closed by JNZ (the counts never reach zero) or by a
-    // near JMP to its start, whose CS target check stays on the paged
-    // register lane: after a warm-up run every block is entered once and
-    // walked once, whether it runs to its end or a budget ends it in its middle.
+    // fault witness, each closed by JNZ (the counts never reach zero), by a
+    // near JMP rel8 to its start or by a near JMP BP (FF E5) to it, whose CS
+    // target check stays on the paged register lane (`register_lane`): an
+    // instruction off that lane adds a walk of its own. After a warm-up run
+    // every block is entered once and walked once, whether it runs to its
+    // end or a budget ends it in its middle.
     for world in WORLDS {
         for model in MODELS {
             for (body, close) in [
@@ -592,14 +594,23 @@ fn a_warm_block_is_one_op_walk_and_a_budget_cut_keeps_it_one() {
                 prefix(world),
             ]
             .into_iter()
-            .flat_map(|body| [(body.clone(), 0x75u8), (body, 0xeb)])
-            {
+            .flat_map(|body| {
+                [
+                    (body.clone(), b"\x75".as_slice()),
+                    (body.clone(), b"\xeb"),
+                    (body, b"\xff\xe5"),
+                ]
+            }) {
                 let mut code = body;
                 let instructions = if code.len() == 9 { 9 } else { 8 };
-                code.push(close);
-                code.push((-(code.len() as i8 + 1)) as u8);
+                code.extend_from_slice(close);
+                if close.len() == 1 {
+                    code.push((-(code.len() as i8 + 1)) as u8);
+                }
                 for budget in [3, 4 * (instructions + 1) + 5] {
                     let ((avm, mut a), _) = pair(world, model, &code, false);
+                    // BP holds the loop's start: the code's offset in CS.
+                    a.cpu.gpr[5] = a.cpu.rip;
                     let what = format!("{world:?} {model:?} {code:02x?} budget={budget}");
                     let initial = a.cpu.clone();
                     a.run_steps(&avm, 40, StepOptions::default()).unwrap();
@@ -616,6 +627,162 @@ fn a_warm_block_is_one_op_walk_and_a_budget_cut_keeps_it_one() {
                     );
                     assert_eq!(walks, blocks, "{what}: one op walk per block");
                 }
+            }
+        }
+    }
+}
+
+/// A real-mode machine whose caches prove Direct; the reference flips the
+/// accessed bit of the FS cache, which no instruction here addresses and a
+/// real-mode access does not read, so it keeps Checked and nothing else
+/// differs.
+fn real(model: CpuModel, code: &[u8], reference: bool) -> (Vm, Vcpu) {
+    let mut vm = Vm::new(VmConfig::flat(0x20000));
+    vm.set_cpu_model(model);
+    vm.set_exception_delivery(ExceptionDelivery::Outward);
+    vm.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();
+    vm.write_bytes(0x1100, code).unwrap();
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu = CpuState::legacy_real_entry([0x100, 0xa00, 0xb00, 0x700, 0x800, 0x900]);
+    cpu.cpu.rip = 0x100;
+    cpu.cpu.gpr[4] = 0x1000;
+    cpu.set_a20_enabled(true);
+    if reference {
+        cpu.cpu.legacy.segments[4].attributes ^= 1;
+    }
+    let expected = if reference {
+        SegmentClass::Checked
+    } else {
+        SegmentClass::Direct
+    };
+    assert_eq!(class(&cpu), expected, "{model:?}");
+    (vm, cpu)
+}
+
+/// Registers, retirement and all RAM of a real-mode run and its reference.
+fn same_real(a: &Vcpu, b: &Vcpu, avm: &Vm, bvm: &Vm, what: &str) {
+    let mut reference = b.cpu.clone();
+    reference.legacy.segments[4].attributes ^= 1;
+    assert_eq!(live(&a.cpu), live(&reference), "{what}");
+    assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
+    let mut am = vec![0; 0x20000];
+    let mut bm = vec![0; 0x20000];
+    avm.read_bytes(0, &mut am).unwrap();
+    bvm.read_bytes(0, &mut bm).unwrap();
+    assert!(am == bm, "{what}: memory");
+}
+
+/// The two runs' results. KNOWN DIVERGENCE (I80486Dx only): the Checked
+/// lowering reports a REP fault with `path: Interpreter` and no REP progress
+/// in its fault metadata, where Direct, and Checked on the 80286 and 80386,
+/// report the string helper's `RepRestart`; steps, the exit and its vector
+/// and address agree, and so does the state (`same_real`).
+fn same_stop(model: CpuModel, a: &x86jit_core::StepRun, b: &x86jit_core::StepRun, what: &str) {
+    if model != CpuModel::I80486Dx {
+        assert_eq!(format!("{a:?}"), format!("{b:?}"), "{what}");
+        return;
+    }
+    assert_eq!(a.steps(), b.steps(), "{what}");
+    let key = |run: &x86jit_core::StepRun| match run.stop() {
+        StepStop::Exit(Exit::Exception { addr, vector, .. }) => format!("{addr:x} {vector}"),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(key(a), key(b), "{what}");
+}
+
+#[test]
+fn a_direct_rep_cut_between_iterations_resumes_and_faults_on_a_later_one() {
+    // INC AX; REP MOVSW; INC BX; HLT with CX=5. A word at offset FFFFh
+    // leaves its 64-KiB segment: the fourth iteration faults, through ES
+    // (the destination) or DS (the source), with #GP (vector 13; 286 PRM
+    // App. B MOV p. B-74; SDM Vol 3B §23.1.4 Table 23-1). REP is
+    // interruptible between iterations with CX and the index registers
+    // updated and IP at the instruction (SDM Vol 2B REP pp. 4-563–4-564), so each
+    // budget leaves it unfinished at a different iteration, and the run
+    // resumed from there ends at the same fault.
+    let code = b"\x40\xf3\xa5\x43\xf4";
+    for model in [CpuModel::I80286, CpuModel::I80386, CpuModel::I80486Dx] {
+        for (si, di) in [(0x10u64, 0xfff9u64), (0xfff9, 0x20)] {
+            for budget in 0..8 {
+                let [(avm, mut a), (bvm, mut b)] = [false, true].map(|reference| {
+                    let (vm, mut cpu) = real(model, code, reference);
+                    cpu.cpu.gpr[1] = 5;
+                    cpu.cpu.gpr[6] = si;
+                    cpu.cpu.gpr[7] = di;
+                    let data: Vec<u8> = (0..0x10000u32).map(|i| (i * 7 + 3) as u8).collect();
+                    vm.write_bytes(0xa000, &data).unwrap();
+                    (vm, cpu)
+                });
+                let what = format!("{model:?} SI={si:x} DI={di:x} budget={budget}");
+                let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                same_stop(model, &ar, &br, &what);
+                same_real(&a, &b, &avm, &bvm, &what);
+                let ar = a.run_steps(&avm, 20, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, 20, StepOptions::default()).unwrap();
+                same_stop(model, &ar, &br, &format!("{what} resumed"));
+                same_real(&a, &b, &avm, &bvm, &format!("{what} resumed"));
+                let StepStop::Exit(Exit::Exception { vector, .. }) = ar.stop() else {
+                    panic!("{what}: {ar:?}")
+                };
+                assert_eq!(*vector, 13, "{what}");
+                // Three iterations completed; the REP is the next to run.
+                assert_eq!(a.cpu.gpr[1], 2, "{what}");
+                assert_eq!((a.cpu.gpr[6], a.cpu.gpr[7]), (si + 6, di + 6), "{what}");
+                assert_eq!(a.cpu.rip, 0x101, "{what}");
+                assert_eq!(a.cpu.gpr[0] & 0xffff, 1, "{what}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_strict_lane_step_out_resumes_the_walk() {
+    // INC AX; MOV DS,[m16] (the selector it already holds); INC BX;
+    // MOV CX,[m16]; INC DX; JMP back. The segment load is a system lane of
+    // the paged walk; its descriptor window is proved from the selector the
+    // previous pass loaded, but its selector read lies outside that window,
+    // so the lane steps out, replays on the operand transaction and the walk
+    // resumes at the next instruction (an extra op walk, two per step-out).
+    // SDM Vol 2B MOV p. 4-35: the selector loads DS and its descriptor.
+    for world in [Flat32 { paged: true }, Segmented { paged: true }] {
+        for model in MODELS {
+            let (code, selector_at): (&[u8], u64) = if world.wide() {
+                (
+                    b"\x40\x8e\x1d\x00\x60\x00\x00\x43\x8b\x0d\x02\x60\x00\x00\x42\xeb\xef",
+                    0x6000,
+                )
+            } else {
+                (
+                    b"\x40\x8e\x1e\x10\x00\x43\x8b\x0e\x12\x00\x42\xeb\xf3",
+                    0xa010,
+                )
+            };
+            let build = |reference| {
+                let (vm, cpu) = make(world, model, code, reference);
+                vm.write_bytes(selector_at, &[0x10, 0, 0x34, 0x12]).unwrap();
+                (vm, cpu)
+            };
+            for budget in [1, 2, 3, 6, 7, 13, 25] {
+                let (avm, mut a) = build(false);
+                let (bvm, mut b) = build(true);
+                assert_eq!(class(&a), world.class());
+                assert_eq!(class(&b), SegmentClass::Checked);
+                let what = format!("{world:?} {model:?} budget={budget}");
+                let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
+                assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what}");
+                same(world, &a, &b, &avm, &bvm, &what);
+                assert_eq!(ar.steps(), budget, "{what}");
+                // A warm loop: every pass after the first steps out once.
+                x86jit_core::Vcpu::take_machine_counters_for_test();
+                let ar = a.run_steps(&avm, 24, StepOptions::default()).unwrap();
+                let [blocks, _, _, _, walks] = x86jit_core::Vcpu::take_machine_counters_for_test();
+                let br = b.run_steps(&bvm, 24, StepOptions::default()).unwrap();
+                assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what} warm");
+                same(world, &a, &b, &avm, &bvm, &format!("{what} warm"));
+                assert_eq!(a.cpu.gpr[1] & 0xffff, 0x1234, "{what}");
+                assert!(walks > blocks, "{what}: no step-out ({blocks}, {walks})");
             }
         }
     }

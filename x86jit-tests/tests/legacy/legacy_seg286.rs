@@ -1,8 +1,10 @@
 //! The 80286 in the Segmented class (xj-to9.36; spec.md §17.10): every run is
 //! compared with the Checked lowering of the same state. Authority: Intel
 //! 80286 and 80287 PRM 210498-005 ("286 PRM"), cited by printed page.
-//! The Checked reference clears the P bit of the GS cache, which the 80286
-//! never addresses: admission then fails and nothing else differs.
+//! The Checked reference clears the P bit of the ES cache: admission then
+//! fails, and an operand access reads only the cached type, limit and base
+//! (the P bit raises #NP when a selector loads, 286 PRM App. B #NP p. B-10),
+//! so nothing else differs. The 80286 admission reads no FS or GS cache.
 #[path = "../support/descriptor_fixture.rs"]
 #[allow(dead_code)]
 mod fixture;
@@ -27,10 +29,17 @@ fn class(cpu: &Vcpu) -> SegmentClass {
 /// and 18h. 286 PRM §6.3 Fig. 6-3 p. 6-5: 24-bit bases, 16-bit limits,
 /// the access byte and a zero last word.
 fn setup(code: &[u8], cpl: u8, checked: bool) -> (Vm, Vcpu) {
-    let mut vm = Vm::new(VmConfig::flat(0x20000));
+    setup_in(0x20000, &[(0, 0x20000)], code, cpl, checked)
+}
+
+/// `setup` in a bus of `size` bytes with RAM at each `(start, len)`.
+fn setup_in(size: u64, ram: &[(u64, usize)], code: &[u8], cpl: u8, checked: bool) -> (Vm, Vcpu) {
+    let mut vm = Vm::new(VmConfig::flat(size));
     vm.set_cpu_model(MODEL);
     vm.set_exception_delivery(ExceptionDelivery::Outward);
-    vm.map(0, 0x20000, Prot::RWX, RegionKind::Ram).unwrap();
+    for &(start, len) in ram {
+        vm.map(start, len, Prot::RWX, RegionKind::Ram).unwrap();
+    }
     vm.write_bytes(0x1100, code).unwrap();
     let mut cpu = vm.new_vcpu();
     cpu.set_a20_enabled(true);
@@ -54,7 +63,7 @@ fn setup(code: &[u8], cpl: u8, checked: bool) -> (Vm, Vcpu) {
     descriptor(&vm, 0x3010, 0xa000, 0xff, 0x93 | (u16::from(cpl) << 5));
     descriptor(&vm, 0x3018, 0x7000, 0x1fff, 0x93 | (u16::from(cpl) << 5));
     if checked {
-        cpu.cpu.legacy.segments[5].attributes &= !0x80;
+        cpu.cpu.legacy.segments[2].attributes &= !0x80;
     }
     assert_eq!(
         class(&cpu),
@@ -67,10 +76,13 @@ fn setup(code: &[u8], cpl: u8, checked: bool) -> (Vm, Vcpu) {
     (vm, cpu)
 }
 
+/// Compares everything but the ES cache's P bit, which the reference keeps
+/// clear (an ES load inside the run may set it); afterwards it is clear again.
 fn same(a: &Vcpu, b: &mut Vcpu, avm: &Vm, bvm: &Vm, what: &str) {
-    b.cpu.legacy.segments[5].attributes |= 0x80;
+    let es = &mut b.cpu.legacy.segments[2].attributes;
+    *es = (*es & !0x80) | (a.cpu.legacy.segments[2].attributes & 0x80);
     assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu), "{what}");
-    b.cpu.legacy.segments[5].attributes &= !0x80;
+    b.cpu.legacy.segments[2].attributes &= !0x80;
     assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
     let mut am = vec![0; 0x20000];
     let mut bm = vec![0; 0x20000];
@@ -336,7 +348,9 @@ fn whole_operand_limit_edges_and_expand_down_upper_bound() {
             for cpu in [&mut a, &mut b] {
                 cpu.cpu.legacy.segments[segment].attributes = attributes | (u16::from(cpl) << 5);
             }
+            b.cpu.legacy.segments[2].attributes &= !0x80;
             assert_eq!(class(&a), SegmentClass::Segmented);
+            assert_eq!(class(&b), SegmentClass::Checked);
             compare((&avm, &mut a), (&bvm, &mut b), 3, &format!("{code:02x?}"));
             assert_eq!(a.retired_instructions(), 1);
         }
@@ -676,6 +690,182 @@ fn loadall_ends_the_block_and_reselects_from_the_loaded_caches() {
         if budget >= 5 {
             assert!(r.contains("vector: 13"), "{r}");
             assert_eq!(a.retired_instructions(), 4);
+        }
+    }
+}
+
+#[test]
+fn fs_and_gs_caches_do_not_decide_the_80286_class() {
+    // 286 PRM §2.3.2 p. 2-8: the 80286 has four segment registers, CS, DS,
+    // ES and SS. Caches in the FS and GS slots that would fail the proof (a
+    // system type, not present, unusable) keep Segmented on the 80286 and
+    // run equal to Checked; the same state on the 80386 keeps Checked.
+    let i386 = {
+        let mut vm = Vm::new(VmConfig::flat(0x1000));
+        vm.set_cpu_model(CpuModel::I80386);
+        vm.new_vcpu().legacy_cpu_model().unwrap()
+    };
+    let code = b"\x43\xa1\x00\x00\x40\x26\xa3\x02\x00\x50\x59\x42\xf4";
+    for cpl in [0, 3] {
+        for (fs, gs) in [(0x82u16, 0x13u16), (0x03, 0x9b), (0x13, 0x02)] {
+            let odd = |cpu: &mut Vcpu| {
+                let segments = &mut cpu.cpu.legacy.segments;
+                segments[4].attributes = fs | (u16::from(cpl) << 5);
+                segments[5].attributes = gs | (u16::from(cpl) << 5);
+                segments[5].limit = 0;
+            };
+            let what = format!("CPL{cpl} FS={fs:02x} GS={gs:02x}");
+            for budget in [1, 3, 10] {
+                let (avm, mut a) = setup(code, cpl, false);
+                let (bvm, mut b) = setup(code, cpl, true);
+                odd(&mut a);
+                odd(&mut b);
+                assert_eq!(class(&a), SegmentClass::Segmented, "{what}");
+                assert_eq!(class(&b), SegmentClass::Checked, "{what}");
+                assert_eq!(
+                    derive_legacy_context(i386, &a.cpu).unwrap().segment_class,
+                    SegmentClass::Checked,
+                    "{what} on the 80386"
+                );
+                compare((&avm, &mut a), (&bvm, &mut b), budget, &what);
+            }
+        }
+        // FS and GS unusable: Segmented as well.
+        let (_, mut a) = setup(code, cpl, false);
+        for cache in &mut a.cpu.legacy.segments[4..] {
+            cache.unusable = 1;
+            cache.attributes = 0;
+        }
+        assert_eq!(class(&a), SegmentClass::Segmented);
+    }
+}
+
+#[test]
+fn data_operands_across_the_24_bit_wrap_match_checked() {
+    // 286 PRM §6.4 p. 6-6: the 24-bit sum of base and offset wraps at the
+    // bus, so with DS.base FFFF00h the word at offset 00FFh is the bytes at
+    // FFFFFFh and 000000h; whole-operand limits are those of §7.4.1
+    // p. 7-12 (limit FFFFh here). Loads, stores, a read-modify-write and a
+    // MOVSW source, below, across and above the wrap.
+    let top = 0xff_f000u64;
+    for cpl in [0, 3] {
+        for (name, body) in [
+            ("load", &b"\xa1"[..]),
+            ("store", b"\xa3"),
+            ("inc", b"\xff\x06"),
+            ("movsw", b""),
+        ] {
+            for offset in [0xfeu16, 0xff, 0x100] {
+                let mut code = vec![0x43];
+                if body.is_empty() {
+                    code.push(0xa5);
+                } else {
+                    code.extend_from_slice(body);
+                    code.extend_from_slice(&offset.to_le_bytes());
+                }
+                code.extend_from_slice(b"\x42\xf4");
+                let build = |checked| {
+                    let (vm, mut cpu) = setup_in(
+                        0x100_0000,
+                        &[(0, 0x20000), (top, 0x1000)],
+                        &code,
+                        cpl,
+                        checked,
+                    );
+                    vm.write_bytes(0xff_fffe, &[0x11, 0x22]).unwrap();
+                    vm.write_bytes(0, &[0x33, 0x44]).unwrap();
+                    cpu.cpu.legacy.segments[1].base = 0xff_ff00;
+                    cpu.cpu.legacy.segments[1].limit = 0xffff;
+                    cpu.cpu.gpr[0] = 0xbeef;
+                    cpu.cpu.gpr[6] = u64::from(offset);
+                    cpu.cpu.gpr[7] = 0x20;
+                    (vm, cpu)
+                };
+                let what = format!("CPL{cpl} {name} offset={offset:x}");
+                for budget in [1, 2, 3] {
+                    let (avm, mut a) = build(false);
+                    let (bvm, mut b) = build(true);
+                    assert_eq!(class(&a), SegmentClass::Segmented, "{what}");
+                    compare((&avm, &mut a), (&bvm, &mut b), budget, &what);
+                    let mut at = [0; 0x1000];
+                    let mut bt = [0; 0x1000];
+                    avm.read_bytes(top, &mut at).unwrap();
+                    bvm.read_bytes(top, &mut bt).unwrap();
+                    assert!(at == bt, "{what}: top page");
+                    if budget == 3 {
+                        assert_eq!(a.retired_instructions(), 3, "{what}");
+                    }
+                }
+                if offset == 0xff && name == "load" {
+                    let (vm, mut cpu) = build(false);
+                    cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+                    assert_eq!(cpu.cpu.gpr[0] & 0xffff, 0x3322, "{what}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stack_limit_and_expand_down_edges_match_checked() {
+    // 286 PRM §7.4.1 pp. 7-12–13: SS offsets 0..limit (expand-up) or
+    // limit+1..FFFFh (expand-down), checked for the whole word before the
+    // reference; a violation through SS is #SS(0) (App. B MOV p. B-74).
+    // PUSH and CALL write the word below SP, POP reads the word at SP.
+    let limit = 0x1ffu64;
+    for cpl in [0, 3] {
+        for down in [false, true] {
+            for (name, op, push) in [
+                ("push", &b"\x50"[..], true),
+                ("call", b"\xe8\x00\x00", true),
+                ("pop", b"\x59", false),
+            ] {
+                for sp in [
+                    0u64,
+                    1,
+                    2,
+                    limit - 1,
+                    limit,
+                    limit + 1,
+                    limit + 2,
+                    limit + 3,
+                    0xfffe,
+                    0xffff,
+                ] {
+                    let mut code = vec![0x43];
+                    code.extend_from_slice(op);
+                    code.extend_from_slice(b"\x42\xf4");
+                    let what = format!("CPL{cpl} down={down} {name} SP={sp:x}");
+                    let build = |checked| {
+                        let (vm, mut cpu) = setup(&code, cpl, checked);
+                        for_limit(&mut cpu, 3, limit as u32, down);
+                        cpu.cpu.gpr[4] = sp;
+                        (vm, cpu)
+                    };
+                    for budget in [1, 2, 3] {
+                        let (avm, mut a) = build(false);
+                        let (bvm, mut b) = build(true);
+                        assert_eq!(class(&a), SegmentClass::Segmented, "{what}");
+                        compare((&avm, &mut a), (&bvm, &mut b), budget, &what);
+                    }
+                    let start = if push {
+                        sp.wrapping_sub(2) & 0xffff
+                    } else {
+                        sp
+                    };
+                    let allowed =
+                        start < 0xffff && if down { start > limit } else { start < limit };
+                    let (vm, mut cpu) = build(false);
+                    if allowed {
+                        let run = cpu.run_steps(&vm, 3, StepOptions::default()).unwrap();
+                        assert_eq!(run.steps(), 3, "{what}: {run:?}");
+                    } else {
+                        let (steps, vector, error) = exception(&mut cpu, &vm, 3);
+                        assert_eq!((steps, vector), (1, 12), "{what}");
+                        assert_eq!(error, ErrorCode::bits(0, 0xffff), "{what}");
+                    }
+                }
+            }
         }
     }
 }

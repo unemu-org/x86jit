@@ -6198,8 +6198,9 @@ mod tests {
             let mut cpu = vm.new_vcpu();
             cpu.cpu.rip = 0x1000;
             cpu.cpu.legacy.cr0 = 1;
-            // Keep this a Checked-cache identity witness on both models.
-            cpu.cpu.legacy.segments[SegmentId::Gs as usize].attributes &= !0x80;
+            // Keep this a Checked-cache identity witness on both models: the
+            // 80286 admission reads no GS cache, so clear P on ES, unused here.
+            cpu.cpu.legacy.segments[SegmentId::Es as usize].attributes &= !0x80;
             let initial = cpu.cpu.legacy;
             let run = cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
             assert_eq!(run.steps(), 1);

@@ -377,8 +377,13 @@ fn derive_context<const V86: bool>(
             // any reference (§7.4.1 p. 7-13); the 24-bit sum wraps at the bus
             // mask (§6.4 p. 6-6). Loads keep the shared descriptor checks.
             && cs.attributes & 0x98 == 0x98
-            && state
-                .segments
+            // The 80286 has no FS or GS (I286 PRM §2.3.2 p. 2-8: four segment
+            // registers), so its admission reads only CS, DS, ES and SS.
+            && state.segments[..if model.generation == CpuGeneration::I286 {
+                4
+            } else {
+                6
+            }]
                 .iter()
                 .all(|c| c.unusable != 0 || c.attributes & 0x90 == 0x90)
         {
