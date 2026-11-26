@@ -286,3 +286,119 @@ fn protected_first_byte_of_split_access_faults_like_contained() {
         "failed cases (tier, store, lead, status): {failures:?}"
     );
 }
+
+/// The twenty-bit models with host-fault recovery on. A RAM word store whose
+/// two bytes are consecutive takes one host access (`interp::i8086::write`);
+/// one whose second byte wraps at offset FFFFh takes the byte path (8086
+/// Family UM §2.3 p. 2-12). With the second byte on a host-protected page,
+/// both fault at that byte and commit neither byte, with equal exits, IP and
+/// retirement, on every twenty-bit model.
+#[test]
+fn twenty_bit_word_store_over_protected_page_commits_no_byte() {
+    use x86jit_core::{CpuMode, CpuModel};
+    const SIZE: usize = 0x10_0000;
+    // The protected host page, its first byte a twenty-bit physical address.
+    let g = (page() * 4) as u64;
+    assert!(g + 0xffff + 2 < SIZE as u64 && page() <= 0x8000);
+    // `segment:offset` of the word (DS:DI): at offset Fh of the paragraph
+    // below the page, crossing into it (one access), or at offset FFFFh with
+    // DS based on the page (two byte transfers, the second at its first byte).
+    let run = |model: CpuModel, segment: u64, offset: u64| -> (Exit, [u8; 2], u64, u64) {
+        // SAFETY: the mapping stays owned by HostRam and is freed exactly once.
+        let mut vm = unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            Vm::with_backend_host_ram(
+                VmConfig::flat(SIZE as u64),
+                Box::new(InterpreterBackend),
+                HostRam {
+                    ptr: ptr.cast(),
+                    len: SIZE,
+                    guest_base: 0,
+                    protect: None,
+                    dtor: Box::new(|p, len| {
+                        libc::munmap(p.cast(), len);
+                    }),
+                },
+            )
+            .unwrap()
+        };
+        vm.set_cpu_mode(CpuMode::Real16);
+        vm.set_cpu_model(model);
+        vm.mem.set_host_fault_recovery(true);
+        vm.map(0, SIZE, Prot::RWX, RegionKind::Ram).unwrap();
+        // mov [di], ax ; hlt
+        vm.write_bytes(0x1000, &[0x89, 0x05, 0xf4]).unwrap();
+        let first = (segment << 4) + offset;
+        let second = (segment << 4) + ((offset + 1) & 0xffff);
+        assert_eq!(second, g);
+        vm.write_bytes(first, &[0x53]).unwrap();
+        vm.write_bytes(second, &[0x53]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.set_reg(Reg::Cs, 0);
+        cpu.set_reg(Reg::Rip, 0x1000);
+        cpu.set_reg(Reg::Ds, segment);
+        cpu.set_reg(Reg::Rdi, offset);
+        cpu.set_reg(Reg::Rax, 0xa5c3);
+        signal::HANDLE.store(cpu.fault_handle().as_usize(), Ordering::Relaxed);
+        // SAFETY: the page is aligned and inside this child's live mapping.
+        let protect = |prot| unsafe {
+            assert_eq!(
+                libc::mprotect(
+                    vm.mem.host_base().add(g as usize).cast_mut().cast(),
+                    page(),
+                    prot
+                ),
+                0
+            );
+        };
+        protect(libc::PROT_READ);
+        let exit = cpu.run(&vm, None);
+        protect(libc::PROT_READ | libc::PROT_WRITE);
+        let mut bytes = [0; 2];
+        vm.read_bytes(first, &mut bytes[..1]).unwrap();
+        vm.read_bytes(second, &mut bytes[1..]).unwrap();
+        (exit, bytes, cpu.reg(Reg::Rip), cpu.retired_instructions())
+    };
+    let mut failures = Vec::new();
+    for model in [
+        CpuModel::I8088,
+        CpuModel::I8086,
+        CpuModel::NecV20,
+        CpuModel::NecV30,
+    ] {
+        let status = signal::child(|| {
+            // SAFETY: the forked child owns its handlers and mapping.
+            unsafe {
+                signal::install();
+            }
+            let word = run(model, (g >> 4) - 1, 0xf);
+            let bytes = run(model, g >> 4, 0xffff);
+            for (name, (exit, stored, rip, retired)) in [("word", &word), ("bytes", &bytes)] {
+                assert!(
+                    matches!(exit, Exit::UnmappedMemory { addr, access: AccessKind::Write, .. }
+                        if *addr == g),
+                    "{model:?} {name}: {exit:?}"
+                );
+                assert_eq!(*stored, [0x53; 2], "{model:?} {name}");
+                assert_eq!((*rip, *retired), (0x1000, 0), "{model:?} {name}");
+            }
+            assert_eq!(
+                format!("{:?}", word.0),
+                format!("{:?}", bytes.0),
+                "{model:?}"
+            );
+        });
+        if status != 0 {
+            failures.push((model, status));
+        }
+    }
+    assert!(failures.is_empty(), "failed models: {failures:?}");
+}

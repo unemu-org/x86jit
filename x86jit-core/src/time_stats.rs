@@ -442,8 +442,13 @@ struct DetailedCounters {
 }
 struct Counters {
     basic: [u64; FETCH_HITS],
+    // Bit `i` set: `basic[i]` was written (`IndexMut`) and may be nonzero. A
+    // run publishes only these, so a run that touches a few counters does not
+    // scan all of them.
+    written: u32,
     detailed: Option<Box<DetailedCounters>>,
 }
+const _: () = assert!(FETCH_HITS <= u32::BITS as usize);
 impl std::ops::Index<usize> for Counters {
     type Output = u64;
     fn index(&self, index: usize) -> &u64 {
@@ -459,6 +464,7 @@ impl std::ops::Index<usize> for Counters {
 impl std::ops::IndexMut<usize> for Counters {
     fn index_mut(&mut self, index: usize) -> &mut u64 {
         if index < FETCH_HITS {
+            self.written |= 1 << index;
             &mut self.basic[index]
         } else {
             &mut self.detailed.as_mut().unwrap().values[index - FETCH_HITS]
@@ -483,6 +489,7 @@ impl Local {
     const EMPTY: Self = Self {
         values: Counters {
             basic: [0; FETCH_HITS],
+            written: 0,
             detailed: None,
         },
         resume: SharedReason::Entry,
@@ -571,17 +578,38 @@ pub(crate) struct DispatchCounts {
 
 pub(crate) type Outside = Option<(usize, MonotonicTime)>;
 pub(crate) struct RunGuard {
-    previous: Local,
+    // The thread's state before the run, restored at drop: an enclosing run's,
+    // or one a helper scope left open outside any run. `None` when it was
+    // idle, and the run used it in place.
+    previous: Option<Box<Local>>,
     record: Arc<Record>,
+}
+impl Local {
+    // No run owns it and no scope is open in it. Its counters are zero then,
+    // as a run clears what it wrote (`RunGuard::drop`), and its other fields
+    // hold their `EMPTY` values, so a run can start in it without a copy.
+    fn idle(&self) -> bool {
+        !self.active
+            && self.helper_depth == 0
+            && !self.resolving
+            && self.values.written == 0
+            && self.values.detailed.is_none()
+    }
 }
 impl RunGuard {
     pub(crate) fn enter(record: Arc<Record>, enabled: bool, outside: Outside) -> Self {
-        let mut current = Local {
-            active: true,
-            enabled,
-            since: enabled.then(MonotonicTime::now),
-            ..Local::default()
-        };
+        LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            let previous = (!l.idle()).then(|| Box::new(std::mem::replace(&mut *l, Local::EMPTY)));
+            Self::start(&mut l, enabled, outside);
+            Self { previous, record }
+        })
+    }
+    #[inline(always)]
+    fn start(current: &mut Local, enabled: bool, outside: Outside) {
+        current.active = true;
+        current.enabled = enabled;
+        current.since = enabled.then(MonotonicTime::now);
         if enabled {
             current.resume = match outside.map(|(kind, _)| kind) {
                 Some(6) => SharedReason::BudgetResume,
@@ -600,8 +628,6 @@ impl RunGuard {
                 );
             }
         }
-        let previous = LOCAL.with(|l| l.replace(current));
-        Self { previous, record }
     }
     // Codegen pin, once per run: out of line, with the TLS access inlined in this
     // module. `LocalKey::with` is not `#[inline]`, so whether it inlines here depends
@@ -666,27 +692,52 @@ fn add_dispatch(values: &mut Counters, chains: u64, counts: &DispatchCounts) {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let previous = std::mem::replace(&mut self.previous, Local::EMPTY);
-        let mut current = LOCAL.with(|l| l.replace(previous));
-        if let Some(start) = current.since {
-            add(&mut current.values, current.segment, start.elapsed_ns());
-        }
-        let publish = |counter: &AtomicU64, value: u64| {
-            if value != 0 {
-                let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                    Some(old.saturating_add(value))
-                });
+        match self.previous.take() {
+            None => LOCAL.with(|l| {
+                let mut l = l.borrow_mut();
+                publish_run(&self.record, &mut l);
+                // Idle again (`Local::idle`): the fields a run sets go back to
+                // their `EMPTY` values; its scopes have closed.
+                l.active = false;
+                l.enabled = false;
+                l.segment = INTERPRETER;
+                l.since = None;
+                l.resume = SharedReason::Entry;
+                l.policy_ns = 0;
+                l.hit_start = None;
+                l.miss = None;
+            }),
+            Some(previous) => {
+                let mut current = LOCAL.with(|l| l.replace(*previous));
+                publish_run(&self.record, &mut current);
             }
-        };
-        // Keep the always-on array independent of optional detailed storage.
-        // Model dispatch specializations share this publication path.
-        for (counter, value) in self.record.0[..FETCH_HITS].iter().zip(current.values.basic) {
+        }
+    }
+}
+
+// Add a finished run's counters to its vCPU's record, and clear them.
+fn publish_run(record: &Record, current: &mut Local) {
+    if let Some(start) = current.since {
+        add(&mut current.values, current.segment, start.elapsed_ns());
+    }
+    let publish = |counter: &AtomicU64, value: u64| {
+        if value != 0 {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(old.saturating_add(value))
+            });
+        }
+    };
+    // Keep the always-on array independent of optional detailed storage.
+    // Model dispatch specializations share this publication path.
+    let mut written = std::mem::take(&mut current.values.written);
+    while written != 0 {
+        let i = written.trailing_zeros() as usize;
+        written &= written - 1;
+        publish(&record.0[i], std::mem::take(&mut current.values.basic[i]));
+    }
+    if let Some(detailed) = current.values.detailed.take() {
+        for (counter, value) in record.0[FETCH_HITS..].iter().zip(detailed.values) {
             publish(counter, value);
-        }
-        if let Some(detailed) = current.values.detailed {
-            for (counter, value) in self.record.0[FETCH_HITS..].iter().zip(detailed.values) {
-                publish(counter, value);
-            }
         }
     }
 }
@@ -1023,6 +1074,39 @@ mod tests {
         ] {
             assert_eq!(record.0[index].load(Ordering::Relaxed), value);
         }
+    }
+
+    #[test]
+    fn nested_and_successive_runs_publish_their_own_counts() {
+        let mut registry = Registry::default();
+        let (outer, inner) = (registry.register(), registry.register());
+        let run = RunGuard::enter(outer.clone(), false, None);
+        run.finish(Some(&crate::Exit::Hlt));
+        // A run inside a helper scope or another run starts from zero and
+        // gives the enclosing state back.
+        LOCAL.with(|l| l.borrow_mut().helper_depth += 1);
+        let nested = RunGuard::enter(inner.clone(), true, None);
+        LOCAL.with(|l| assert!(l.borrow().values.written == 0 && l.borrow().enabled));
+        nested.finish(Some(&crate::Exit::Syscall));
+        drop(nested);
+        LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            assert_eq!(l.helper_depth, 1);
+            assert!(l.active && !l.enabled);
+            l.helper_depth -= 1;
+        });
+        run.finish(Some(&crate::Exit::Hlt));
+        drop(run);
+        LOCAL.with(|l| assert!(l.borrow().idle()));
+        // The next run on the thread starts from zero.
+        let next = RunGuard::enter(outer.clone(), false, None);
+        next.finish(Some(&crate::Exit::Hlt));
+        drop(next);
+        let count =
+            |record: &Record, kind: usize| record.0[EXITS + kind * 2].load(Ordering::Relaxed);
+        assert_eq!((count(&outer, 5), count(&outer, 0)), (3, 0));
+        assert_eq!((count(&inner, 5), count(&inner, 0)), (0, 1));
+        LOCAL.with(|l| assert!(l.borrow().idle()));
     }
 
     #[test]

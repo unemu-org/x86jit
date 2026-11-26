@@ -664,7 +664,11 @@ fn lift_block(
             || !ops.iter().any(|op| matches!(
                 op,
                 IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. })
-            ))
+            )),
+        "a twenty-bit string instruction in a block of {} instructions at {:#x}: \
+         the REP-restart lookup reads one-instruction blocks only",
+        ir.icount,
+        ir.guest_start
     );
     // One allocation of the block's size; `ops` keeps its capacity for the
     // next lift.

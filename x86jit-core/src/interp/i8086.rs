@@ -162,9 +162,14 @@ fn read<const ROUTED: bool, const ORDER: u8>(
     size: u8,
 ) -> Result<u64, Exit> {
     let mem = Access::<ROUTED, ORDER, _>::new(mem);
+    // A byte operand's miss is the first read below, made once (a device byte
+    // pays no second region lookup).
+    let mut first = None;
     if let Some(addr) = contiguous(cpu, cpu.rip, tag, size) {
-        if let Ok(value) = mem.read(addr, size) {
-            return Ok(value);
+        match mem.read(addr, size) {
+            Ok(value) => return Ok(value),
+            miss if size == 1 => first = Some(miss),
+            Err(_) => {}
         }
     }
     let mut result = 0;
@@ -173,7 +178,7 @@ fn read<const ROUTED: bool, const ORDER: u8>(
         let value = if let Some(value) = cpu.mmio_part(cpu.rip, addr) {
             value
         } else {
-            match mem.read(addr, 1) {
+            match first.take().unwrap_or_else(|| mem.read(addr, 1)) {
                 Ok(value) => value,
                 Err(MemTrap::Mmio) if tag & WORD_BUS != 0 => {
                     return device_read::<ROUTED, ORDER>(cpu, mem, tag, size, i, result)
@@ -199,20 +204,34 @@ fn write<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<(), Exit> {
     // With host-fault recovery the whole destination is validated first, as
     // below. Without it, a store that misses commits no byte: the region
-    // checks precede the store (`Memory::write_mode`).
+    // checks precede the store (`Memory::write_mode`), and a byte store misses
+    // as a byte probe does. A byte operand's miss is therefore the validation
+    // of its only byte below, made once (a device byte pays no second region
+    // lookup).
+    let mut first = None;
     if let Some(addr) = contiguous(cpu, cpu.rip, tag, size) {
-        if (!ROUTED || mem.probe_write_mode::<ROUTED>(addr, size).is_ok())
-            && Access::<ROUTED, ORDER, _>::new(mem)
-                .write(addr, value, size)
-                .is_ok()
-        {
-            return Ok(());
+        let checked = if ROUTED {
+            mem.probe_write_mode::<ROUTED>(addr, size)
+        } else {
+            Ok(())
+        };
+        match checked {
+            Ok(()) => match Access::<ROUTED, ORDER, _>::new(mem).write(addr, value, size) {
+                Ok(()) => return Ok(()),
+                Err(trap) if !ROUTED && size == 1 => first = Some(Err(trap)),
+                Err(_) => {}
+            },
+            miss if size == 1 => first = Some(miss),
+            Err(_) => {}
         }
     }
     // Validate the complete RAM destination before the first byte commits.
     for i in 0..size {
         let addr = physical(tag, i);
-        if let Err(trap) = mem.probe_write_mode::<ROUTED>(addr, 1) {
+        if let Err(trap) = first
+            .take()
+            .unwrap_or_else(|| mem.probe_write_mode::<ROUTED>(addr, 1))
+        {
             if trap != MemTrap::Mmio {
                 return Err(memory_exit(cpu, trap, addr, true, (value >> (8 * i)) & 255));
             }

@@ -363,7 +363,8 @@ impl Vcpu {
     #[cold]
     #[inline(never)]
     pub(super) fn machine_epilogue(&mut self, ir: &crate::ir::IrBlock, retired: u64) -> bool {
-        let unblocked = self.nmi_after_unit(ir, retired);
+        // An enabled delivery log alone also comes here, after every unit.
+        let unblocked = self.nmi_state & NMI_BLOCKED != 0 && self.nmi_after_unit(ir, retired);
         let a20 = self
             .legacy_execution
             .as_ref()
@@ -385,6 +386,10 @@ impl Vcpu {
         ir: &crate::ir::IrBlock,
         progress: &crate::interp::legacy::Progress,
     ) {
+        // Both end blocking only; an enabled delivery log alone also comes here.
+        if self.nmi_state & NMI_BLOCKED == 0 {
+            return;
+        }
         match &progress.outcome {
             Some(Err(exit)) => self.nmi_after_fault(ir, exit),
             _ => {

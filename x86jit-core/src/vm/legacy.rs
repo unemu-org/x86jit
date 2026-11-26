@@ -2501,7 +2501,7 @@ impl Vcpu {
     // twenty-bit INT, INT 3, INTO, CHKIND or BRKEM writes the vector and the
     // CS:IP its frame holds into the op's `taken` temporary once the frame is
     // written (`legacy::report_interrupt20`). Called only while the log is
-    // enabled.
+    // enabled, after every unit: no scan of the block's ops.
     #[cold]
     #[inline(never)]
     fn record_unit(
@@ -2519,36 +2519,28 @@ impl Vcpu {
                 ) => Some(*taken),
                 _ => None,
             };
-            // The interrupt op ends its block (`vm::i8086::resolve`): the block
-            // holds one, in its last instruction.
+            // A lifted twenty-bit instruction ends with its terminator and the
+            // walk marker (`lift::i8086::instruction`, `brkem`), and an
+            // interrupt op is the terminator of its instruction, which ends
+            // the block (`vm::i8086::resolve`): a block holds at most one, as
+            // its last op but the marker.
+            let at = ir.ops.len().wrapping_sub(2);
             debug_assert!(
-                {
-                    let last = ir
-                        .ops
-                        .iter()
-                        .rposition(|op| matches!(op, IrOp::InsnStart { .. }));
-                    let mut found = ir
-                        .ops
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, op)| taken(op).is_some());
-                    match (found.next(), found.next(), last) {
-                        (None, _, _) => true,
-                        (Some((at, _)), None, Some(last)) => at > last,
-                        _ => false,
-                    }
-                },
-                "a twenty-bit interrupt op that is not its block's only one, in its last instruction"
+                ir.ops
+                    .iter()
+                    .enumerate()
+                    .all(|(i, op)| taken(op).is_none() || i == at),
+                "a twenty-bit interrupt op that is not its block's last op before the walk marker"
             );
-            let Some(taken) = ir.ops.iter().rev().find_map(taken) else {
-                return;
-            };
             // A walk that retired the whole block reached the op, which wrote
             // its report; one that stopped earlier left the temporary from an
             // earlier walk.
             if progress.retired != u64::from(ir.icount) {
                 return;
             }
+            let Some(taken) = ir.ops.get(at).and_then(taken) else {
+                return;
+            };
             let Some((vector, cs, ip, flags)) = self
                 .interp_scratch
                 .values
