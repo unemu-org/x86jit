@@ -1607,7 +1607,7 @@ fn walk_ops<
                         {
                             if let Some(bytes) = crate::x87::mem_write_bytes(*kind) {
                                 for i in 0..bytes {
-                                    mem.0.note_block_write(
+                                    mem.0.note_unobserved_write(
                                         i8086::physical(read_val(*addr, temps), i as u8),
                                         1,
                                     );
@@ -1623,10 +1623,10 @@ fn walk_ops<
                         let tag = read_val(*addr, temps);
                         let first = i8086::physical(tag, 0);
                         if i8086::physical(tag, *size - 1) == first + u64::from(*size) - 1 {
-                            mem.0.note_block_write(first, usize::from(*size));
+                            mem.0.note_unobserved_write(first, usize::from(*size));
                         } else {
                             for i in 0..*size {
-                                mem.0.note_block_write(i8086::physical(tag, i), 1);
+                                mem.0.note_unobserved_write(i8086::physical(tag, i), 1);
                             }
                         }
                     }
