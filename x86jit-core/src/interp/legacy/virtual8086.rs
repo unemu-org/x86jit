@@ -120,6 +120,7 @@ pub(crate) fn execute_block<const ROUTED: bool, const ORDER: u8>(
             guest_start: ir.guest_start,
             guest_len: ir.guest_len,
             ops: &ir.ops,
+            proven: false,
         },
         cpu,
         &LegacyAccess::new(memory, legacy::physical_mask(context.generation)),

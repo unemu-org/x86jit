@@ -11,7 +11,7 @@ use std::cell::Cell;
 const MAX_BLOCKS: usize = 256;
 const MAX_CONTEXTS: usize = 64;
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq)]
 struct Key {
     segment_class: crate::SegmentClass,
     // The singleton reference entry (`interpret_*_for_test`) never shares
@@ -21,6 +21,16 @@ struct Key {
     generation: u64,
     cr3: u32,
     cr0: u32,
+}
+impl Hash for Key {
+    // Every field, packed losslessly: one `BlockHasher` round per word.
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.decode.hash(state);
+        state.write_u64(self.generation);
+        state.write_u64(u64::from(self.cr3) | (u64::from(self.cr0) << 32));
+        state.write_u64(self.segment_class as u64 | (u64::from(self.ordinary) << 8));
+    }
 }
 
 struct Proof {
@@ -39,11 +49,11 @@ pub(super) struct State {
     mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
     context_id: u64,
-    contexts: HashMap<LegacyContextStamp, u64>,
+    contexts: EngineMap<LegacyContextStamp, u64>,
     model: Option<LegacyCpuModel>,
     memory: usize,
     source_generation: u64,
-    blocks: HashMap<Key, Proof>,
+    blocks: EngineMap<Key, Proof>,
     lifts: u64,
     before_publication: Option<fn(&Vm)>,
     port_input: Option<crate::interp::legacy::paging::PortPlan>,

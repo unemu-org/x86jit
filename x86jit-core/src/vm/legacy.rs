@@ -63,6 +63,20 @@ impl Vcpu {
     }
 }
 
+// The block and context maps below (`Execution`, `flat32::State`,
+// `paging::State`) are per vCPU and keyed only by values the engine derives:
+// guest addresses and CPU-state stamps, engine-issued owner, context and
+// generation identities, and the selected model's semantics identity. The
+// embedder supplies only the guest state and the model, and whoever chooses
+// either already runs whatever it wants on this CPU: a colliding key set can
+// only slow this vCPU's own dispatch. HashDoS resistance buys nothing here,
+// so the maps use the multiply-rotate `BlockHasher` instead of SipHash. A
+// `LegacyContextStamp` is large but is hashed only when a context change misses
+// the `recent` lists; a steady context compares stamps and never hashes them,
+// so the stamp carries no cached hash.
+type EngineMap<K, V> =
+    HashMap<K, V, std::hash::BuildHasherDefault<crate::cache::cache_hash::BlockHasher>>;
+
 // The retained context stamp guards the segment class. Flat32 and paging
 // also own separate proof maps, so the shared key need not hash that class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,15 +92,19 @@ struct LegacyBlockKey {
     mxcsr_mode: u32,
 }
 impl Hash for LegacyBlockKey {
+    // Every field, packed losslessly into five words: one hasher round each.
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.owner_id.hash(state);
-        self.context_id.hash(state);
-        self.model_semantics_id.hash(state);
-        // Preserve RandomState's byte stream without three short hasher calls.
-        state.write(&[self.decode_bits, self.stack_bits, self.regime as u8]);
-        self.decode_ip.hash(state);
-        self.linear_fetch.hash(state);
-        self.mxcsr_mode.hash(state);
+        state.write_u64(self.owner_id);
+        state.write_u64(self.context_id);
+        state.write_u64(self.model_semantics_id);
+        state.write_u64(
+            u64::from(self.decode_bits)
+                | (u64::from(self.stack_bits) << 8)
+                | (u64::from(self.regime as u8) << 16)
+                | (u64::from(self.mxcsr_mode) << 32),
+        );
+        state.write_u64(u64::from(self.decode_ip) | (u64::from(self.linear_fetch) << 32));
     }
 }
 // `eq` below is the derived field-by-field comparison, so the derived `Hash` agrees.
@@ -527,8 +545,8 @@ pub(super) struct Execution {
     validated: Option<(LegacyContextStamp, MachineContext, u64)>,
     // The validated stamp covers every selector and the effective A20 line.
     validated_direct_bus: bool,
-    contexts: HashMap<LegacyContextStamp, RetainedContext>,
-    blocks: HashMap<LegacyBlockKey, Block>,
+    contexts: EngineMap<LegacyContextStamp, RetainedContext>,
+    blocks: EngineMap<LegacyBlockKey, Block>,
     instruction_retry: Option<InstructionRetry>,
     // Immutable slice of the last exiting source block; never a fetch proof.
     retry_slice: Option<(Arc<IrBlock>, Arc<IrBlock>)>,
@@ -599,9 +617,9 @@ impl Execution {
             stamp: None,
             validated: None,
             validated_direct_bus: false,
-            contexts: HashMap::new(),
+            contexts: EngineMap::default(),
             recent: Box::new([None; RECENT_CONTEXTS]),
-            blocks: HashMap::new(),
+            blocks: EngineMap::default(),
             instruction_retry: None,
             retry_slice: None,
             rep_flags: None,
@@ -6356,6 +6374,42 @@ mod virtual8086_key_tests {
         assert!(LegacyContextStamp::new(&cpu, model) != real);
         cpu.rflags_system = 0;
         assert!(LegacyContextStamp::new(&cpu, model) == real);
+    }
+
+    #[test]
+    fn block_key_hash_reads_every_field() {
+        // The packed `Hash` keeps every field: changing any one moves the hash.
+        use std::hash::BuildHasher;
+        let hasher =
+            std::hash::BuildHasherDefault::<crate::cache::cache_hash::BlockHasher>::default();
+        let key = LegacyBlockKey {
+            owner_id: 1,
+            context_id: 1,
+            model_semantics_id: 7,
+            decode_bits: 16,
+            stack_bits: 16,
+            regime: MachineRegime::Real,
+            decode_ip: 0x1000,
+            linear_fetch: 0x1000,
+            mxcsr_mode: 0,
+        };
+        let mut hashes = std::collections::HashSet::from([hasher.hash_one(key)]);
+        let changes: [fn(&mut LegacyBlockKey); 9] = [
+            |k| k.owner_id = 2,
+            |k| k.context_id = 2,
+            |k| k.model_semantics_id = 8,
+            |k| k.decode_bits = 32,
+            |k| k.stack_bits = 32,
+            |k| k.regime = MachineRegime::Protected,
+            |k| k.decode_ip = 0x1001,
+            |k| k.linear_fetch = 0x1001,
+            |k| k.mxcsr_mode = 0x6000,
+        ];
+        for change in changes {
+            let mut changed = key;
+            change(&mut changed);
+            assert!(hashes.insert(hasher.hash_one(changed)));
+        }
     }
 }
 

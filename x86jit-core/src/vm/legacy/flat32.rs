@@ -54,7 +54,7 @@ struct Proof {
 pub(super) struct State {
     generation: u64,
     mapping: Option<Arc<()>>,
-    blocks: HashMap<LegacyBlockKey, Proof>,
+    blocks: EngineMap<LegacyBlockKey, Proof>,
 }
 
 impl State {

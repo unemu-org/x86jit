@@ -1254,6 +1254,7 @@ where
         guest_start: ir.guest_start,
         guest_len: ir.guest_len,
         ops: &ir.ops,
+        proven: false,
     };
     if PAGED {
         return execute::<false, 0, PAGED, V86>(
@@ -1272,6 +1273,7 @@ where
             guest_start: ir.guest_start,
             guest_len: ir.guest_len,
             ops: &ir.ops,
+            proven: false,
         },
         cpu,
         &LegacyAccess::<false, 0, PAGED>::new(memory, u32::MAX),
@@ -2257,6 +2259,7 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
         guest_start: ir.guest_start,
         guest_len: ir.guest_len,
         ops: &ir.ops,
+        proven: false,
     };
     execute_with_retry::<ROUTED, ORDER, true, V86>(
         ir,
@@ -2546,6 +2549,7 @@ pub(crate) fn execute_far_fast<const ROUTED: bool, const ORDER: u8, const V86: b
         guest_start: ir.guest_start,
         guest_len: ir.guest_len,
         ops: &ir.ops,
+        proven: false,
     };
     strict_lane(cpu, &mem, task_switch, |cpu, task_switch| {
         execute_instruction::<ROUTED, ORDER, true, V86>(
@@ -2896,6 +2900,8 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
             guest_start: guest_addr,
             guest_len: (next - guest_addr) as u32,
             ops: &ir.ops[start..end],
+            // `ordinary_block`, decided at lift, implies `flat32_ordinary`.
+            proven: true,
         };
         mem.paging.fast_operand = None;
         let once = retry.is_none()

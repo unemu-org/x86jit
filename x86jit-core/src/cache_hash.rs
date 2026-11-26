@@ -1,8 +1,12 @@
-//! Integer-key hashing for the shared translation map (§9.1).
+//! Integer-key hashing for the shared translation map (§9.1) and the Machine
+//! interpreter's per-vCPU block and context maps (decision-23 §5).
 use std::hash::Hasher;
 
-// Keys are guest addresses under the embedder's control. HashDoS resistance is
-// out of scope; avoid SipHash's cost on every shared dispatch lookup.
+// Keys are guest addresses under the embedder's control, or values the engine
+// derives from them and from its own state. HashDoS resistance is out of scope:
+// whoever can choose a colliding key set already controls the guest CPU the map
+// serves, so collisions only slow that guest down. Avoid SipHash's cost on
+// every dispatch lookup.
 #[derive(Default)]
 pub struct BlockHasher(u64);
 
@@ -15,6 +19,27 @@ impl Hasher for BlockHasher {
     #[inline]
     fn write_u64(&mut self, word: u64) {
         self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    // Narrow integers take one round each, not the byte path below.
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.write_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
     }
 
     fn write(&mut self, bytes: &[u8]) {

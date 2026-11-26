@@ -2223,6 +2223,11 @@ struct InstructionView<'a> {
     guest_start: u64,
     guest_len: u32,
     ops: &'a [IrOp],
+    /// Every op is `supported`, decided once when the block was built: a
+    /// `flat32_ordinary` block (the Direct and paged ordinary walks) or a
+    /// Direct-class lift, which turns any other op into `Refuse`. The
+    /// instruction then skips the run-time scan. False wherever unproved.
+    proven: bool,
 }
 
 // A locked operand partly in RAM and partly in one Trap region, A20-split or
@@ -2409,6 +2414,7 @@ pub(crate) fn execute<const ROUTED: bool, const ORDER: u8>(
             guest_start: ir.guest_start,
             guest_len: ir.guest_len,
             ops: &ir.ops,
+            proven: false,
         },
         cpu,
         &LegacyAccess::new(memory, legacy::physical_mask(context.generation)),
@@ -2444,7 +2450,8 @@ where
     }
     mem.read_index.set(0);
     let checked = context.segment_class != crate::SegmentClass::Direct;
-    if checked && !ir.ops.iter().all(supported) {
+    debug_assert!(!checked || !ir.proven || ir.ops.iter().all(supported));
+    if checked && !ir.proven && !ir.ops.iter().all(supported) {
         return Err(refusal(
             cpu,
             crate::UnsupportedSystemOperation::LegacyInstruction,
@@ -2757,6 +2764,8 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
                 guest_start: guest_addr,
                 guest_len: (next - guest_addr) as u32,
                 ops: &ir.ops[start..end],
+                // `BlockWalk::Direct`: a Direct-class or `flat32_ordinary` block.
+                proven: true,
             },
             cpu,
             mem,
@@ -2885,6 +2894,7 @@ fn continue_after_reload<const ROUTED: bool, const ORDER: u8>(
                     guest_start: guest_addr,
                     guest_len: (next - guest_addr) as u32,
                     ops: &ir.ops[start..end],
+                    proven: true,
                 },
                 cpu,
                 mem,
@@ -3312,6 +3322,7 @@ pub(super) fn execute_shared_op<const ROUTED: bool, const ORDER: u8>(
             guest_start: ip,
             guest_len: (next - ip) as u32,
             ops: &ops,
+            proven: false,
         },
         cpu,
         &access,
@@ -5652,5 +5663,101 @@ mod delivery_log_layout {
             size_of::<Result<OutcomeBefore, Exit>>()
         );
         assert_eq!(size_of::<Progress>(), size_of::<ProgressBefore>());
+    }
+}
+
+#[cfg(test)]
+mod walk_verdict {
+    use super::*;
+
+    #[test]
+    fn an_op_outside_the_walk_is_refused_at_its_instruction() {
+        // The `supported` verdict is taken when a block is built: only a
+        // `flat32_ordinary` block gets the Direct walk, whose instructions skip
+        // the run-time scan. An instruction carrying any other op (no 80386
+        // or 80486 encoding lifts to one; this IR is hand-built) ends the
+        // block before it and runs alone on the Protected walk, which refuses
+        // it before it changes anything, the earlier instruction retired.
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x4000));
+        vm.map(0, 0x4000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        let mut cpu = CpuState {
+            rip: 0x1000,
+            ..CpuState::default()
+        };
+        cpu.legacy.cr0 = 1;
+        cpu.legacy.a20_enabled = 1;
+        for (i, cache) in cpu.legacy.segments[..4].iter_mut().enumerate() {
+            cache.base = 0;
+            cache.limit = u32::MAX;
+            cache.attributes = if i == 0 { 0x9b } else { 0x93 } | 0x4000;
+        }
+        let model = crate::CpuModel::I80386.legacy_model();
+        let context = legacy::derive_legacy_context(model, &cpu).unwrap();
+        assert_eq!(context.segment_class, crate::SegmentClass::Flat32);
+        let lift = |bytes: &[u8], ip| crate::lift::legacy::instruction(bytes, ip, context).unwrap();
+        let first = lift(b"\x40", 0x1000); // INC EAX
+        let mut second = lift(b"\x43", 0x1001); // INC EBX, then the foreign op
+        second.ops.push(IrOp::Cpuid);
+        assert!(!supported(&IrOp::Cpuid));
+        let mut joined = first.clone();
+        joined.ops.extend(second.ops.iter().cloned());
+        joined.guest_len += second.guest_len;
+        joined.icount += 1;
+
+        // Build-time verdicts: the ordinary prefix is proven, the rest is not.
+        assert!(matches!(BlockWalk::for_flat32(&first), BlockWalk::Direct));
+        assert!(matches!(
+            BlockWalk::for_flat32(&second),
+            BlockWalk::Protected
+        ));
+        assert!(matches!(
+            BlockWalk::for_flat32(&joined),
+            BlockWalk::Protected
+        ));
+
+        let refused = |progress: &Progress| {
+            matches!(
+                progress.outcome,
+                Some(Err(Exit::UnsupportedSystemContext {
+                    operation: crate::UnsupportedSystemOperation::LegacyInstruction,
+                    ..
+                }))
+            )
+        };
+        let exit_word = std::sync::atomic::AtomicU64::new(0);
+        let mut scratch = Vec::new();
+        let mut tasks = tasks::SwitchState::default();
+        let mut run = |ir: &IrBlock, cpu: &mut CpuState| {
+            execute_block::<false, 0>(
+                BlockWalk::for_flat32(ir),
+                ir,
+                cpu,
+                &vm.mem,
+                &mut scratch,
+                u64::MAX,
+                &exit_word,
+                &mut tasks,
+                false,
+                0,
+                false,
+                false,
+            )
+        };
+        let start = cpu.clone();
+        // The block the lifter builds stops before the foreign instruction.
+        let progress = run(&first, &mut cpu);
+        assert_eq!((progress.retired, cpu.rip, cpu.gpr[0]), (1, 0x1001, 1));
+        let after_first = cpu.gpr;
+        let progress = run(&second, &mut cpu);
+        assert!(refused(&progress));
+        assert_eq!((progress.steps, progress.retired), (0, 0));
+        assert_eq!((cpu.rip, cpu.gpr), (0x1001, after_first));
+        // A block holding it whole is refused at its start, as before.
+        cpu = start.clone();
+        let progress = run(&joined, &mut cpu);
+        assert!(refused(&progress));
+        assert_eq!((progress.steps, progress.retired), (0, 0));
+        assert_eq!((cpu.rip, cpu.gpr), (0x1000, start.gpr));
     }
 }
