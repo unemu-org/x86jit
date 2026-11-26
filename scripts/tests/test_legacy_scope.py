@@ -81,6 +81,8 @@ REVIEWED_ENTRY_POINTS = {
     # select catalogue models and lift single instructions for the classifier.
     "x86jit-core/src/vm/legacy/return_witness.rs": {
         "lift::legacy::instruction_for_profile", "model::CpuModel",
+        # CR0.AM of the witness's Machine state, for the same lift.
+        "lift::legacy::alignment_mask",
     },
     "x86jit-core/src/interp/control.rs": {
         "interp::legacy::execute_loop", "lift::legacy::alias_context",
@@ -105,6 +107,9 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::mod", "interp::legacy::scalar_limit_access",
         "interp::legacy::selector", "interp::legacy::stack_fault_access",
         "lift::legacy::shared_helper",
+        # The 486 alignment gate's regime test, in the arm matched only when
+        # an instruction executor is enabled (Machine instruction walks).
+        "interp::legacy::alignment_regime",
     },
     "x86jit-core/src/ir/verify.rs": {
         "ir::verify::legacy_probes::mod",
@@ -145,6 +150,8 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::tasks", "lift::i8086::CONTEXT", "lift::i8086::word_bus",
         "lift::legacy::alias_context",
         "lift::legacy::instruction_for_profile", "lift::legacy::shared_helper", "model::CpuModel",
+        # CR0.AM for the Machine resolvers' instruction_for_profile lifts.
+        "lift::legacy::alignment_mask",
         "model::decode", "vm::i8086::resolve",
         # The twenty-bit dispatcher's retained self-modifying-code pages.
         "vm::i8086::RetainedBlocks", "vm::i8086::resolve_retained",
@@ -158,6 +165,8 @@ REVIEWED_ENTRY_POINTS = {
         # the lifter's in-block segment-load mask (xj-to9.18) too.
         "interp::legacy::flat32_ordinary", "interp::legacy::data_segment_load",
         "model::CpuModel", "model::decode",
+        # CR0.AM for the Machine Flat32 and Segmented proof lift.
+        "lift::legacy::alignment_mask",
     },
     "x86jit-core/src/vm/legacy/paging.rs": {
         # Machine-only paged dispatch, incoming-task fault ownership, and the
@@ -167,6 +176,8 @@ REVIEWED_ENTRY_POINTS = {
         "interp::legacy::paging", "interp::legacy::finish_port_input",
         # Paged Flat32 and Segmented blocks reuse the ordinary-IR effect proof.
         "interp::legacy::flat32_ordinary", "model::CpuModel", "model::decode",
+        # CR0.AM for the Machine paged proof lift.
+        "lift::legacy::alignment_mask",
     },
     "x86jit-core/src/vm/legacy/live.rs": {
         # Live instruction fields (xj-to9.46): called only by the Flat32,

@@ -403,9 +403,14 @@ fn only_near_returns_end_in_a_return_link_exit() {
         let profile = vm.machine_model_profile(context.generation);
         let forms: &[(&[u8], bool)] = sized(setup, &narrow, &wide);
         for &(bytes, near) in forms {
-            let ir =
-                crate::lift::legacy::instruction_for_profile(bytes, CODE as u32, context, profile)
-                    .unwrap();
+            let ir = crate::lift::legacy::instruction_for_profile(
+                bytes,
+                CODE as u32,
+                context,
+                profile,
+                crate::lift::legacy::alignment_mask(&cpu.cpu),
+            )
+            .unwrap();
             assert_eq!(links::ends_near_return(&ir), near, "{setup:?} {bytes:02x?}");
             assert!(!ir.ends_direct(), "{setup:?} {bytes:02x?}");
         }

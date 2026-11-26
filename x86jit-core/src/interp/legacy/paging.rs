@@ -1558,6 +1558,7 @@ pub(crate) fn scalar_for_test(
         cpu.rip as u32,
         context,
         model.profile(),
+        crate::lift::legacy::alignment_mask(cpu),
     )
     .map_err(|_| refusal(cpu, crate::UnsupportedSystemOperation::LegacyInstruction))?;
     execute_for_test::<true, false>(

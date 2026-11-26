@@ -231,6 +231,7 @@ fn lift(
             ip as u32,
             context,
             vm.machine_model_profile(context.generation),
+            crate::lift::legacy::alignment_mask(cpu),
             bus,
             live,
         ) {

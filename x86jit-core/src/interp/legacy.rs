@@ -207,6 +207,15 @@ fn write_cr0(cpu: &mut CpuState, value: u32) -> Result<bool, Exit> {
     Ok(changed)
 }
 
+/// Whether alignment checking is enabled: CR0.AM, EFLAGS.AC and CPL 3,
+/// virtual-8086 mode included (SDM Vol 3A §7.15, Event 17—Alignment Check
+/// Exception (#AC), p. 7-53; 486 PRM §4.1.1 p. 4-2). The 486 gate
+/// (`LegacyOp::I486Gate`) refuses an instruction in this regime.
+#[inline(always)]
+pub(super) fn alignment_regime(cpu: &CpuState) -> bool {
+    cpu.legacy.cpl == 3 && cpu.legacy.cr0 & (1 << 18) != 0 && cpu.rflags_system & (1 << 18) != 0
+}
+
 pub(super) fn selector(cpu: &CpuState, segment: SegmentId) -> u16 {
     match segment {
         SegmentId::Cs => cpu.cs,
@@ -4438,12 +4447,9 @@ where
         IrOp::Legacy(op) => {
             match op {
                 L::I486Gate => {
-                    // 486 PRM §4.1.1 p. 4-2. ASSUMED: conservative refusal
-                    // of the whole AM+AC+CPL3 regime, including aligned accesses.
-                    if cpu.legacy.cpl == 3
-                        && cpu.legacy.cr0 & (1 << 18) != 0
-                        && cpu.rflags_system & (1 << 18) != 0
-                    {
+                    // ASSUMED: conservative refusal of the whole regime,
+                    // including aligned accesses.
+                    if alignment_regime(cpu) {
                         return Err(refusal(
                             cpu,
                             crate::UnsupportedSystemOperation::LegacyAlignmentCheck,

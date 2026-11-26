@@ -482,6 +482,46 @@ fn alignment_regime_is_refused_before_execution() {
 }
 
 #[test]
+fn alignment_regime_entered_by_popfd_refuses_the_next_instruction() {
+    // PRM §4.1.1 p. 4-2: the regime is AM, AC and CPL 3; POPFD at CPL 3
+    // writes AC (§26 POPF/POPFD). Every instruction before the POPFD runs
+    // its gate outside the regime; the NOP after it is refused, whole.
+    for model in MODELS {
+        for mode in [Mode::P16, Mode::P32] {
+            let mut code = vec![0x40]; // INC (E)AX
+            code.extend(instruction(mode, 4, &[0x9c])); // PUSHFD
+            code.extend(instruction(mode, 4, &[0x58])); // POP EAX
+            let mut or = vec![0x0d]; // OR EAX, AC
+            or.extend((1u32 << 18).to_le_bytes());
+            code.extend(instruction(mode, 4, &or));
+            code.extend(instruction(mode, 4, &[0x50])); // PUSH EAX
+            code.extend(instruction(mode, 4, &[0x9d])); // POPFD
+            let nop = 0x1000 + code.len() as u64;
+            code.push(0x90);
+            let (vm, mut cpu) = setup(model, mode, &code);
+            ring(&mut cpu, 3);
+            cpu.cpu.legacy.cr0 |= 1 << 18;
+            let run = cpu.run_steps(&vm, 16, StepOptions::default()).unwrap();
+            assert_eq!(run.steps(), 6, "{mode:?}: {:?}", run.stop());
+            assert!(
+                matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::UnsupportedSystemContext {
+                        operation: U::LegacyAlignmentCheck,
+                        ..
+                    })
+                ),
+                "{:?}",
+                run.stop()
+            );
+            assert_eq!(cpu.cpu.rip, nop);
+            assert_ne!(cpu.cpu.rflags_system & (1 << 18), 0);
+            assert_ne!(cpu.cpu.gpr[0] & (1 << 18), 0);
+        }
+    }
+}
+
+#[test]
 fn decode_boundaries_preserve_386_and_reject_later_encodings() {
     // PRM §3.11 p. 3-43, App. A pp. A-4–7; DM App. D pp. D-1–3.
     for mode in MODES {

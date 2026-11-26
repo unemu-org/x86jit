@@ -358,6 +358,7 @@ fn lift(
             cursor.rip as u32,
             context,
             vm.machine_model_profile(context.generation),
+            crate::lift::legacy::alignment_mask(&cursor),
             bus,
             live,
         ) {

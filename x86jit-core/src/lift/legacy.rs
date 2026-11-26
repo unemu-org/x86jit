@@ -12,6 +12,8 @@ struct Ops {
     /// The fields read live, by `LiveFieldKind`, and the temporary each
     /// defines at its first use.
     live: Option<Box<LiveRequest>>,
+    /// CR0.AM of the state lifted for (`LiftBuffer::alignment_mask`).
+    alignment_mask: bool,
 }
 type LiveRequest = [Option<(LiveSpec, Option<Temp>)>; 2];
 impl std::ops::Deref for Ops {
@@ -34,6 +36,9 @@ impl LiftBuffer for Ops {
     }
     fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
         Some(self.profile)
+    }
+    fn alignment_mask(&self) -> bool {
+        self.alignment_mask
     }
     fn live_field(&mut self, kind: LiveFieldKind, tg: &mut TempGen) -> Option<Val> {
         let (spec, temp) = self.live.as_mut()?[kind as usize].as_mut()?;
@@ -155,6 +160,7 @@ pub(crate) fn live_instruction(
     ip: u32,
     context: MachineContext,
     profile: &'static crate::ModelProfile,
+    alignment_mask: bool,
     fields: LiveFields,
     requested: [Option<u64>; 2],
 ) -> Option<IrBlock> {
@@ -194,9 +200,16 @@ pub(crate) fn live_instruction(
         })?;
         *slot = Some((LiveSpec { bus, bytes, extend }, None));
     }
-    let mut lifts = probes
-        .iter()
-        .map(|code| instruction_with(code, ip, context, profile, Some(Box::new(live))));
+    let mut lifts = probes.iter().map(|code| {
+        instruction_with(
+            code,
+            ip,
+            context,
+            profile,
+            alignment_mask,
+            Some(Box::new(live)),
+        )
+    });
     let first = lifts.next()?.ok()?;
     let image = format!("{:?}", first.ops);
     if !first
@@ -289,7 +302,7 @@ mod live_tests {
         let requested = [Some(0x1001), None];
         for (bake, live) in [(0, true), (1, false), (2, false)] {
             BAKE.with(|b| b.set(bake));
-            let ir = live_instruction(code, 0x1000, context, profile, fields, requested);
+            let ir = live_instruction(code, 0x1000, context, profile, true, fields, requested);
             BAKE.with(|b| b.set(0));
             assert_eq!(ir.is_some(), live, "bake {bake}");
         }
@@ -423,16 +436,27 @@ pub(crate) fn instruction(
         ip,
         context,
         crate::model::profile_for_generation(context.generation),
+        true,
     )
 }
 
+/// CR0.AM, the alignment-mask control (SDM Vol 3A §7.15, Event 17—Alignment
+/// Check Exception (#AC), p. 7-53; 486 PRM §4.1.1 p. 4-2), of the state a
+/// Machine instruction is lifted for: `alignment_mask` of the lifts below.
+pub(crate) fn alignment_mask(cpu: &crate::CpuState) -> bool {
+    cpu.legacy.cr0 & (1 << 18) != 0
+}
+
+/// `alignment_mask` is CR0.AM of the state lifted for ([`alignment_mask`]);
+/// `true` is always exact, at the cost of the 486 gate at CPL 3.
 pub(crate) fn instruction_for_profile(
     code: &[u8],
     ip: u32,
     context: MachineContext,
     profile: &'static crate::ModelProfile,
+    alignment_mask: bool,
 ) -> Result<IrBlock, LiftError> {
-    instruction_with(code, ip, context, profile, None)
+    instruction_with(code, ip, context, profile, alignment_mask, None)
 }
 
 fn instruction_with(
@@ -440,6 +464,7 @@ fn instruction_with(
     ip: u32,
     context: MachineContext,
     profile: &'static crate::ModelProfile,
+    alignment_mask: bool,
     live: Option<Box<LiveRequest>>,
 ) -> Result<IrBlock, LiftError> {
     let mut decoder = Decoder::with_ip(
@@ -470,6 +495,7 @@ fn instruction_with(
         context,
         profile,
         live,
+        alignment_mask,
     };
     let mut tg = TempGen::new();
     ops.push(IrOp::InsnStart {
@@ -1395,10 +1421,23 @@ pub(super) fn lower(
     use Mnemonic::*;
     let context = ops.legacy_context().expect("legacy lowering context");
     let profile = lowering_profile(ops, context);
+    // Alignment checking needs CR0.AM, EFLAGS.AC and CPL 3, V86 included
+    // (SDM Vol 3A §7.15, Event 17—Alignment Check Exception (#AC), p. 7-53;
+    // 486 PRM §4.1.1 p. 4-2). CPL and CR0.AM hold for the whole block: a
+    // control transfer, which ends it, changes CPL, and only MOV to CR0, at
+    // CPL 0, writes AM (SDM Vol 2B MOV—Move to/from Control Registers,
+    // p. 4-33). LMSW loads only CR0[3:0] (Vol 2A LMSW p. 3-560), CLTS clears
+    // only TS (Vol 2A CLTS p. 3-152) and a task switch sets only TS (Vol 3A
+    // §10.3 Table 10-2 p. 10-15). Every block key that can hold a gate-less
+    // CPL 3 block names the context stamp, CR0 and CPL included; real mode
+    // is CPL 0. AC alone changes inside a block (POPFD), so the gate stays
+    // per instruction.
     if matches!(
         profile.isa,
         crate::ModelIsa::I80486Dx | crate::ModelIsa::I80486DxCpuid
-    ) {
+    ) && context.cpl == 3
+        && ops.alignment_mask()
+    {
         emit(ops, L::I486Gate);
     }
     // 287 PRM Part II Ch. 2 p. 2-16, App. B item 2 p. B-1;
@@ -2455,5 +2494,53 @@ mod restartability_tests {
         )
         .unwrap();
         assert!(matches!(ir.ops.get(1), Some(IrOp::Legacy(L::Checkpoint))));
+    }
+
+    #[test]
+    fn alignment_gate_is_lowered_only_at_cpl3_with_am() {
+        // SDM Vol 3A §7.15, Event 17—Alignment Check Exception (#AC),
+        // p. 7-53; 486 PRM §4.1.1 p. 4-2: alignment checking needs CR0.AM,
+        // EFLAGS.AC and CPL 3. The 386 has no gate; the 486 has one per
+        // instruction at CPL 3 with AM, whatever AC is now.
+        for model in [
+            crate::CpuModel::I80386,
+            crate::CpuModel::I80486Dx,
+            crate::CpuModel::I80486DxCpuid,
+        ] {
+            for (cpl, am) in (0..4).flat_map(|cpl| [(cpl, false), (cpl, true)]) {
+                let mut cpu = crate::CpuState::default();
+                cpu.legacy.cr0 = 1 | u32::from(am) << 18;
+                cpu.legacy.cpl = cpl;
+                cpu.cs = 8 | u16::from(cpl);
+                cpu.ss = 16 | u16::from(cpl);
+                for (i, cache) in cpu.legacy.segments.iter_mut().enumerate() {
+                    cache.limit = u32::MAX;
+                    cache.attributes = if i == 0 { 0x409b } else { 0x4093 } | u16::from(cpl) << 5;
+                }
+                let context =
+                    crate::legacy::derive_legacy_context(model.legacy_model(), &cpu).unwrap();
+                assert_eq!(context.cpl, cpl);
+                assert_eq!(alignment_mask(&cpu), am);
+                // INC EAX; MOV EAX,[2000h].
+                for code in [&b"\x40"[..], &b"\x8b\x05\x00\x20\x00\x00"[..]] {
+                    let gates = |mask| {
+                        instruction_for_profile(code, 0x1000, context, model.profile(), mask)
+                            .unwrap()
+                            .ops
+                            .iter()
+                            .filter(|op| matches!(op, IrOp::Legacy(L::I486Gate)))
+                            .count()
+                    };
+                    let i486 = model != crate::CpuModel::I80386;
+                    assert_eq!(
+                        gates(alignment_mask(&cpu)),
+                        usize::from(i486 && cpl == 3 && am),
+                        "{model:?} CPL {cpl} AM {am}"
+                    );
+                    // A lift that does not know CR0.AM keeps the gate.
+                    assert_eq!(gates(true), usize::from(i486 && cpl == 3));
+                }
+            }
+        }
     }
 }

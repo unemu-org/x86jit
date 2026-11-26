@@ -1407,6 +1407,85 @@ fn cpl3_486_alignment_regime_keeps_checked_refusal() {
 }
 
 #[test]
+fn cpl3_block_lifted_before_am_is_not_reused_after_the_kernel_sets_it() {
+    // SDM Vol 3A §7.15, Event 17—Alignment Check Exception (#AC), p. 7-53;
+    // 486 PRM §4.1.1 p. 4-2: checking needs CR0.AM, EFLAGS.AC and CPL 3.
+    // The kernel returns three times to the same CPL 3 block from the same
+    // frame, each time after a MOV to CR0. CR0 starts with ET set, which the
+    // 486 forces (486 PRM §4.1.3 p. 4-7), so the first two writes leave CR0
+    // as it is: the block is lifted with AM clear, without its gate, and the
+    // second entry reuses it. The third write sets only AM, and the return
+    // sets AC: the block is lifted again and its misaligned load is refused,
+    // whole, as every instruction of the regime is.
+    // 1000: MOV EAX,[6001h]; 1006: INT 20h.
+    let code = b"\x8b\x05\x01\x60\x00\x00\xcd\x20";
+    let kernel = [
+        &b"\x41"[..],                        // INC ECX
+        b"\x0f\x20\xc0",                     // MOV EAX,CR0
+        b"\x83\xf9\x03",                     // CMP ECX,3
+        b"\x72\x0d",                         // JB the CR0 write
+        b"\x0d\x00\x00\x04\x00",             // OR EAX,AM
+        b"\x81\x4c\x24\x08\x00\x00\x04\x00", // OR dword [ESP+8],AC
+        b"\x0f\x22\xc0",                     // MOV CR0,EAX
+        b"\xc7\x04\x24\x00\x10\x00\x00",     // MOV dword [ESP],1000h
+        b"\xcf",                             // IRETD
+    ]
+    .concat();
+    for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
+        for paged in [false, true] {
+            for checked in [false, true] {
+                let case = format!("{model:?} paged {paged} checked {checked}");
+                let (vm, mut cpu) = user_setup(model, code, paged, checked);
+                vm.write_bytes(0x4000, &kernel).unwrap();
+                cpu.cpu.legacy.cr0 |= 0x10;
+                cpu.cpu.gpr[1] = 0;
+                let cr0 = cpu.cpu.legacy.cr0;
+                assert_eq!(cr0 & (1 << 18), 0);
+                let steps = |cpu: &mut Vcpu, budget| {
+                    x86jit_core::Vcpu::take_machine_counters_for_test();
+                    let run = cpu.run_steps(&vm, budget, StepOptions::default()).unwrap();
+                    let [_, _, lifts, proofs, ..] =
+                        x86jit_core::Vcpu::take_machine_counters_for_test();
+                    (run, lifts, proofs)
+                };
+                // The first entry and the first kernel call (7 instructions).
+                assert_eq!(steps(&mut cpu, 9).0.steps(), 9, "{case}");
+                assert_eq!(cpu.cpu.legacy.cr0, cr0, "{case}");
+                let (run, lifts, _) = steps(&mut cpu, 2);
+                assert_eq!(run.steps(), 2, "{case}");
+                assert_ne!(lifts, 0, "{case}: the block's first lift after a return");
+                assert_eq!(steps(&mut cpu, 7).0.steps(), 7, "{case}");
+                assert_eq!(cpu.cpu.legacy.cr0, cr0, "{case}");
+                let (run, lifts, proofs) = steps(&mut cpu, 2);
+                assert_eq!(run.steps(), 2, "{case}");
+                assert_eq!((lifts, proofs != 0), (0, true), "{case}: reused unchanged");
+                // The third call sets AM, and AC in the frame (9 instructions).
+                assert_eq!(steps(&mut cpu, 9).0.steps(), 9, "{case}");
+                assert_eq!(cpu.cpu.legacy.cr0, cr0 | 1 << 18, "{case}");
+                let (run, lifts, _) = steps(&mut cpu, 4);
+                assert_eq!(run.steps(), 0, "{case}");
+                assert!(
+                    matches!(
+                        run.stop(),
+                        StepStop::Exit(Exit::UnsupportedSystemContext {
+                            operation:
+                                x86jit_core::UnsupportedSystemOperation::LegacyAlignmentCheck,
+                            ..
+                        })
+                    ),
+                    "{case}: {:?}",
+                    run.stop()
+                );
+                assert_ne!(lifts, 0, "{case}: lifted again once AM is set");
+                assert_eq!(cpu.cpu.rip, 0x1000, "{case}");
+                assert_eq!(cpu.cpu.legacy.cpl, 3, "{case}");
+                assert_ne!(cpu.cpu.rflags_system & (1 << 18), 0, "{case}");
+            }
+        }
+    }
+}
+
+#[test]
 fn cpl3_task_gate_reselects_before_the_incoming_task() {
     // SDM Vol 3A §§8.2.1, 8.3, 8.6: a task gate loads the incoming
     // TSS's CS/CPL and CR3; the interrupted instruction has no successor.

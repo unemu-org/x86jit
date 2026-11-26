@@ -914,6 +914,7 @@ impl Execution {
             cpu.rip as u32,
             context,
             vm.machine_model_profile(context.generation),
+            crate::lift::legacy::alignment_mask(cpu),
         )
         .map_err(|error| match error {
             crate::lift::LiftError::Unsupported { addr, bytes, len } => {
@@ -1370,6 +1371,7 @@ fn resolve_direct_uncached(
                     insn.ip() as u32,
                     context,
                     profile,
+                    crate::lift::legacy::alignment_mask(cpu),
                 );
                 let allowed = !insn.is_invalid()
                     && shared_instruction(&insn)
@@ -1410,6 +1412,7 @@ fn resolve_direct_uncached(
                         cpu.rip as u32,
                         context,
                         vm.machine_model_profile(context.generation),
+                        crate::lift::legacy::alignment_mask(cpu),
                     )
                     .map_err(|error| direct_refusal(cpu, error))?
                 }
@@ -1466,6 +1469,7 @@ fn resolve_direct_uncached(
                 cpu.rip as u32,
                 context,
                 vm.machine_model_profile(context.generation),
+                crate::lift::legacy::alignment_mask(cpu),
             )
             .map_err(|error| direct_refusal(cpu, error))?
         };

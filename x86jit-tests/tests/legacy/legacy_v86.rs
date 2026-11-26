@@ -731,6 +731,44 @@ fn i486_alignment_boundary_is_retained_in_v86() {
     }
 }
 
+#[test]
+fn i486_v86_block_lifted_before_am_is_not_reused_once_am_and_ac_are_set() {
+    // SDM Vol 3A §7.15, Event 17—Alignment Check Exception (#AC), p. 7-53:
+    // CPL 3 includes virtual-8086 mode. A block lifted with AM clear carries
+    // no gate; once AM is set (between runs, as a monitor would) the block
+    // is lifted again with it, and AC then refuses the same instruction.
+    for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
+        for paged in [false, true] {
+            let (vm, mut cpu) = world(model, &[0x40, 0x90, 0x90, 0xf4], 3);
+            if paged {
+                identity_paging(&vm, &mut cpu);
+            }
+            let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+            assert_eq!(r.steps(), 2, "{:?}", r.stop());
+            for ac in [false, true] {
+                cpu.cpu.rip = 0x1000;
+                cpu.cpu.legacy.cr0 |= 1 << 18;
+                cpu.cpu.rflags_system |= u64::from(ac) << 18;
+                let before = format!("{:?}", cpu.cpu);
+                let r = cpu.run_steps(&vm, 2, StepOptions::default()).unwrap();
+                if ac {
+                    assert_eq!(r.steps(), 0);
+                    assert!(matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::UnsupportedSystemContext {
+                            operation: UnsupportedSystemOperation::LegacyAlignmentCheck,
+                            ..
+                        })
+                    ));
+                    assert_eq!(format!("{:?}", cpu.cpu), before);
+                } else {
+                    assert_eq!(r.steps(), 2, "{:?}", r.stop());
+                }
+            }
+        }
+    }
+}
+
 // Intel486 PRM §§4.1.3, 19.2.4 pp. 4-7, 19-4: NE selects internal #MF
 // versus FERR#/IGNNE#. V86 §9/Q5 keeps internal routing even with NE=0
 // until that independent facility is implemented; this is an engine boundary.

@@ -317,16 +317,20 @@ impl LiveFields {
     /// byte `i` to. Changes the lift needs go to `plan`.
     #[cold]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn instruction(
         &self,
         code: &[u8],
         ip: u32,
         context: MachineContext,
         profile: &'static crate::ModelProfile,
+        alignment_mask: bool,
         bus: impl Fn(u32) -> u64,
         plan: &mut Plan,
     ) -> Result<IrBlock, LiftError> {
-        let plain = || crate::lift::legacy::instruction_for_profile(code, ip, context, profile);
+        let plain = || {
+            crate::lift::legacy::instruction_for_profile(code, ip, context, profile, alignment_mask)
+        };
         if !self.armed.load(Ordering::Relaxed) {
             self.armed.store(true, Ordering::Relaxed);
         }
@@ -454,9 +458,15 @@ impl LiveFields {
         let Some(fields) = fields.filter(|_| requested.iter().any(Option::is_some)) else {
             return plain();
         };
-        if let Some(ir) =
-            crate::lift::legacy::live_instruction(code, ip, context, profile, fields, requested)
-        {
+        if let Some(ir) = crate::lift::legacy::live_instruction(
+            code,
+            ip,
+            context,
+            profile,
+            alignment_mask,
+            fields,
+            requested,
+        ) {
             for (kind, start) in requested.iter().enumerate() {
                 if let (Some(start), true, Some((_, bytes))) =
                     (*start, fresh[kind], fields.fields[kind])

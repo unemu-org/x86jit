@@ -45,6 +45,12 @@ pub(crate) trait LiftBuffer: std::ops::DerefMut<Target = [IrOp]> {
     fn model_profile(&self) -> Option<&'static crate::ModelProfile> {
         None
     }
+    /// CR0.AM of the state the Machine block is lifted for; with CPL 3 it
+    /// decides whether the 486 lowering keeps its alignment gate. A buffer
+    /// that does not know it answers `true`, which keeps the gate.
+    fn alignment_mask(&self) -> bool {
+        true
+    }
     /// The instruction's `kind` field as a value read when it executes
     /// (`LegacyOp::LiveField`), or `None` to bake the decoded value. Only a
     /// Machine proof lift asks for live fields (xj-to9.46).

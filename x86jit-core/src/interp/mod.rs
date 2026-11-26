@@ -1576,6 +1576,15 @@ fn walk_ops<
             mem.0.begin_op(op, temps, cpu);
         }
         match op {
+            // The 486 alignment gate outside its regime
+            // (`legacy::alignment_regime`) has no effect: the executor would
+            // return at once. It needs no instruction bounds, so it skips the
+            // executor. In the regime the executor refuses.
+            IrOp::Legacy(L::I486Gate)
+                if instruction.enabled() && !legacy::alignment_regime(cpu) =>
+            {
+                continue;
+            }
             // The Machine instruction walks' own operations, in the same
             // dispatch as every other op.
             op @ (legacy::machine_specific_ops!()) if instruction.enabled() => {
