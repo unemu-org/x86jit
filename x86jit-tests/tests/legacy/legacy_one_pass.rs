@@ -672,22 +672,10 @@ fn same_real(a: &Vcpu, b: &Vcpu, avm: &Vm, bvm: &Vm, what: &str) {
     assert!(am == bm, "{what}: memory");
 }
 
-/// The two runs' results. KNOWN DIVERGENCE (I80486Dx only): the Checked
-/// lowering reports a REP fault with `path: Interpreter` and no REP progress
-/// in its fault metadata, where Direct, and Checked on the 80286 and 80386,
-/// report the string helper's `RepRestart`; steps, the exit and its vector
-/// and address agree, and so does the state (`same_real`).
-fn same_stop(model: CpuModel, a: &x86jit_core::StepRun, b: &x86jit_core::StepRun, what: &str) {
-    if model != CpuModel::I80486Dx {
-        assert_eq!(format!("{a:?}"), format!("{b:?}"), "{what}");
-        return;
-    }
-    assert_eq!(a.steps(), b.steps(), "{what}");
-    let key = |run: &x86jit_core::StepRun| match run.stop() {
-        StepStop::Exit(Exit::Exception { addr, vector, .. }) => format!("{addr:x} {vector}"),
-        other => format!("{other:?}"),
-    };
-    assert_eq!(key(a), key(b), "{what}");
+/// The two runs' results, compared whole: steps and the stop, with the
+/// exit's fault metadata.
+fn same_stop(a: &x86jit_core::StepRun, b: &x86jit_core::StepRun, what: &str) {
+    assert_eq!(format!("{a:?}"), format!("{b:?}"), "{what}");
 }
 
 #[test]
@@ -716,11 +704,11 @@ fn a_direct_rep_cut_between_iterations_resumes_and_faults_on_a_later_one() {
                 let what = format!("{model:?} SI={si:x} DI={di:x} budget={budget}");
                 let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
                 let br = b.run_steps(&bvm, budget, StepOptions::default()).unwrap();
-                same_stop(model, &ar, &br, &what);
+                same_stop(&ar, &br, &what);
                 same_real(&a, &b, &avm, &bvm, &what);
                 let ar = a.run_steps(&avm, 20, StepOptions::default()).unwrap();
                 let br = b.run_steps(&bvm, 20, StepOptions::default()).unwrap();
-                same_stop(model, &ar, &br, &format!("{what} resumed"));
+                same_stop(&ar, &br, &format!("{what} resumed"));
                 same_real(&a, &b, &avm, &bvm, &format!("{what} resumed"));
                 let StepStop::Exit(Exit::Exception { vector, .. }) = ar.stop() else {
                     panic!("{what}: {ar:?}")

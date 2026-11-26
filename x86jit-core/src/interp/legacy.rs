@@ -2602,13 +2602,15 @@ where
     // Match the shared walk's evidence only where the instruction's
     // memory effects are represented. Opaque frame/system helpers keep
     // their existing evidence; generic scalar analysis cannot prove
-    // that those helpers left RAM untouched.
+    // that those helpers left RAM untouched. The 486 alignment gate
+    // (`I486Gate`) only refuses before any effect, so it changes nothing.
     let scalar_evidence = context.regime == legacy::MachineRegime::Real
         && ir.ops.iter().all(|op| match op {
             IrOp::Legacy(op) => matches!(
                 op,
                 L::SharedWalk
                     | L::Checkpoint
+                    | L::I486Gate
                     | L::Address { .. }
                     | L::ReadSelector { .. }
                     | L::DirectStackAddress { .. }
