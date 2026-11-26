@@ -3369,18 +3369,23 @@ impl Vcpu {
                 }
                 if direct20 {
                     self.cpu.rip &= 0xffff;
-                    let restart = ir.ops.iter().find_map(|op| match op {
-                        IrOp::Legacy(crate::legacy::LegacyOp::WrappedString {
-                            restart_ip,
-                            rep,
-                            ..
-                        }) if !matches!(rep, crate::ir::RepKind::None)
-                            && self.cpu.rip == ir.guest_start =>
-                        {
-                            Some((self.cpu.cs, self.cpu.rip as u16, *restart_ip))
-                        }
-                        _ => None,
-                    });
+                    // A string is its block's only instruction (`i8086::resolve`
+                    // ends the block before and after one), so a longer block, or
+                    // one left at another IP, holds no pair: no scan of its ops.
+                    let restart = if ir.icount == 1 && self.cpu.rip == ir.guest_start {
+                        ir.ops.iter().find_map(|op| match op {
+                            IrOp::Legacy(crate::legacy::LegacyOp::WrappedString {
+                                restart_ip,
+                                rep,
+                                ..
+                            }) if !matches!(rep, crate::ir::RepKind::None) => {
+                                Some((self.cpu.cs, self.cpu.rip as u16, *restart_ip))
+                            }
+                            _ => None,
+                        })
+                    } else {
+                        None
+                    };
                     // UM §2.7 p. 2-42: only a string with a completed element is
                     // interrupted inside the instruction. A stop before its first
                     // element keeps the full owner unless an earlier walk already

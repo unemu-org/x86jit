@@ -1578,9 +1578,16 @@ fn walk_ops<
                     if let L::WrappedStore { addr, size, .. } | L::LockedRmw20 { addr, size, .. } =
                         op
                     {
-                        for i in 0..*size {
-                            mem.0
-                                .note_block_write(i8086::physical(read_val(*addr, temps), i), 1);
+                        // Consecutive bytes are one range; the running block
+                        // reaches the same verdict for it as for its bytes.
+                        let tag = read_val(*addr, temps);
+                        let first = i8086::physical(tag, 0);
+                        if i8086::physical(tag, *size - 1) == first + u64::from(*size) - 1 {
+                            mem.0.note_block_write(first, usize::from(*size));
+                        } else {
+                            for i in 0..*size {
+                                mem.0.note_block_write(i8086::physical(tag, i), 1);
+                            }
                         }
                     }
                 }

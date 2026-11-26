@@ -140,6 +140,21 @@ fn device_read<const ROUTED: bool, const ORDER: u8>(
     }
     Ok(result)
 }
+// The first physical address of an operand whose bytes are consecutive
+// physical addresses, wrapping neither the segment at offset FFFFh (UM §2.3
+// p. 2-12) nor the twenty-bit bus at FFFFFh (§2.8 p. 2-68), when no transfer of
+// the instruction at `rip` is acknowledged (`mmio_part`). Memory is an array of
+// bytes, and how many bus cycles move a word is a bus property (UM §2.3
+// pp. 2-8 and 2-15): such an operand in one RAM or ROM region is one host
+// access. Any other operand, or a miss of that access, takes the byte
+// transfers below, which then make every device transfer and every exit.
+#[inline(always)]
+fn contiguous(cpu: &CpuState, rip: u64, tag: u64, size: u8) -> Option<u64> {
+    let first = physical(tag, 0);
+    (physical(tag, size - 1) == first + u64::from(size) - 1
+        && (cpu.mmio_parts_len == 0 || cpu.mmio_parts_rip != rip))
+        .then_some(first)
+}
 fn read<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &Memory,
@@ -147,6 +162,11 @@ fn read<const ROUTED: bool, const ORDER: u8>(
     size: u8,
 ) -> Result<u64, Exit> {
     let mem = Access::<ROUTED, ORDER, _>::new(mem);
+    if let Some(addr) = contiguous(cpu, cpu.rip, tag, size) {
+        if let Ok(value) = mem.read(addr, size) {
+            return Ok(value);
+        }
+    }
     let mut result = 0;
     for i in 0..size {
         let addr = physical(tag, i);
@@ -177,6 +197,18 @@ fn write<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     value: u64,
 ) -> Result<(), Exit> {
+    // With host-fault recovery the whole destination is validated first, as
+    // below. Without it, a store that misses commits no byte: the region
+    // checks precede the store (`Memory::write_mode`).
+    if let Some(addr) = contiguous(cpu, cpu.rip, tag, size) {
+        if (!ROUTED || mem.probe_write_mode::<ROUTED>(addr, size).is_ok())
+            && Access::<ROUTED, ORDER, _>::new(mem)
+                .write(addr, value, size)
+                .is_ok()
+        {
+            return Ok(());
+        }
+    }
     // Validate the complete RAM destination before the first byte commits.
     for i in 0..size {
         let addr = physical(tag, i);
@@ -1055,6 +1087,11 @@ pub(super) fn string_load<M: StrMem>(
     tag: u64,
     elem: u8,
 ) -> Result<u64, MemTrap> {
+    if let Some(addr) = contiguous(cpu, rip, tag, elem) {
+        if let Ok(value) = mem.sload(addr, elem) {
+            return Ok(value);
+        }
+    }
     let mut value = 0;
     for i in 0..elem {
         let key = 32 + slot * 8 + u64::from(i);
@@ -1090,6 +1127,13 @@ pub(super) fn string_store<M: StrMem>(
     value: u64,
     elem: u8,
 ) -> Result<(), MemTrap> {
+    if let Some(addr) = contiguous(cpu, rip, tag, elem) {
+        if mem.preflight_store(addr, 1, elem, u16::from(elem)).is_ok()
+            && mem.sstore(addr, value, elem).is_ok()
+        {
+            return Ok(());
+        }
+    }
     for i in 0..elem {
         if let Err((_, trap)) = mem.preflight_store(physical(tag, i), 1, 1, 1) {
             record_fault_byte(cpu, rip, i);

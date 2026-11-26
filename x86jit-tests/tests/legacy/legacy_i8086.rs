@@ -3415,3 +3415,148 @@ fn in_and_out_end_their_block() {
         port_block::check(|code| setup(model, code), IP, true);
     }
 }
+
+// xj-50w.16: a RAM word whose bytes are consecutive physical addresses is one
+// host access; a word that wraps its segment (UM §2.3 p. 2-12) or the twenty-bit
+// bus (§2.8 p. 2-68) keeps its byte transfers. Memory is an array of bytes and
+// the bus cycles per word are a bus property (§2.3 pp. 2-8 and 2-15), so every
+// model ends with the same bytes. The rows pin both sides of each edge: the
+// last contiguous word below it and the word over it.
+const TWENTY_BIT: [CpuModel; 4] = [
+    CpuModel::I8088,
+    CpuModel::I8086,
+    CpuModel::NecV20,
+    CpuModel::NecV30,
+];
+fn edge_bytes(segment: u16, offset: u16) -> (u64, u64) {
+    let at = |o: u16| ((u64::from(segment) << 4) + u64::from(o)) & 0xf_ffff;
+    (at(offset), at(offset.wrapping_add(1)))
+}
+#[test]
+fn ram_words_at_segment_and_bus_edges_equal_their_bytes() {
+    // (segment, offset): contiguous at the segment end, over the segment end,
+    // contiguous at the top of the bus, over the bus wrap.
+    let edges = [
+        (0x1000u16, 0xfffeu16),
+        (0x1000, 0xffff),
+        (0xffff, 0x000e),
+        (0xffff, 0x000f),
+    ];
+    // The bytes past each edge that a missed wrap would reach.
+    let beyond = [0x2_0000u64, 0x2_0000, 0x10_0000, 0x10_0000];
+    for model in TWENTY_BIT {
+        for (&(segment, offset), &past) in edges.iter().zip(&beyond) {
+            let (lo, hi) = edge_bytes(segment, offset);
+            let what = format!("{model:?} {segment:04x}:{offset:04x}");
+            let seed = |vm: &Vm| {
+                vm.mem.write(lo, 0x34, 1).unwrap();
+                vm.mem.write(hi, 0x12, 1).unwrap();
+                vm.mem.write(past, 0x99, 1).unwrap();
+            };
+            let bytes = |vm: &Vm| {
+                (
+                    vm.mem.read(lo, 1).unwrap(),
+                    vm.mem.read(hi, 1).unwrap(),
+                    vm.mem.read(past, 1).unwrap(),
+                )
+            };
+            // MOV AX,[DI]; LODSW: the word reads the two bytes.
+            for code in [&b"\x8b\x05"[..], &b"\xad"[..]] {
+                let (vm, mut cpu) = setup(model, code);
+                seed(&vm);
+                cpu.cpu.ds = segment;
+                cpu.cpu.gpr[6] = u64::from(offset);
+                cpu.cpu.gpr[7] = u64::from(offset);
+                step(&vm, &mut cpu, 1);
+                assert_eq!(cpu.cpu.gpr[0], 0x1234, "{what} {code:x?}");
+            }
+            // MOV [DI],AX; STOSW; ADD [DI],AX: the word writes the two bytes.
+            for (code, ax, want) in [
+                (&b"\x89\x05"[..], 0xabcd, 0xabcd),
+                (&b"\xab"[..], 0xabcd, 0xabcd),
+                (&b"\x01\x05"[..], 0x1111, 0x2345),
+            ] {
+                let (vm, mut cpu) = setup(model, code);
+                seed(&vm);
+                cpu.cpu.ds = segment;
+                cpu.cpu.es = segment;
+                cpu.cpu.gpr[0] = ax;
+                cpu.cpu.gpr[7] = u64::from(offset);
+                step(&vm, &mut cpu, 1);
+                assert_eq!(
+                    bytes(&vm),
+                    (want & 0xff, want >> 8, 0x99),
+                    "{what} {code:x?}"
+                );
+            }
+            // MOVSW from the edge, then to it.
+            let (vm, mut cpu) = setup(model, b"\xa5\xa5");
+            seed(&vm);
+            vm.mem.write(0x5_0100, 0x5678, 2).unwrap();
+            cpu.cpu.ds = segment;
+            cpu.cpu.gpr[6] = u64::from(offset);
+            cpu.cpu.es = 0x5000;
+            cpu.cpu.gpr[7] = 0x80;
+            step(&vm, &mut cpu, 1);
+            assert_eq!(
+                vm.mem.read(0x5_0080, 2).unwrap(),
+                0x1234,
+                "{what} movsw from"
+            );
+            cpu.cpu.ds = 0x5000;
+            cpu.cpu.gpr[6] = 0x100;
+            cpu.cpu.es = segment;
+            cpu.cpu.gpr[7] = u64::from(offset);
+            step(&vm, &mut cpu, 1);
+            assert_eq!(bytes(&vm), (0x78, 0x56, 0x99), "{what} movsw to");
+        }
+    }
+}
+
+// xj-50w.16: a word store that reaches the next instruction of its own block
+// is seen by that instruction (SDM Vol 3A §14.6, as `RunningMemory` applies it),
+// at an odd address where only its high byte lands there and at an even one.
+#[test]
+fn a_word_store_into_the_next_instruction_is_fetched_again() {
+    // MOV [DI],AX; MOV AL,90h; HLT. At IP + 1 the store keeps its own low
+    // byte and makes MOV AL two NOPs; at IP + 2 it makes it two INC AX.
+    let code = b"\x89\x05\xb0\x90\xf4";
+    for model in TWENTY_BIT {
+        for (di, ax, want) in [(IP + 1, 0x9005u64, 0x9005), (IP + 2, 0x4040, 0x4042)] {
+            let (vm, mut cpu) = setup(model, code);
+            cpu.cpu.gpr[7] = di;
+            cpu.cpu.gpr[0] = ax;
+            let r = cpu.run_steps(&vm, 16, StepOptions::default()).unwrap();
+            assert!(
+                matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+                "{model:?} {:?}",
+                r.stop()
+            );
+            assert_eq!(cpu.cpu.gpr[0], want, "{model:?} di={di:#x}");
+            assert_eq!(cpu.cpu.rip, IP + 5, "{model:?} di={di:#x}");
+        }
+    }
+}
+
+// xj-50w.16: a word store over a page boundary marks both watched pages, as
+// its two byte stores do.
+#[test]
+fn a_word_store_over_a_page_boundary_marks_both_watched_pages() {
+    for model in TWENTY_BIT {
+        for (code, rep) in [(&b"\x89\x05"[..], false), (&b"\xf3\xab"[..], true)] {
+            let (vm, mut cpu) = setup(model, code);
+            vm.watch_range(0x2000, 0x2000);
+            assert!(vm.take_dirty_ranges().is_empty());
+            cpu.cpu.gpr[0] = 0xabcd;
+            cpu.cpu.gpr[1] = 1;
+            cpu.cpu.gpr[7] = 0x2fff;
+            step(&vm, &mut cpu, 1);
+            assert_eq!(vm.mem.read(0x2fff, 2).unwrap(), 0xabcd, "{model:?} {rep}");
+            assert_eq!(
+                vm.take_dirty_ranges(),
+                vec![(0x2000, 0x2000)],
+                "{model:?} {rep}"
+            );
+        }
+    }
+}

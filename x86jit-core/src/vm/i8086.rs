@@ -540,6 +540,15 @@ pub(super) fn resolve(
             ip = next;
         }
         let ir = combined.expect("first instruction decoded");
+        // The dispatcher looks for a REP restart pair only in a one-instruction
+        // block (`legacy::run_dispatch`).
+        debug_assert!(
+            ir.icount == 1
+                || !ir.ops.iter().any(|op| matches!(
+                    op,
+                    IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. })
+                ))
+        );
         if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
             continue;
         }
