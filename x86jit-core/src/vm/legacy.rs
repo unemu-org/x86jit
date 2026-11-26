@@ -16,6 +16,7 @@ mod paging;
 
 mod flat32;
 mod links;
+mod proof_map;
 
 /// VM-issued paging proof identity (decision-27). A process-wide issuer keeps
 /// domains distinct even when a vCPU moves between VMs; zero is never issued.

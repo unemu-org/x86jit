@@ -440,6 +440,61 @@ fn links_never_outlive_their_run() {
     }
 }
 
+/// xj-to9.45: a store into one block of a page drops only that block's
+/// proof, and no link outlives the generation advance that drops it (links
+/// name the generation, so a selective drop ends every link by design). A
+/// linked count-down W shares the page with B, whose immediate low byte the
+/// loop stores; W stays proved across the stores and B runs its new bytes.
+#[test]
+fn a_selective_proof_drop_ends_links_and_keeps_its_neighbours_proved() {
+    //   mov cx,8; L: mov dx,20; W: dec dx; jnz W; mov [B+1],cl; jmp B;
+    //   B: mov ax,imm; add bx,ax; loop L; jmp $
+    let code = |w: usize| {
+        let imm = |v: u32| v.to_le_bytes()[..w].to_vec();
+        let mut c = vec![0xb9];
+        c.extend(imm(8));
+        let l = c.len();
+        c.push(0xba);
+        c.extend(imm(20));
+        c.extend([0x4a, 0x75, 0xfd, 0x88, if w == 4 { 0x0d } else { 0x0e }]);
+        let at = c.len();
+        c.extend(imm(0));
+        c.extend([0xeb, 0x00]);
+        let b = c.len();
+        c[at..at + w].copy_from_slice(&imm(CODE as u32 + b as u32 + 1));
+        c.push(0xb8);
+        c.extend(imm(1 << (8 * w - 4)));
+        c.extend([0x01, 0xc3, 0xe2]);
+        c.push((l as isize - c.len() as isize - 1) as u8);
+        c.extend([0xeb, 0xfe]);
+        c
+    };
+    for setup in PROTECTED {
+        let w = if matches!(setup, Setup::Flat32 | Setup::Paged(_)) {
+            4
+        } else {
+            2
+        };
+        let outcome = witness(setup, &code(w), &[], 600, Some(true), |_| {});
+        let mask = if w == 4 { 0xffff_ffff } else { 0xffff };
+        // Iterations see CL = 8, 7, ... 1 in the immediate's low byte.
+        let ebx = (8 << (8 * w - 4)) + 36;
+        assert_eq!(outcome.gpr[3] & mask, ebx, "{setup:?}");
+        // Proofs: each iteration re-lifts B only. Dropping every proof on
+        // each store would re-lift W, L and the store's block too.
+        let (vm, mut cpu) = machine(setup, &code(w), &[]);
+        cpu.run_steps(&vm, 1, StepOptions::default()).unwrap();
+        cpu.run_steps(&vm, 599, StepOptions::default()).unwrap();
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        let lifts = match setup {
+            Setup::Paged(_) => execution.paging.as_ref().unwrap().lifts,
+            _ => execution.flat32.lifts,
+        };
+        // Under 32: at most the first lifts and about one per iteration.
+        assert!(lifts <= 2 * 8 + 4, "{setup:?}: {lifts} lifts");
+    }
+}
+
 /// A call-heavy loop whose block starts lie a few bytes apart (the
 /// `real16_loops` dos-mixed body): its links are made once and followed,
 /// not remade on every visit.

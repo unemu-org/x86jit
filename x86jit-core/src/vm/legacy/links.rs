@@ -202,13 +202,13 @@ impl Execution {
         match path {
             LinkPath::Twenty => [0; 4],
             LinkPath::Direct => [u64::from(cpu.legacy.a20_enabled != 0), 0, 0, 0],
-            LinkPath::Flat => [self.context_id, self.flat32.version, 0, 0],
+            LinkPath::Flat => [self.context_id, self.flat32.version(), 0, 0],
             LinkPath::Paged => {
                 let state = self.paging.as_deref_mut().unwrap();
                 [
                     self.context_id,
                     state.context_id,
-                    state.version,
+                    state.version(),
                     state.tlb.get_mut().generation,
                 ]
             }

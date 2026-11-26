@@ -718,6 +718,12 @@ pub struct TranslationCache {
     // Every invalidation cancels source reads still in flight, even if no cached
     // span overlaps. Keep this separate so data writes preserve dispatch predictors.
     publication_generation: AtomicU64,
+    // The bytes behind recent generation advances, so private proof maps can
+    // drop only the proofs a write overlapped (xj-to9.45). Drained writes are
+    // recorded once a private proof exists (`private_sources`); any other
+    // advance leaves a gap, which drops every private proof.
+    written_log: Mutex<WrittenLog>,
+    private_sources: std::sync::atomic::AtomicBool,
     // Policy/configuration changes also advance the dispatch epoch without
     // victims; source publication is always canceled independently.
     pub(crate) invalidate_pending_fetches: bool,
@@ -740,6 +746,18 @@ pub struct TranslationCache {
     tier_up_latency_ns: AtomicU64,
     tier_up_latency_count: AtomicU64,
     tier_bg_rejected: AtomicU64,
+}
+
+// Generation advances a `WrittenLog` retains: far more than one vCPU's
+// resolves see between two of its own, bounded for a guest that stores into
+// its code on every instruction.
+const WRITTEN_LOG: usize = 256;
+
+/// The generation each recorded advance led to and the bytes it wrote, in
+/// generation order. An advance missing here wrote unknown bytes.
+#[derive(Default)]
+struct WrittenLog {
+    ranges: std::collections::VecDeque<(u64, u64, u64)>,
 }
 
 impl TranslationCache {
@@ -866,6 +884,8 @@ impl TranslationCache {
             lifetime: RwLock::default(),
             previous_lifetimes: Mutex::default(),
             publication_generation: AtomicU64::new(0),
+            written_log: Mutex::default(),
+            private_sources: std::sync::atomic::AtomicBool::new(false),
             invalidate_pending_fetches: false,
             ibtc_filled: AtomicU64::new(0),
             hotness: RwLock::new(HashMap::new()),
@@ -1095,6 +1115,7 @@ impl TranslationCache {
         self.coverage_bytes.store(0, Ordering::Relaxed);
         self.hotness.write().unwrap().clear();
         self.region_decision.write().unwrap().clear();
+        // Every source is dropped: no record covers this advance.
         self.publication_generation.fetch_add(1, Ordering::Release);
         // Closed domains can still own deferred teardown workers. Keep them
         // reachable so VM shutdown joins every replaced backend's workers.
@@ -1137,6 +1158,74 @@ impl TranslationCache {
     /// This does not flush vCPU dispatch predictors (see [`Self::epoch`]).
     pub fn publication_generation(&self) -> u64 {
         self.publication_generation.load(Ordering::Acquire)
+    }
+
+    // Advance the source generation for a write of `[lo, hi)`. `RECORD`
+    // also records the bytes for `written_since`; an unrecorded advance is a
+    // gap there. The log lock orders recorded advances with their records.
+    //
+    // Only `Vm::handle_smc`'s drain of byte stores records
+    // (`invalidate_written_recorded`): its range is exactly the bytes that
+    // changed, so a proof over other bytes stays valid. Every other advance
+    // must stay a gap, which makes every private proof revalidate: an
+    // `invalidate_overlapping` for a mapping, protection, region-kind,
+    // backing or fetch-policy change, or one an embedder issues after editing
+    // what a fetch depends on, and a code-lifetime reset, invalidate for
+    // reasons its range does not describe (fetch permits, region mappings,
+    // retried device and descriptor-cache fetches); a child arena's pages are
+    // reconciled after the fact (`invalidate_child_written`).
+    #[inline(always)]
+    fn advance_publication<const RECORD: bool>(&self, lo: u64, hi: u64) {
+        if !RECORD {
+            self.publication_generation.fetch_add(1, Ordering::Release);
+            return;
+        }
+        let mut log = self.written_log.lock().unwrap();
+        let generation = self.publication_generation.fetch_add(1, Ordering::Release) + 1;
+        if log.ranges.len() == WRITTEN_LOG {
+            log.ranges.pop_front();
+        }
+        log.ranges.push_back((generation, lo, hi));
+    }
+
+    /// Whether drained writes should go through
+    /// [`Self::invalidate_written_recorded`]: some private proof has existed.
+    /// Never cleared. Clearing would be safe (a drain that skips the record
+    /// is a gap, which only drops more) but needs a VM-wide count of live
+    /// private registrations; once set, a drained write also takes the log
+    /// lock.
+    #[inline(always)]
+    pub(crate) fn records_written(&self) -> bool {
+        self.private_sources.load(Ordering::Relaxed)
+    }
+
+    /// The byte ranges `[lo, hi)` written by every source-generation advance
+    /// after `since`, appended to `out`, and the generation they lead to.
+    /// `false` when the record no longer covers every such advance (a reset,
+    /// or more advances than it retains): the caller drops every proof made
+    /// before that generation. A private proof map uses this to keep the
+    /// proofs whose registered sources no write overlapped (xj-to9.45).
+    pub(crate) fn written_since(&self, since: u64, out: &mut Vec<(u64, u64)>) -> (u64, bool) {
+        let log = self.written_log.lock().unwrap();
+        // Recorded advances hold this lock; an unrecorded one makes a gap.
+        let now = self.publication_generation();
+        let Some(wanted) = now.checked_sub(since) else {
+            return (now, false);
+        };
+        let first = log
+            .ranges
+            .partition_point(|&(generation, ..)| generation <= since);
+        let recorded = &log.ranges.range(first..);
+        if recorded.len() as u64 != wanted
+            || recorded
+                .clone()
+                .next()
+                .is_some_and(|&(g, ..)| g != since + 1)
+        {
+            return (now, false);
+        }
+        out.extend(recorded.clone().map(|&(_, lo, hi)| (lo, hi)));
+        (now, true)
     }
 
     /// Heuristic input for retaining SMC-heavy Machine pages; never validates IR.
@@ -1523,6 +1612,9 @@ impl TranslationCache {
         if self.publication_generation() != generation {
             return false;
         }
+        // Drained writes from here on record their bytes (`written_since`).
+        // A drain that has not seen this yet leaves a gap: every proof drops.
+        self.private_sources.store(true, Ordering::Relaxed);
         on_mark();
         true
     }
@@ -1568,7 +1660,7 @@ impl TranslationCache {
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
-        self.invalidate_range::<false>(lo, hi, |empty| {
+        self.invalidate_range::<false, false>(lo, hi, |empty| {
             if empty {
                 on_clear_page();
             }
@@ -1581,7 +1673,7 @@ impl TranslationCache {
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
-        self.invalidate_range::<true>(lo, hi, |empty| {
+        self.invalidate_range::<true, false>(lo, hi, |empty| {
             if empty {
                 on_clear_page();
             }
@@ -1595,10 +1687,23 @@ impl TranslationCache {
         hi: u64,
         on_write: impl FnOnce(bool),
     ) -> Vec<BlockKey> {
-        self.invalidate_range::<false>(lo, hi, on_write)
+        self.invalidate_range::<false, false>(lo, hi, on_write)
     }
 
-    fn invalidate_range<const CHILD: bool>(
+    /// [`Self::invalidate_written`], recording the written bytes for private
+    /// proof maps (`written_since`, xj-to9.45).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn invalidate_written_recorded(
+        &self,
+        lo: u64,
+        hi: u64,
+        on_write: impl FnOnce(bool),
+    ) -> Vec<BlockKey> {
+        self.invalidate_range::<false, true>(lo, hi, on_write)
+    }
+
+    fn invalidate_range<const CHILD: bool, const RECORD: bool>(
         &self,
         lo: u64,
         hi: u64,
@@ -1631,7 +1736,7 @@ impl TranslationCache {
                 // After registration, coverage overlap cancels the request instead.
                 // Page-tag clears also remain under the lock.
                 on_write(!on_page && !pending_on_page);
-                self.publication_generation.fetch_add(1, Ordering::Release);
+                self.advance_publication::<RECORD>(lo, hi);
                 if CHILD || self.invalidate_pending_fetches {
                     self.code_lifetime().flush_predictions();
                 }
@@ -1682,7 +1787,7 @@ impl TranslationCache {
         on_write(!spans.pending_sources.has_units(lo, hi) && !spans.cached.has_units(lo, hi));
         // A source span may have been read but not cached yet. Reject its
         // publication even when all currently cached spans survive this write.
-        self.publication_generation.fetch_add(1, Ordering::Release);
+        self.advance_publication::<RECORD>(lo, hi);
         if CHILD || !victims.is_empty() || self.invalidate_pending_fetches {
             self.code_lifetime().flush_predictions();
         }

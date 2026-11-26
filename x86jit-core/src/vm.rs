@@ -1672,36 +1672,57 @@ impl Vm {
     /// advanced the source generation or canceled pending source spans.
     fn handle_smc(&self, word: &AtomicU64) {
         self.mem.dispatch_smc(word, |dirty| {
-            let mut invalidated = false;
-            for (lo, hi) in dirty {
-                let page = lo >> crate::memory::CODE_PAGE_BITS;
-                let (lo, hi) = if self.mem.fetch_policy.is_some() {
-                    let start = page << crate::memory::CODE_PAGE_BITS;
-                    (start, start.saturating_add(crate::memory::CODE_PAGE_SIZE))
-                } else {
-                    (lo, hi)
-                };
-                // A dropped unit's inbound link slots (in other, surviving blocks) still
-                // point at its now-stale compiled code. Note whether anything was
-                // dropped so we can clear the backend's slots once, below.
-                // The page tag is cleared *inside* `invalidate_written`, under the
-                // spans lock and only if no block still spans the page — so it can't race
-                // a concurrent insert's mark.
-                invalidated |= !self
-                    .cache
-                    .invalidate_written(lo, hi, |empty| {
-                        if empty {
-                            self.mem.clear_code_page(page);
-                        }
-                    })
-                    .is_empty();
-            }
+            // Once a private proof exists, record the written bytes, so
+            // private proof maps drop only what a write overlapped.
+            let invalidated = if self.cache.records_written() {
+                self.invalidate_recorded(dirty)
+            } else {
+                self.invalidate_dirty::<false>(dirty)
+            };
             // Clear all backend-owned cached code pointers so no surviving block chains
             // into a dropped unit. Cleared slots re-link on their next traversal.
             if invalidated {
                 self.backend.invalidate_links();
             }
         });
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn invalidate_recorded(&self, dirty: Vec<(u64, u64)>) -> bool {
+        self.invalidate_dirty::<true>(dirty)
+    }
+
+    #[inline(always)]
+    fn invalidate_dirty<const RECORD: bool>(&self, dirty: Vec<(u64, u64)>) -> bool {
+        let mut invalidated = false;
+        for (lo, hi) in dirty {
+            let page = lo >> crate::memory::CODE_PAGE_BITS;
+            let (lo, hi) = if self.mem.fetch_policy.is_some() {
+                let start = page << crate::memory::CODE_PAGE_BITS;
+                (start, start.saturating_add(crate::memory::CODE_PAGE_SIZE))
+            } else {
+                (lo, hi)
+            };
+            // A dropped unit's inbound link slots (in other, surviving blocks) still
+            // point at its now-stale compiled code. Note whether anything was
+            // dropped so we can clear the backend's slots once, below.
+            // The page tag is cleared *inside* `invalidate_written`, under the
+            // spans lock and only if no block still spans the page — so it can't race
+            // a concurrent insert's mark.
+            let on_write = |empty| {
+                if empty {
+                    self.mem.clear_code_page(page);
+                }
+            };
+            invalidated |= !if RECORD {
+                self.cache.invalidate_written_recorded(lo, hi, on_write)
+            } else {
+                self.cache.invalidate_written(lo, hi, on_write)
+            }
+            .is_empty();
+        }
+        invalidated
     }
 
     /// One execution context per guest thread (§4.3). Shares this `Vm`.

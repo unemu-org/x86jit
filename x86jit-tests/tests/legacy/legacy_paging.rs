@@ -3551,27 +3551,59 @@ fn public_reset_abandons_paged_device_plan_and_snapshot() {
 fn public_device_write_acknowledgement_invalidates_declared_code_alias() {
     // Paging §3.5: the acknowledged physical bus write invalidates all
     // registered source aliases even when the embedder supplies equal bytes.
-    let mut f = Fixture::new(CpuModel::I80386, true, 0);
-    f.code_mapping(0, CODE_FRAME);
-    f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
-    f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
-        .unwrap();
-    f.vm.mem
-        .declare_code_alias(u64::from(DATA), u64::from(CODE_FRAME), 0x1000)
-        .unwrap();
-    let code = f.code(true, OFFSET + 0x600);
-    f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
-        .unwrap();
-    f.cpu.cpu.gpr[0] = 0; // equal-byte device write at the corresponding alias offset
-    assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
-    let before = f.cpu.paging_cache_for_test();
-    f.cpu.complete_mmio_write();
-    assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
-    f.cpu.cpu.rip = 0x400;
-    assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
-    let after = f.cpu.paging_cache_for_test();
-    assert_eq!(after.0, before.0); // SMC expires source proofs, not translations.
-    assert!(after.2 > before.2);
+    // A write drops only the proofs whose bytes it overlaps (xj-to9.45): at
+    // the alias of the store's own bytes it drops the store's proof, 200h
+    // further on it keeps it.
+    for (target, drops) in [(0x400, true), (0x600, false)] {
+        let mut f = Fixture::new(CpuModel::I80386, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.unmap(u64::from(DATA), 0x1000).unwrap();
+        f.vm.map(u64::from(DATA), 0x1000, Prot::RWX, RegionKind::Trap)
+            .unwrap();
+        f.vm.mem
+            .declare_code_alias(u64::from(DATA), u64::from(CODE_FRAME), 0x1000)
+            .unwrap();
+        let code = f.code(true, OFFSET + target);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+            .unwrap();
+        f.cpu.cpu.gpr[0] = 0; // equal-byte device write at the corresponding alias offset
+        assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+        let before = f.cpu.paging_cache_for_test();
+        f.cpu.complete_mmio_write();
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        f.cpu.cpu.rip = 0x400;
+        assert!(matches!(public_step(&mut f), Exit::MmioWrite { .. }));
+        let after = f.cpu.paging_cache_for_test();
+        assert_eq!(after.0, before.0); // SMC expires source proofs, not translations.
+        assert_eq!(after.2 > before.2, drops, "store at {target:#x}");
+    }
+}
+
+#[test]
+fn a_store_through_a_second_linear_mapping_of_a_proof_frame_drops_that_proof() {
+    // The data page maps the code frame too, so the guest's store reaches
+    // the bytes of the block at linear 0 through another linear page. An
+    // equal-byte store over the block's own bytes drops its proof
+    // (xj-to9.45); one 200h further on keeps it.
+    for (target, drops) in [(0x400, true), (0x600, false)] {
+        let mut f = Fixture::new(CpuModel::I80386, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.put(f.pte(), CODE_FRAME | 7);
+        let code = f.code(true, OFFSET + target);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &code)
+            .unwrap();
+        f.cpu.cpu.gpr[0] = u64::from(u32::from_le_bytes(code[..4].try_into().unwrap()));
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        let before = f.cpu.paging_cache_for_test();
+        f.cpu.cpu.rip = 0x400;
+        assert!(matches!(public_step(&mut f), Exit::BudgetExhausted));
+        let after = f.cpu.paging_cache_for_test();
+        assert_eq!(after.2 > before.2, drops, "store at {target:#x}");
+        let mut stored = [0; 4];
+        f.vm.read_bytes(u64::from(CODE_FRAME) + u64::from(target), &mut stored)
+            .unwrap();
+        assert_eq!(stored, code[..4]);
+    }
 }
 
 #[test]

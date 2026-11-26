@@ -52,23 +52,28 @@ struct Proof {
 
 #[derive(Default)]
 pub(super) struct State {
-    generation: u64,
     mapping: Option<Arc<()>>,
-    blocks: EngineMap<LegacyBlockKey, Proof>,
-    // Advances whenever `blocks` may drop or replace a proof, and with it
-    // its registration; successor links (`links.rs`) name it.
-    pub(super) version: u64,
+    blocks: super::proof_map::ProofMap<LegacyBlockKey, Proof>,
+    #[cfg(test)]
+    pub(super) lifts: u64,
 }
 
 impl State {
+    /// Advances whenever the map may drop or replace a proof, and with it
+    /// its registration; successor links (`links.rs`) name it.
+    pub(super) fn version(&self) -> u64 {
+        self.blocks.version()
+    }
+
     /// Whether a proof holds this very block.
     pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
         self.blocks.values().any(|proof| Arc::ptr_eq(&proof.ir, ir))
     }
 
+    #[cold]
+    #[inline(never)]
     pub(super) fn evict_context(&mut self, id: u64) {
-        self.version = self.version.wrapping_add(1);
-        self.blocks.retain(|key, _| key.context_id != id);
+        self.blocks.retain(|key| key.context_id != id);
     }
 
     #[cold]
@@ -83,19 +88,17 @@ impl State {
     ) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
         loop {
             vm.handle_smc(exit_word);
-            let generation = vm.cache.publication_generation();
             let mapping = vm.mem.mapping_identity();
-            if generation != self.generation
-                || self
-                    .mapping
-                    .as_ref()
-                    .is_none_or(|old| !Arc::ptr_eq(old, &mapping))
+            if self
+                .mapping
+                .as_ref()
+                .is_none_or(|old| !Arc::ptr_eq(old, &mapping))
             {
-                self.version = self.version.wrapping_add(1);
-                self.blocks.clear();
-                self.generation = generation;
+                self.blocks.reset(vm.cache.publication_generation());
                 self.mapping = Some(mapping);
             }
+            // A write drops the proofs whose physical sources it overlaps.
+            let generation = self.blocks.reconcile(&vm.cache);
             if let Some(proof) = self
                 .blocks
                 .get(&key)
@@ -105,6 +108,10 @@ impl State {
                 return Ok((proof.ir.clone(), proof.walk));
             }
             probe!(LIFTS);
+            #[cfg(test)]
+            {
+                self.lifts += 1;
+            }
             let source = crate::memory::LiftSource::new(&vm.mem);
             let permit = vm.mem.fetch_permit();
             let ir = lift(vm, cpu, context, &source)?;
@@ -112,7 +119,6 @@ impl State {
                 continue;
             }
             if !source.publishable() {
-                self.version = self.version.wrapping_add(1);
                 self.blocks.remove(&key);
                 let CachedBlock::Interpreted(ir) = source.uncached(ir) else {
                     unreachable!()
@@ -159,26 +165,20 @@ impl State {
             // Keep retention bounded independently of the context LRU. Each
             // proof owns its counted physical registration until eviction.
             if self.blocks.len() == 64 {
-                self.version = self.version.wrapping_add(1);
                 self.blocks.clear();
             }
             let direct_exit = ir.ends_direct();
             let ir = Arc::new(IrBlock { direct_exit, ..ir });
-            if self
-                .blocks
-                .insert(
-                    key,
-                    Proof {
-                        ir: ir.clone(),
-                        walk,
-                        permit,
-                        _registration: registration.unwrap(),
-                    },
-                )
-                .is_some()
-            {
-                self.version = self.version.wrapping_add(1);
-            }
+            self.blocks.insert(
+                key,
+                Proof {
+                    ir: ir.clone(),
+                    walk,
+                    permit,
+                    _registration: registration.unwrap(),
+                },
+                &sources,
+            );
             return Ok((ir, walk));
         }
     }
@@ -379,5 +379,168 @@ mod tests {
                 assert!(!Arc::ptr_eq(&a, &c));
             }
         }
+    }
+
+    // xj-to9.45: blocks A, B and C share one page; C sits 2 KiB on.
+    // Block A: INC EAX; JMP $+2. B: INC EBX; JMP $+2. C: INC ECX; JMP $+2.
+    const A: u64 = 0x1000;
+    const B: u64 = 0x1003;
+    const C: u64 = 0x1800;
+
+    fn proof_fixture(
+        model: crate::CpuModel,
+        class: crate::SegmentClass,
+    ) -> (Vm, crate::Vcpu, MachineContext) {
+        let mut vm = Vm::new(crate::VmConfig::flat(0x10000));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x4000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(A, b"\x40\xeb\x00\x43\xeb\x00").unwrap();
+        vm.write_bytes(C, b"\x41\xeb\x00").unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.cr0 = 1;
+        for (i, cache) in cpu.cpu.legacy.segments[..4].iter_mut().enumerate() {
+            cache.base = 0;
+            let flat = class == crate::SegmentClass::Flat32;
+            cache.limit = if flat { u32::MAX } else { 0xffff };
+            cache.attributes = if i == 0 { 0x9b } else { 0x93 } | if flat { 0x4000 } else { 0 };
+        }
+        let context = derive_legacy_context(model.legacy_model(), &cpu.cpu).unwrap();
+        assert_eq!(context.segment_class, class);
+        (vm, cpu, context)
+    }
+
+    fn resolve_at(
+        execution: &mut Execution,
+        vm: &Vm,
+        cpu: &mut crate::Vcpu,
+        context: MachineContext,
+        exit: &AtomicU64,
+        ip: u64,
+    ) -> Arc<IrBlock> {
+        cpu.cpu.rip = ip;
+        let model = vm.cpu_model.unwrap().legacy_model();
+        execution
+            .resolve::<MACHINE_DISPATCH>(vm, &cpu.cpu, model, context, exit)
+            .unwrap()
+            .0
+    }
+
+    fn writes(ir: &IrBlock, reg: crate::Reg) -> bool {
+        ir.ops
+            .iter()
+            .any(|op| matches!(op, IrOp::WriteReg { reg: r, .. } if *r == reg))
+    }
+
+    #[test]
+    fn a_code_write_drops_only_the_proofs_whose_bytes_it_overlaps() {
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Segmented] {
+                let (vm, mut cpu, context) = proof_fixture(model, class);
+                let mut execution = Execution::new();
+                execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+                let exit = AtomicU64::new(0);
+                let at = |e: &mut Execution, cpu: &mut crate::Vcpu, ip| {
+                    resolve_at(e, &vm, cpu, context, &exit, ip)
+                };
+                let [a, b, c] = [A, B, C].map(|ip| at(&mut execution, &mut cpu, ip));
+                assert_eq!(execution.flat32.lifts, 3);
+                // INC EBX becomes INC EDX: only B's proof overlaps the byte.
+                vm.write_bytes(B, b"\x42").unwrap();
+                assert!(Arc::ptr_eq(&a, &at(&mut execution, &mut cpu, A)));
+                assert!(Arc::ptr_eq(&c, &at(&mut execution, &mut cpu, C)));
+                assert_eq!(execution.flat32.lifts, 3, "{model:?} {class:?}");
+                let b2 = at(&mut execution, &mut cpu, B);
+                assert!(!Arc::ptr_eq(&b, &b2));
+                assert!(writes(&b2, crate::Reg::Rdx) && !writes(&b2, crate::Reg::Rbx));
+                assert_eq!(execution.flat32.lifts, 4);
+                // A data store on the page, next to every proof, drops none.
+                vm.write_bytes(0x1f00, &[1; 4]).unwrap();
+                for (ip, ir) in [(A, &a), (B, &b2), (C, &c)] {
+                    assert!(Arc::ptr_eq(ir, &at(&mut execution, &mut cpu, ip)));
+                }
+                assert_eq!(execution.flat32.lifts, 4);
+                // A store into A's last byte (its JMP displacement) drops A.
+                vm.write_bytes(A + 2, b"\x00").unwrap();
+                assert!(!Arc::ptr_eq(&a, &at(&mut execution, &mut cpu, A)));
+                assert!(Arc::ptr_eq(&b2, &at(&mut execution, &mut cpu, B)));
+                assert_eq!(execution.flat32.lifts, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn unrecorded_advances_and_mapping_changes_drop_every_proof() {
+        for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Segmented] {
+            let model = crate::CpuModel::I80486Dx;
+            let (mut vm, mut cpu, context) = proof_fixture(model, class);
+            let mut execution = Execution::new();
+            execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+            let exit = AtomicU64::new(0);
+            let warm = |e: &mut Execution, vm: &Vm, cpu: &mut crate::Vcpu| {
+                [A, C].map(|ip| resolve_at(e, vm, cpu, context, &exit, ip))
+            };
+            let fresh = |old: &[Arc<IrBlock>; 2], new: &[Arc<IrBlock>; 2]| {
+                old.iter().zip(new).all(|(o, n)| !Arc::ptr_eq(o, n))
+            };
+            // An invalidation outside the drain (here a wide one) is
+            // unrecorded: a gap, which no proof survives.
+            let before = warm(&mut execution, &vm, &mut cpu);
+            vm.cache
+                .invalidate_overlapping(0, u64::MAX, || vm.mem.clear_all_code_pages());
+            let after = warm(&mut execution, &vm, &mut cpu);
+            assert!(fresh(&before, &after));
+            // More advances than the record retains: their bytes are unknown.
+            for i in 0..300 {
+                vm.write_bytes(0x1c00 + i, &[0]).unwrap();
+            }
+            let lost = warm(&mut execution, &vm, &mut cpu);
+            assert!(fresh(&after, &lost));
+            // A mapping change drops every proof.
+            vm.map(0x8000, 0x1000, crate::Prot::RWX, crate::RegionKind::Ram)
+                .unwrap();
+            let mapped = warm(&mut execution, &vm, &mut cpu);
+            assert!(fresh(&lost, &mapped));
+            // A reset of the shared cache (a closed code lifetime rebound)
+            // records no bytes either.
+            let next = Arc::new(crate::code_lifetime::CodeLifetime::default());
+            // SAFETY: the interpreter backend has no compiled code to stop.
+            unsafe { vm.cache.code_lifetime().retire_all() };
+            assert!(vm.cache.reconcile_code_lifetime(next, |_| {}));
+            let reset = warm(&mut execution, &vm, &mut cpu);
+            assert!(fresh(&mapped, &reset));
+            let again = warm(&mut execution, &vm, &mut cpu);
+            assert!(!fresh(&reset, &again));
+        }
+    }
+
+    #[test]
+    fn another_vcpu_draining_a_code_write_drops_only_its_proofs() {
+        let model = crate::CpuModel::I80386;
+        let class = crate::SegmentClass::Flat32;
+        let (vm, mut cpu, context) = proof_fixture(model, class);
+        let mut first = Execution::new();
+        let mut second = Execution::new();
+        first.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+        second.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+        let (one, two) = (AtomicU64::new(0), AtomicU64::new(0));
+        let [a, b, c] =
+            [A, B, C].map(|ip| resolve_at(&mut first, &vm, &mut cpu, context, &one, ip));
+        // The second vCPU's dispatch drains the write first.
+        vm.write_bytes(B, b"\x42").unwrap();
+        assert!(vm.mem.has_dirty_code());
+        resolve_at(&mut second, &vm, &mut cpu, context, &two, C);
+        assert!(!vm.mem.has_dirty_code());
+        assert!(Arc::ptr_eq(
+            &a,
+            &resolve_at(&mut first, &vm, &mut cpu, context, &one, A)
+        ));
+        assert!(Arc::ptr_eq(
+            &c,
+            &resolve_at(&mut first, &vm, &mut cpu, context, &one, C)
+        ));
+        let b2 = resolve_at(&mut first, &vm, &mut cpu, context, &one, B);
+        assert!(!Arc::ptr_eq(&b, &b2) && writes(&b2, crate::Reg::Rdx));
+        assert_eq!(first.flat32.lifts, 4);
     }
 }

@@ -11,7 +11,7 @@ use std::cell::Cell;
 const MAX_BLOCKS: usize = 256;
 const MAX_CONTEXTS: usize = 64;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Key {
     segment_class: crate::SegmentClass,
     // The singleton reference entry (`interpret_*_for_test`) never shares
@@ -52,22 +52,24 @@ pub(super) struct State {
     contexts: EngineMap<LegacyContextStamp, u64>,
     model: Option<LegacyCpuModel>,
     memory: usize,
-    source_generation: u64,
-    blocks: EngineMap<Key, Proof>,
-    lifts: u64,
+    blocks: super::proof_map::ProofMap<Key, Proof>,
+    pub(super) lifts: u64,
     before_publication: Option<fn(&Vm)>,
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
     pub(super) transaction: Option<crate::interp::legacy::paging::Transaction>,
     pub(super) event_transaction: Option<crate::interp::legacy::paging::Transaction>,
     // Most recent first; every entry is a member of `contexts`.
     recent: Box<[Option<(LegacyContextStamp, u64)>; 4]>,
-    // Advances whenever `blocks` may drop or replace a proof, and with it
-    // its registration, or `contexts` may give an identity to another stamp;
-    // successor links (`links.rs`) name it.
-    pub(super) version: u64,
 }
 
 impl State {
+    /// Advances whenever `blocks` may drop or replace a proof, and with it
+    /// its registration, or `contexts` may give an identity to another
+    /// stamp (it clears `blocks` then); successor links (`links.rs`) name it.
+    pub(super) fn version(&self) -> u64 {
+        self.blocks.version()
+    }
+
     pub(super) fn reset(&mut self) {
         self.invalidate();
         self.transaction = None;
@@ -81,7 +83,6 @@ impl State {
     }
 
     pub(super) fn invalidate(&mut self) {
-        self.version = self.version.wrapping_add(1);
         self.blocks.clear();
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
@@ -93,7 +94,6 @@ impl State {
     pub(super) fn reconcile(&mut self, vm: &Vm, cpu: &CpuState, model: LegacyCpuModel) {
         let stamp = LegacyContextStamp::new(cpu, model);
         let memory = &vm.mem as *const Memory as usize;
-        let source_generation = vm.cache.publication_generation();
         let mapping = vm.mem.mapping_identity();
         if self.model != Some(model)
             || self.memory != memory
@@ -103,15 +103,13 @@ impl State {
                 .is_none_or(|m| !Arc::ptr_eq(m, &mapping))
         {
             self.invalidate();
+            self.blocks.reset(vm.cache.publication_generation());
             self.model = Some(model);
             self.memory = memory;
             self.mapping = Some(mapping);
         }
-        if self.source_generation != source_generation {
-            self.version = self.version.wrapping_add(1);
-            self.blocks.clear();
-            self.source_generation = source_generation;
-        }
+        // A write drops the proofs whose bus sources it overlaps.
+        self.blocks.reconcile(&vm.cache);
         if self.stamp != Some(stamp) {
             self.context_id = if let Some(slot) = self
                 .recent
@@ -127,7 +125,6 @@ impl State {
                     // Bound context identities as well as blocks. Clear both before
                     // reusing an ID; this does not expire cached translations.
                     if self.contexts.len() == MAX_CONTEXTS {
-                        self.version = self.version.wrapping_add(1);
                         self.blocks.clear();
                         self.contexts.clear();
                         *self.recent = [None; 4];
@@ -149,7 +146,6 @@ impl State {
     fn reconcile_generation(&mut self) {
         let generation = self.tlb.get_mut().generation;
         if self.generation != generation {
-            self.version = self.version.wrapping_add(1);
             self.blocks.clear();
             self.generation = generation;
         }
@@ -257,7 +253,6 @@ impl State {
             let ir = Arc::new(IrBlock { direct_exit, ..ir });
             if !source.publishable() {
                 // The interpreter may use this snapshot once, without a proof.
-                self.version = self.version.wrapping_add(1);
                 self.blocks.remove(&key);
                 let ir = retry_instruction(&ir, cpu.rip);
                 let ordinary = ordinary && ordinary_block(context, &ir);
@@ -272,24 +267,18 @@ impl State {
                 continue;
             }
             if self.blocks.len() == MAX_BLOCKS && !self.blocks.contains_key(&key) {
-                self.version = self.version.wrapping_add(1);
                 self.blocks.clear();
             }
-            if self
-                .blocks
-                .insert(
-                    key,
-                    Proof {
-                        ir: ir.clone(),
-                        ordinary,
-                        permit,
-                        _registration: registration.unwrap(),
-                    },
-                )
-                .is_some()
-            {
-                self.version = self.version.wrapping_add(1);
-            }
+            self.blocks.insert(
+                key,
+                Proof {
+                    ir: ir.clone(),
+                    ordinary,
+                    permit,
+                    _registration: registration.unwrap(),
+                },
+                &sources,
+            );
             return Ok((ir, ordinary));
         }
     }
@@ -1435,6 +1424,69 @@ mod tests {
                 .unwrap()
                 .0;
             assert!(!Arc::ptr_eq(&a, &c));
+        }
+    }
+
+    #[test]
+    fn a_paged_code_write_drops_only_the_proofs_whose_frame_bytes_it_overlaps() {
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            let mut vm = Vm::new(crate::VmConfig::flat(0x8000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x8000, crate::Prot::RWX, crate::RegionKind::Ram)
+                .unwrap();
+            // Linear code page 1 maps physical frame 4. Block A: INC EAX;
+            // JMP $+2. B: INC EBX; JMP $+2. Both in the one frame.
+            vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+            vm.write_bytes(0x3004, &0x4007u32.to_le_bytes()).unwrap();
+            vm.write_bytes(0x4000, b"\x40\xeb\x00\x43\xeb\x00").unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.legacy.cr0 = 0x80000001;
+            cpu.cpu.legacy.cr3 = 0x2000;
+            for (i, cache) in cpu.cpu.legacy.segments[..4].iter_mut().enumerate() {
+                cache.base = 0;
+                cache.limit = u32::MAX;
+                cache.attributes = if i == 0 { 0x409b } else { 0x4093 };
+            }
+            let context = derive_legacy_context(model.legacy_model(), &cpu.cpu).unwrap();
+            let mut state = State::default();
+            let exit = AtomicU64::new(0);
+            let mut at = |state: &mut State, ip| {
+                cpu.cpu.rip = ip;
+                state
+                    .resolve(
+                        &vm,
+                        &mut cpu.cpu,
+                        model.legacy_model(),
+                        context,
+                        1,
+                        &exit,
+                        true,
+                    )
+                    .unwrap()
+                    .0
+            };
+            let (a, b) = (at(&mut state, 0x1000), at(&mut state, 0x1003));
+            assert_eq!(state.lifts, 2);
+            // INC EBX becomes INC EDX in the frame: only B's proof overlaps.
+            vm.write_bytes(0x4003, b"\x42").unwrap();
+            assert!(Arc::ptr_eq(&a, &at(&mut state, 0x1000)));
+            assert_eq!(state.lifts, 2, "{model:?}");
+            let b2 = at(&mut state, 0x1003);
+            assert!(!Arc::ptr_eq(&b, &b2));
+            assert!(b2.ops.iter().any(|op| matches!(
+                op,
+                IrOp::WriteReg {
+                    reg: crate::Reg::Rdx,
+                    ..
+                }
+            )));
+            assert_eq!(state.lifts, 3);
+            // An invalidation outside the drain is unrecorded: every proof drops.
+            vm.cache
+                .invalidate_overlapping(0, u64::MAX, || vm.mem.clear_all_code_pages());
+            assert!(!Arc::ptr_eq(&a, &at(&mut state, 0x1000)));
+            assert!(!Arc::ptr_eq(&b2, &at(&mut state, 0x1003)));
+            assert_eq!(state.lifts, 5);
         }
     }
 }
