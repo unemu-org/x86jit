@@ -942,8 +942,15 @@ pub struct Memory {
     /// `guest_base >> CODE_PAGE_BITS`, including a partially backed first page.
     code_page: CodePages,
     code_aliases: Arc<Mutex<CodeAliases>>,
-    // Any declaration is live: gates the walks' alias expansion of stores made
-    // without an observer (`InterpreterMemory::note_unobserved_write`).
+    // The extent `lo..hi` of every declared view (empty: `u64::MAX..0`) and
+    // a count of declaration changes, written under `code_aliases`: an
+    // interpreter walk of a block outside the extent has no other view to
+    // track (`Memory::running_view_reach`).
+    code_alias_lo: AtomicU64,
+    code_alias_hi: AtomicU64,
+    code_alias_generation: AtomicU64,
+    // Any declaration is live: gates the walk's alias check of a store made
+    // through `Memory` (`InterpreterMemory::note_unobserved_write`).
     code_aliases_declared: AtomicBool,
     code_tag_epoch: AtomicU64,
     code_barrier_epoch: AtomicU64,
@@ -1623,6 +1630,9 @@ impl Memory {
             trap_intervals: Vec::new(),
             code_page,
             code_aliases,
+            code_alias_lo: AtomicU64::new(u64::MAX),
+            code_alias_hi: AtomicU64::new(0),
+            code_alias_generation: AtomicU64::new(0),
             code_aliases_declared: AtomicBool::new(false),
             code_tag_epoch: AtomicU64::new(0),
             code_barrier_epoch: AtomicU64::new(0),
@@ -1790,6 +1800,10 @@ impl Memory {
         if !aliases.pairs.insert(pair) {
             return Ok(());
         }
+        self.code_alias_lo.fetch_min(a.min(b), Ordering::Relaxed);
+        self.code_alias_hi
+            .fetch_max(a.max(b) + len as u64, Ordering::Relaxed);
+        self.code_alias_generation.fetch_add(1, Ordering::Relaxed);
         self.code_aliases_declared.store(true, Ordering::Relaxed);
         let mut affected = BTreeSet::new();
         CodeAliases::edges(a, b, len, |a, b| {
@@ -1821,6 +1835,15 @@ impl Memory {
         if !aliases.pairs.remove(&pair) {
             return false;
         }
+        let (lo, hi) = aliases
+            .pairs
+            .iter()
+            .fold((u64::MAX, 0), |(lo, hi), &(a, b, len)| {
+                (lo.min(a), hi.max(b + len as u64))
+            });
+        self.code_alias_lo.store(lo, Ordering::Relaxed);
+        self.code_alias_hi.store(hi, Ordering::Relaxed);
+        self.code_alias_generation.fetch_add(1, Ordering::Relaxed);
         if aliases.pairs.is_empty() {
             self.code_aliases_declared.store(false, Ordering::Relaxed);
         }
@@ -2197,29 +2220,72 @@ impl Memory {
         self.code_aliases_declared.load(Ordering::Relaxed)
     }
 
-    /// Every declared view of the written bytes `addr..addr + len` on a code
-    /// page, the written range included, as `(lo, hi)` ranges; `visit` sees
-    /// each. A byte on a page with no code tag is not expanded: an alias of
-    /// live code shares its tag (`refresh_code_aliases`).
+    /// The end of the written bytes `addr..end` in the running block's own
+    /// addresses (`lo..hi`), over every other declared view of the block that
+    /// they touch; 0 when they touch none. No code-page tag is consulted: an
+    /// uncached block or another vCPU's drain can clear them mid-walk. The
+    /// views are mapped once per block and declaration state, under the alias
+    /// lock, and kept per thread.
     #[cold]
     #[inline(never)]
-    pub(crate) fn visit_code_alias_views(
-        &self,
-        addr: u64,
-        len: usize,
-        mut visit: impl FnMut(u64, u64),
-    ) {
-        let end = addr.saturating_add(len.max(1) as u64);
-        let mut aliases = None;
-        for page in code_page_range(addr, len as u64) {
-            if !self.is_code_page(page) {
-                continue;
+    pub(crate) fn running_view_reach(&self, lo: u64, hi: u64, addr: u64, end: u64) -> u64 {
+        if hi <= self.code_alias_lo.load(Ordering::Relaxed)
+            || lo >= self.code_alias_hi.load(Ordering::Relaxed)
+        {
+            return 0;
+        }
+        thread_local! {
+            static VIEWS: RefCell<RunningViews> = const { RefCell::new(RunningViews::EMPTY) };
+        }
+        VIEWS.with(|cell| {
+            let mut cached = cell.borrow_mut();
+            let key = (
+                self.dispatch_identity,
+                self.code_alias_generation.load(Ordering::Relaxed),
+                lo,
+                hi,
+            );
+            if cached.key != key {
+                cached.key = key;
+                cached.views.clear();
+                self.map_running_views(lo, hi, &mut cached.views);
             }
-            let lo = addr.max(page << CODE_PAGE_BITS);
-            let hi = end.min((page + 1) << CODE_PAGE_BITS);
-            let aliases = aliases.get_or_insert_with(|| self.code_aliases.lock().unwrap());
-            for (lo, hi) in aliases.written_ranges(lo, hi) {
-                visit(lo, hi);
+            cached
+                .views
+                .iter()
+                .filter(|view| addr < view.hi && end > view.lo)
+                .map(|view| view.block + (end.min(view.hi) - view.lo))
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Every other declared view of the bytes `lo..hi` into `views`.
+    fn map_running_views(&self, lo: u64, hi: u64, views: &mut Vec<AliasView>) {
+        let aliases = self.code_aliases.lock().unwrap();
+        let mut pending = vec![AliasView { lo, hi, block: lo }];
+        // Declarations chain: a view of a view is a view.
+        while let Some(view) = pending.pop() {
+            for page in code_page_range(view.lo, view.hi - view.lo) {
+                let start = view.lo.max(page << CODE_PAGE_BITS);
+                let end = view.hi.min((page + 1) << CODE_PAGE_BITS);
+                for &(a, b, len) in aliases.registrations.get(&page).into_iter().flatten() {
+                    for (from, to) in [(a, b), (b, a)] {
+                        let (start, end) = (start.max(from), end.min(from + len as u64));
+                        if start >= end {
+                            continue;
+                        }
+                        let found = AliasView {
+                            lo: to + (start - from),
+                            hi: to + (end - from),
+                            block: view.block + (start - view.lo),
+                        };
+                        if found.lo != found.block && !views.contains(&found) {
+                            views.push(found);
+                            pending.push(found);
+                        }
+                    }
+                }
             }
         }
     }
@@ -5817,8 +5883,9 @@ pub(crate) trait InterpreterMemory {
     fn note_block_write(&self, _addr: u64, _len: usize) {}
     fn note_host_block_write(&self, _host: u64, _addr: u64, _len: usize) {}
     /// A store made through [`Self::normal`], whose code-page notification
-    /// reached `Memory` rather than this provider: report the written bytes
-    /// and, when the provider tracks a running block, their declared aliases.
+    /// reached `Memory` rather than this provider: report the written bytes,
+    /// which a provider tracking a running block checks against every
+    /// declared view of it.
     #[inline(always)]
     fn note_unobserved_write(&self, addr: u64, len: usize) {
         self.note_block_write(addr, len)
@@ -5973,6 +6040,34 @@ pub(crate) trait InterpreterMemory {
         unreachable!("child string on normal memory")
     }
 }
+/// A declared view of a running block's bytes: `lo..hi` holds the block's
+/// bytes from `block` on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AliasView {
+    lo: u64,
+    hi: u64,
+    block: u64,
+}
+
+/// One thread's mapped views of its running block (`Memory::running_view_reach`),
+/// valid for its key: the Memory, its declaration count and the block's bytes.
+struct RunningViews {
+    key: (u64, u64, u64, u64),
+    views: Vec<AliasView>,
+}
+
+impl RunningViews {
+    // Dispatch identities start at 1: no Memory matches this key.
+    const EMPTY: Self = Self {
+        key: (0, 0, 0, 0),
+        views: Vec::new(),
+    };
+}
+
+/// The interpreter walk's provider, tracking the running block's bytes
+/// `start..end` (and their host addresses) and, when any alias is declared,
+/// every other declared view of them. Every store the walk makes, through its
+/// own path or through `Memory`, reports here.
 pub(crate) struct RunningMemory<'a> {
     pub memory: &'a Memory,
     pub ir: &'a crate::IrBlock,
@@ -5988,6 +6083,29 @@ impl RunningMemory<'_> {
     #[cold]
     #[inline(never)]
     fn overlap(&self, addr: u64, len: usize) {
+        self.refetch_past(addr.saturating_add(len as u64));
+    }
+
+    /// A store through `Memory` while an alias is declared: its end in the
+    /// running block's own addresses, over every other declared view of the
+    /// block (`Memory::running_view_reach`), with no code-page tag and,
+    /// once the views are mapped, no lock.
+    #[cold]
+    #[inline(never)]
+    fn alias_overlap(&self, addr: u64, len: usize) {
+        let end = addr.saturating_add(len as u64);
+        let reach = self
+            .memory
+            .running_view_reach(self.start, self.end, addr, end);
+        if reach != 0 {
+            self.refetch_past(reach);
+        }
+    }
+
+    /// End the walk after the storing instruction when the written bytes,
+    /// ending at `reach` in the block's own addresses, pass its start.
+    #[inline(always)]
+    fn refetch_past(&self, reach: u64) {
         // SDM Vol 3A §14.6: discard decoded bytes after the storing instruction.
         // Scan only after an overlap; ordinary instruction markers do no extra work.
         let next = self.ir.ops.iter().find_map(|op| match op {
@@ -5997,7 +6115,7 @@ impl RunningMemory<'_> {
             ),
             _ => None,
         });
-        if next.is_some_and(|next| addr.saturating_add(len as u64) > next) {
+        if next.is_some_and(|next| reach > next) {
             self.started.set(0);
         }
     }
@@ -6019,19 +6137,22 @@ impl InterpreterMemory for RunningMemory<'_> {
         if host < self.host_end && host.saturating_add(len as u64) > self.host_start {
             self.overlap(addr, len);
         }
+        if self.memory.has_code_aliases() {
+            self.alias_overlap(addr, len);
+        }
     }
-    // An observed store's code-page path expands aliases before it calls
-    // `note_block_write`; a store made through `Memory` has only its own
-    // view here, so another view of the running block is expanded here.
-    // One relaxed load keeps the expansion off a store with no alias declared.
+    // An observed store's code-page path reports every view it expands;
+    // a store made through `Memory` reports only its own bytes, so while
+    // any alias is declared a cold path maps it into every other view of
+    // the running block, a direct hit too. One relaxed load keeps that off
+    // a store with no alias declared.
     #[inline(always)]
     fn note_unobserved_write(&self, addr: u64, len: usize) {
         if addr < self.end && addr.saturating_add(len as u64) > self.start {
             self.overlap(addr, len);
-        } else if self.memory.has_code_aliases() {
-            self.memory.visit_code_alias_views(addr, len, |lo, hi| {
-                self.note_block_write(lo, (hi - lo) as usize)
-            });
+        }
+        if self.memory.has_code_aliases() {
+            self.alias_overlap(addr, len);
         }
     }
     // The interpreter walk's transfers are containment-only. A miss over adjacent

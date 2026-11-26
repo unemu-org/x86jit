@@ -1896,13 +1896,17 @@ existing started-flag test; it adds no TLS access or shared atomic load.
 
 The code-page cold path expands declared aliases before checking overlap, at
 conservative 4 KiB page granularity. It can end a block whose remaining bytes were
-not changed. The twenty-bit walk's stores go through `Memory` without the walk's
-observer, so the walk expands their aliases itself after the store, gated by one
-relaxed "any alias declared" load (`InterpreterMemory::note_unobserved_write`).
-This alias check relies on the store's alias page still being tagged;
-direct same-linear-address detection does not. SDM Vol 3A §14.6 guarantees the
-cross-alias case when a serializing operation, such as CPUID, precedes execution
-of the modified instruction; the interpreter serves that case within a single block.
+not changed. Detection within the running block relies on neither that
+expansion nor any code-page tag, which an uncached block or another vCPU's
+drain can clear mid-walk: while any alias is declared (one relaxed load per
+store), a cold path maps the running block's bytes into every declared view
+once per block and declaration state, under the alias lock, keeps them per
+thread, and maps the store back into the block's own addresses
+(`Memory::running_view_reach`). Observed stores and the stores the walk makes
+through `Memory` (twenty-bit stores, the shared helpers) both take it. SDM Vol
+3A §14.6 guarantees the cross-alias case when a serializing operation, such as
+CPUID, precedes execution of the modified instruction; the interpreter serves
+that case within a single block.
 Undeclared host aliases remain outside this guarantee.
 
 Another vCPU clearing the running block's tag cannot hide a subsequent direct
