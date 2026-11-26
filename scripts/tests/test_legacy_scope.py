@@ -139,6 +139,8 @@ REVIEWED_ENTRY_POINTS = {
         "lift::legacy::alias_context",
         "lift::legacy::instruction_for_profile", "lift::legacy::shared_helper", "model::CpuModel",
         "model::decode", "vm::i8086::resolve",
+        # The twenty-bit dispatcher's retained self-modifying-code pages.
+        "vm::i8086::RetainedBlocks", "vm::i8086::resolve_retained",
     },
     "x86jit-core/src/vm/legacy/nmi.rs": {
         "interp::legacy::Progress", "model::CpuModel", "model::NmiNesting",

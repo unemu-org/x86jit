@@ -184,7 +184,7 @@ fn lift(
         if ip != cpu.rip && ip + 15 > page_end {
             return Ok(block.unwrap());
         }
-        let bytes = match fetch_watched(vm, cpu, context, ip, Some(source)) {
+        let bytes = match fetch_watched(vm, cpu, context, ip, Some(source), &[]) {
             Ok(bytes) => bytes,
             Err(exit) => return block.ok_or(exit),
         };

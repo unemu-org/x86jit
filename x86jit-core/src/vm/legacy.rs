@@ -576,6 +576,8 @@ pub(super) struct Execution {
     pub(super) pending_a20_enabled: Option<bool>,
     direct_proofs: DirectProofs,
     smc_pages: Vec<u64>,
+    // Twenty-bit blocks of `smc_pages`, outside the shared cache.
+    retained20: super::i8086::RetainedBlocks,
     last_direct_fetch: Option<u64>,
     // `Vcpu::delivery_stalled`: the retired count at the last completed
     // delivery, and the deliveries completed since it last moved.
@@ -642,6 +644,7 @@ impl Execution {
             pending_a20_enabled: None,
             direct_proofs: DirectProofs::default(),
             smc_pages: Vec::new(),
+            retained20: Default::default(),
             last_direct_fetch: None,
             stall_retired: 0,
             stall_count: 0,
@@ -672,6 +675,7 @@ impl Execution {
         self.retry_slice = None;
         self.direct_proofs.clear();
         self.smc_pages.clear();
+        self.retained20.clear();
         self.last_direct_fetch = None;
         self.stall_count = 0;
         if let Some(paging) = &mut self.paging {
@@ -872,7 +876,14 @@ impl Execution {
         // dependent byte, even on cache hits: permissions, policy and physical
         // aliases are checked before executing that instruction, without page
         // version/TLB assumptions reserved for the paging phase.
-        let bytes = fetch(vm, cpu, context)?;
+        let bytes = fetch_watched(
+            vm,
+            cpu,
+            context,
+            cpu.rip,
+            None,
+            self.blocks.get(&key).map_or(&[][..], |block| &block.bytes),
+        )?;
         if let Some(block) = self.blocks.get(&key) {
             if block.bytes == bytes {
                 probe!(PROOFS);
@@ -1489,14 +1500,19 @@ fn direct_refusal(cpu: &CpuState, error: crate::lift::LiftError) -> Exit {
 }
 
 fn fetch(vm: &Vm, cpu: &CpuState, context: MachineContext) -> Result<Vec<u8>, Exit> {
-    fetch_watched(vm, cpu, context, cpu.rip, None)
+    fetch_watched(vm, cpu, context, cpu.rip, None, &[])
 }
+/// Fetch the instruction at CS:IP. `expected` is the byte string this fetch
+/// returned before for the same decode inputs (IP, operand size, model), or
+/// empty: while the bytes read agree with it, its length is the stopping
+/// point, and the per-byte decode that finds the end is not repeated.
 fn fetch_watched(
     vm: &Vm,
     cpu: &CpuState,
     context: MachineContext,
     ip: u64,
     source: Option<&crate::memory::LiftSource<'_>>,
+    expected: &[u8],
 ) -> Result<Vec<u8>, Exit> {
     // The catalogue's instruction-length limit (ten bytes on the 80286,
     // I286 PRM Appendix B #GP p. B-9; fifteen on the 80386) and formed-address
@@ -1514,15 +1530,15 @@ fn fetch_watched(
         CpuGeneration::I8086 => fetch_bytes::<
             { physical_mask(CpuGeneration::I8086) },
             { limit(bus_model(CpuGeneration::I8086)) },
-        >(vm, cpu, context, ip, source),
+        >(vm, cpu, context, ip, source, expected),
         CpuGeneration::I286 => fetch_bytes::<
             { physical_mask(CpuGeneration::I286) },
             { limit(bus_model(CpuGeneration::I286)) },
-        >(vm, cpu, context, ip, source),
+        >(vm, cpu, context, ip, source, expected),
         CpuGeneration::I386 => fetch_bytes::<
             { physical_mask(CpuGeneration::I386) },
             { limit(bus_model(CpuGeneration::I386)) },
-        >(vm, cpu, context, ip, source),
+        >(vm, cpu, context, ip, source, expected),
     }
 }
 
@@ -1532,8 +1548,10 @@ fn fetch_bytes<const MASK: u32, const LIMIT: u64>(
     context: MachineContext,
     ip: u64,
     source: Option<&crate::memory::LiftSource<'_>>,
+    expected: &[u8],
 ) -> Result<Vec<u8>, Exit> {
     let mut bytes = Vec::with_capacity(15);
+    let mut agrees = !expected.is_empty();
     for i in 0..LIMIT {
         let linear = crate::legacy::access(
             cpu,
@@ -1581,6 +1599,16 @@ fn fetch_bytes<const MASK: u32, const LIMIT: u64>(
             source.record(addr, &byte);
         }
         bytes.push(byte[0]);
+        // The stopping rule below reads only these bytes and the decode
+        // inputs, so the bytes that stopped it at `expected.len()` stop it
+        // there again and continue it at every shorter length.
+        agrees &= expected.get(bytes.len() - 1) == Some(&byte[0]);
+        if agrees {
+            if bytes.len() == expected.len() {
+                break;
+            }
+            continue;
+        }
         if crate::model::decode::unavailable_prefix_for_generation(context.generation, &bytes) {
             break;
         }
@@ -3202,9 +3230,31 @@ impl Vcpu {
                         }
                     }
                 }
-                let retained = direct && (!direct_bus || execution.smc_pages.contains(&page));
+                // The twenty-bit bus has no masked lowering: only its
+                // self-modifying pages are retained.
+                let retained =
+                    direct && ((!direct20 && !direct_bus) || execution.smc_pages.contains(&page));
+                // Pages that self-modifying code rewrites keep their
+                // twenty-bit blocks per vCPU, as the 80286 path's retained
+                // pages do. Such a block is invalidated by no store and is
+                // checked against its bytes only in `resolve_retained`: a
+                // memo or block link that skips resolve must not keep a
+                // block resolved while this is set.
+                let retained20 = direct20 && retained && vm.mem.fetch_policy.is_none();
                 let resolved = if direct20 {
-                    super::i8086::resolve(vm, &self.cpu, exit_word, physical)
+                    if retained20 {
+                        let execution = self.legacy_execution.as_mut().unwrap();
+                        super::i8086::resolve_retained(
+                            vm,
+                            &self.cpu,
+                            exit_word,
+                            physical,
+                            &mut execution.retained20,
+                            &mut execution.smc_pages,
+                        )
+                    } else {
+                        super::i8086::resolve(vm, &self.cpu, exit_word, physical)
+                    }
                 } else if direct && !retained && !boundary.instruction_retry {
                     resolve_direct(
                         vm,
@@ -5367,6 +5417,61 @@ mod tests {
             cpu.reset_execution_state(crate::ResetOptions::default());
             assert!(cpu.legacy_execution.as_ref().unwrap().smc_pages.is_empty());
         }
+    }
+
+    #[test]
+    fn twenty_bit_smc_pages_retain_blocks_outside_the_shared_cache() {
+        // A store into the next instruction (MOV byte [1006h],2Ah; MOV AL,0;
+        // JMP back): once a store has dropped a block of the page, its blocks
+        // stay with the vCPU, the page loses its code tag, and the store
+        // leaves no invalidation work; the stored immediate is still fetched.
+        for model in [crate::CpuModel::I8088, crate::CpuModel::NecV30] {
+            let mut vm = Vm::new(VmConfig::flat(0x10000));
+            vm.set_cpu_model(model);
+            vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+            vm.write_bytes(0x1000, b"\xc6\x06\x06\x10\x2a\xb0\x00\xeb\xf7")
+                .unwrap();
+            let mut cpu = vm.new_vcpu();
+            cpu.cpu.rip = 0x1000;
+            for _ in 0..2 {
+                let run = cpu.run_steps(&vm, 60, StepOptions::default()).unwrap();
+                assert_eq!(run.steps(), 60);
+                assert_eq!(cpu.cpu.gpr[0] & 0xff, 42);
+                let execution = cpu.legacy_execution.as_ref().unwrap();
+                assert!(!execution.smc_pages.is_empty());
+                assert_eq!(execution.retained20.len(), 2);
+                assert!(!vm.mem.is_code_page(1));
+            }
+            let dropped = vm.cache.invalidated_blocks();
+            cpu.run_steps(&vm, 60, StepOptions::default()).unwrap();
+            assert_eq!(vm.cache.invalidated_blocks(), dropped);
+            cpu.reset_execution_state(crate::ResetOptions::default());
+            assert_eq!(cpu.legacy_execution.as_ref().unwrap().retained20.len(), 0);
+        }
+    }
+
+    #[test]
+    fn twenty_bit_blocks_after_a_delivery_with_a20_off_stay_shared() {
+        // An IRQ delivered with A20 off and a selector above F000h: the
+        // delivery re-derives the bus lowering, which the twenty-bit bus
+        // does not use; without self-modifying code no block is retained.
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(crate::CpuModel::I8086);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.mem.write(0x20 * 4, 0x0600, 4).unwrap();
+        vm.write_bytes(0x600, b"\x40\x40\xeb\xfc").unwrap();
+        vm.write_bytes(0x1000, b"\x90\xeb\xfd").unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.gpr[4] = 0x8000;
+        cpu.cpu.es = 0xf800;
+        cpu.cpu.flags.if_ = true;
+        cpu.cpu.legacy.a20_enabled = 0;
+        cpu.inject_irq(0x20);
+        let run = cpu.run_steps(&vm, 40, StepOptions::default()).unwrap();
+        assert_eq!(run.steps(), 40);
+        assert_eq!(cpu.legacy_execution.as_ref().unwrap().retained20.len(), 0);
+        assert!(vm.mem.is_code_page(0));
     }
 
     #[test]

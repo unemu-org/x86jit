@@ -49,6 +49,7 @@ mod legacy_seg16;
 mod legacy_seg286;
 mod legacy_seg32;
 mod legacy_segment_blocks;
+mod legacy_smc_positions;
 mod legacy_sse_integer;
 mod legacy_task_registers;
 mod legacy_task_switch;

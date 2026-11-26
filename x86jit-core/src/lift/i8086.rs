@@ -726,9 +726,12 @@ pub(crate) fn instruction(
     profile: &'static crate::ModelProfile,
     tg: &mut TempGen,
 ) -> Result<IrBlock, LiftError> {
-    let mut values = vec![IrOp::InsnStart {
+    // One allocation for a typical instruction's ops instead of a growth
+    // series per instruction lifted.
+    let mut values = Vec::with_capacity(16);
+    values.push(IrOp::InsnStart {
         guest_addr: u64::from(start),
-    }];
+    });
     // Shared lowering reads this entry, never the generation projection.
     let mut ops = legacy::ContextOps {
         ops: &mut values,
@@ -938,7 +941,8 @@ pub(crate) fn instruction(
         return Err(unsupported_insn(insn));
     }
     let word_bus = word_bus(profile);
-    let mut result = Vec::new();
+    // The ops, a sequential terminator and the walk marker.
+    let mut result = Vec::with_capacity(values.len() + 2);
     for op in values {
         match op {
             IrOp::Load {

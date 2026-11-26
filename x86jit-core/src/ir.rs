@@ -3655,6 +3655,10 @@ impl TempGen {
     pub fn new() -> Self {
         TempGen(0)
     }
+    /// Continue a lift that has already allocated `count` temporaries.
+    pub(crate) fn starting_at(count: u32) -> Self {
+        TempGen(count)
+    }
     pub fn fresh(&mut self) -> Temp {
         let t = self.0;
         self.0 += 1;

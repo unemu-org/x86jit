@@ -19,8 +19,6 @@ struct Decoded {
     insn: Instruction,
     len: u32,
     restart: u16,
-    bytes: Vec<u8>,
-    evidence: Vec<u8>,
     /// A NEC V20/V30 form the iced tables do not describe.
     nec: Option<crate::lift::i8086::NecForm>,
     /// NEC V20/V30 REPC or REPNC: the repeat condition tests CY.
@@ -197,11 +195,42 @@ fn carry_repeat(original: &[u8], prefixes: u32) -> Option<u8> {
     }
 }
 
+/// Where an instruction fetch reports the bytes it reads: the shared cache's
+/// source tracking, or the snapshot a retained block is checked against.
+enum Sink<'s, 'm> {
+    Shared(&'s crate::memory::LiftSource<'m>),
+    Retained(&'s mut Vec<u8>),
+}
+
+/// A fetch's byte strings, kept by the lift of one block so that its
+/// instructions reuse them: the fetched bytes (the first fifteen, the
+/// evidence), the bytes after the prefixes, and the decoded form.
+struct Buffers {
+    original: Vec<u8>,
+    suffix: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl Buffers {
+    fn new() -> Self {
+        // Fifteen bytes of evidence; longer prefix runs grow the buffers.
+        Self {
+            original: Vec::with_capacity(15),
+            suffix: Vec::with_capacity(16),
+            bytes: Vec::with_capacity(16),
+        }
+    }
+}
+
+/// Fetch the instruction at `ip`, leaving its bytes and evidence in
+/// `buffers.bytes` and `buffers.original`.
+#[allow(clippy::too_many_arguments)]
 fn fetch<const NEC: bool>(
     vm: &Vm,
     cpu: &CpuState,
     ip: u16,
-    source: &crate::memory::LiftSource<'_>,
+    buffers: &mut Buffers,
+    sink: &mut Sink<'_, '_>,
     spans: &mut Vec<(u64, u32)>,
     word: &AtomicU64,
     profile: &crate::ModelProfile,
@@ -211,8 +240,13 @@ fn fetch<const NEC: bool>(
     let mut carry = false;
     let mut lock = false;
     let mut prefixes = 0u32;
-    let mut original = Vec::new();
-    let mut suffix = Vec::new();
+    let Buffers {
+        original,
+        suffix,
+        bytes,
+    } = buffers;
+    original.clear();
+    suffix.clear();
     // A requested host stop is taken here only with no transfer of the
     // instruction open: the Machine models finish the open retry first
     // (spec.md §5.2, Accesses of several transfers), and a stop at the fetch of
@@ -249,7 +283,9 @@ fn fetch<const NEC: bool>(
                 ));
             }
         }
-        source.watch(pa, 1);
+        if let Sink::Shared(source) = sink {
+            source.watch(pa, 1);
+        }
         let mut b = [0];
         vm.mem.fetch_code(pa, &mut b).map_err(|t| {
             crate::fault::fetch_exit(
@@ -263,7 +299,10 @@ fn fetch<const NEC: bool>(
                 Some(crate::lift::FetchFailure::Memory(t)),
             )
         })?;
-        source.record(pa, &b);
+        match sink {
+            Sink::Shared(source) => source.record(pa, &b),
+            Sink::Retained(snapshot) => snapshot.push(b[0]),
+        }
         if let Some((at, len)) = spans
             .last_mut()
             .filter(|(at, len)| *at + u64::from(*len) == pa)
@@ -287,7 +326,7 @@ fn fetch<const NEC: bool>(
             continue;
         }
         suffix.push(b[0]);
-        if profile.isa.unavailable_prefix(&suffix) {
+        if profile.isa.unavailable_prefix(suffix) {
             // NEC UM p. 12-14: REPNC (64h) and REPC (65h) are repeat prefixes.
             if NEC && matches!(suffix[..], [0x64 | 0x65]) {
                 suffix.clear();
@@ -295,20 +334,20 @@ fn fetch<const NEC: bool>(
                 carry = true;
                 continue;
             }
-            return Err(refusal(u64::from(ip), &original));
+            return Err(refusal(u64::from(ip), original));
         }
         // NEC V20/V30 only: the 8086 byte table refuses these opcodes.
         if NEC && matches!(suffix[0], 0x0f | 0x66 | 0x67) {
-            match nec_form(&suffix, prefixes, segment, carry || repeat.is_some()) {
+            match nec_form(suffix, prefixes, segment, carry || repeat.is_some()) {
                 NecFetch::More => continue,
-                NecFetch::Refuse => return Err(refusal(u64::from(ip), &original)),
+                NecFetch::Refuse => return Err(refusal(u64::from(ip), original)),
                 NecFetch::Form(form, insn) => {
+                    bytes.clear();
+                    bytes.extend_from_slice(suffix);
                     return Ok(Decoded {
                         insn,
                         len: prefixes + suffix.len() as u32,
                         restart: ip,
-                        bytes: suffix.clone(),
-                        evidence: original,
                         nec: Some(form),
                         carry: false,
                         lock,
@@ -317,21 +356,21 @@ fn fetch<const NEC: bool>(
             }
         }
         if NEC && carry {
-            match carry_repeat(&original, prefixes) {
+            match carry_repeat(original, prefixes) {
                 Some(substitute) => repeat = Some(substitute),
-                None => return Err(refusal(u64::from(ip), &original)),
+                None => return Err(refusal(u64::from(ip), original)),
             }
         }
         // iced's fifteen-byte representation is a decoding tool, not the
         // processor's length limit. Retain the last prefix in each class,
         // then decode the bounded opcode/operand suffix at its real end IP.
-        let mut bytes = Vec::new();
+        bytes.clear();
         if lock {
             bytes.push(0xf0);
         }
         bytes.extend(segment);
         bytes.extend(repeat);
-        bytes.extend_from_slice(&suffix);
+        bytes.extend_from_slice(suffix);
         let removed = prefixes - (bytes.len() - suffix.len()) as u32;
         // ESC's CPU address exists even when no x87 instruction uses the
         // extension (UM §4.2 Table 4-12 p. 4-27). Decode its address with a
@@ -352,7 +391,7 @@ fn fetch<const NEC: bool>(
         }
         let mut decoder = Decoder::with_ip(
             16,
-            &bytes,
+            bytes,
             u64::from(ip).wrapping_add(u64::from(removed)),
             profile.isa.decoder_options(),
         );
@@ -363,10 +402,10 @@ fn fetch<const NEC: bool>(
         {
             continue;
         }
-        match profile.isa.decode(&bytes, &insn) {
+        match profile.isa.decode(bytes, &insn) {
             DecodeAction::Defined => {}
             DecodeAction::Alias(code) => insn.set_code(code),
-            DecodeAction::Absent(_) => return Err(refusal(u64::from(ip), &original)),
+            DecodeAction::Absent(_) => return Err(refusal(u64::from(ip), original)),
         }
         // NEC UM p. 12-14: REPC and REPNC repeat a block comparison (CMPBK,
         // CMPM) only.
@@ -380,7 +419,7 @@ fn fetch<const NEC: bool>(
                     | iced_x86::Mnemonic::Scasw
             )
         {
-            return Err(refusal(u64::from(ip), &original));
+            return Err(refusal(u64::from(ip), original));
         }
         // A port block transfer resumes at its first byte. With more prefixes
         // than the model keeps (NEC UM §6 p. 6-4: three) it would resume at a
@@ -393,7 +432,7 @@ fn fetch<const NEC: bool>(
                 | iced_x86::Mnemonic::Outsw
         ) && prefixes > u32::from(profile.quirks.rep_restart_prefixes.unwrap_or(0))
         {
-            return Err(refusal(u64::from(ip), &original));
+            return Err(refusal(u64::from(ip), original));
         }
         let len = prefixes + suffix.len() as u32;
         // 8086 Family UM §2.7 p. 2-42 keeps the last prefix; NEC V20/V30 UM
@@ -404,13 +443,218 @@ fn fetch<const NEC: bool>(
             insn,
             len,
             restart,
-            bytes,
-            evidence: original,
             nec: None,
             carry,
             lock,
         });
     }
+}
+
+/// The block after one of its instructions: what lifting the rest of the
+/// block again from the following instruction starts from.
+pub(super) struct Boundary {
+    /// Fetched bytes up to the end of this instruction.
+    bytes: usize,
+    /// The block's ops after this instruction, its terminator included.
+    ops: usize,
+    /// This instruction's sequential terminator and walk marker, once a
+    /// following instruction has replaced them in the block.
+    tail: Option<[IrOp; 2]>,
+    guest_len: u32,
+    icount: u32,
+    temp_count: u32,
+    temps: u32,
+    next: u16,
+}
+
+/// A block lifted up to and including its `done`th instruction, its ops in
+/// the lift's buffer.
+struct Resume {
+    ir: IrBlock,
+    tg: crate::ir::TempGen,
+    ip: u16,
+    done: usize,
+}
+
+/// Lift the block at `cpu.rip`, or its remainder after `resume`, gathering
+/// its ops in `ops` (left empty). Returns the block and whether it ended by
+/// its own instructions rather than at a fetch that failed after its first
+/// instruction.
+#[allow(clippy::too_many_arguments)]
+fn lift_block(
+    vm: &Vm,
+    cpu: &CpuState,
+    word: &AtomicU64,
+    profile: &'static crate::ModelProfile,
+    sink: &mut Sink<'_, '_>,
+    spans: &mut Vec<(u64, u32)>,
+    ops: &mut Vec<IrOp>,
+    resume: Option<Resume>,
+    mut bounds: Option<&mut Vec<Boundary>>,
+) -> Result<(IrBlock, bool), Exit> {
+    let nec_model = profile.isa == crate::ModelIsa::NecV20;
+    let (mut combined, mut tg, mut ip, done) = match resume {
+        Some(resume) => (Some(resume.ir), resume.tg, resume.ip, resume.done),
+        None => {
+            ops.clear();
+            (None, crate::ir::TempGen::new(), cpu.rip as u16, 0)
+        }
+    };
+    let mut buffers = Buffers::new();
+    let mut complete = true;
+    for _ in done..16 {
+        let fetched = if nec_model {
+            fetch::<true>(vm, cpu, ip, &mut buffers, sink, spans, word, profile)
+        } else {
+            fetch::<false>(vm, cpu, ip, &mut buffers, sink, spans, word, profile)
+        };
+        let Decoded {
+            insn,
+            len,
+            restart,
+            nec,
+            carry,
+            lock,
+        } = match fetched {
+            Ok(value) => value,
+            Err(Exit::Interrupted) => return Err(Exit::Interrupted),
+            Err(_) if combined.is_some() => {
+                complete = false;
+                break;
+            }
+            Err(exit) => return Err(exit),
+        };
+        let (bytes, evidence) = (&buffers.bytes, &buffers.original);
+        let next = if profile.quirks.wrap_sequential_ip {
+            ip.wrapping_add(len as u16)
+        } else {
+            u16::try_from(u64::from(ip) + u64::from(len))
+                .map_err(|_| refusal(u64::from(ip), bytes))?
+        };
+        let mut lifted = match &nec {
+            Some(form) => crate::lift::i8086::nec_form(
+                form, &insn, evidence, ip, len, next, profile, lock, &mut tg,
+            ),
+            None => crate::lift::i8086::instruction(
+                &insn, bytes, evidence, ip, len, next, restart, profile, &mut tg,
+            ),
+        };
+        if lock {
+            lifted = lifted.and_then(|ir| crate::lift::i8086::locked(ir, &insn));
+        }
+        let mut part = match lifted {
+            Ok(ir) => ir,
+            Err(_) if combined.is_some() => break,
+            Err(_) => return Err(refusal(cpu.rip, evidence)),
+        };
+        if carry {
+            carry_string(&mut part);
+        }
+        // REP interruption ownership starts at its own prefix sequence.
+        // Keep strings at block entry so a yield before their first element
+        // cannot acquire an in-progress repeat's restart IP.
+        if combined.is_some()
+            && part.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. })
+                )
+            })
+        {
+            break;
+        }
+        // RunningMemory's active block range is contiguous: an instruction
+        // whose bytes continue past the IP or the bus wrap starts its own
+        // block, so that a store by an earlier instruction into those bytes
+        // ends the walk before it (spec.md §10).
+        let linear = ((u64::from(cpu.cs) << 4) + u64::from(ip)) & 0xfffff;
+        if combined.is_some()
+            && (u64::from(ip) + u64::from(len) > 0x10000 || linear + u64::from(len) > 0x100000)
+        {
+            break;
+        }
+        let terminates = nec.is_some_and(|form| form.terminates())
+            || insn.flow_control() != iced_x86::FlowControl::Next
+            || matches!(
+                insn.mnemonic(),
+                iced_x86::Mnemonic::Hlt | iced_x86::Mnemonic::Popf
+            )
+            // `IrOp::PortIo` ends its block: the walk hands off with IP
+            // at the block end, which must be the next instruction.
+            || part.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    IrOp::PortIo { .. }
+                        | IrOp::PortString { .. }
+                        | IrOp::Legacy(
+                            crate::legacy::LegacyOp::WrappedString { .. }
+                                | crate::legacy::LegacyOp::Interrupt20 { .. }
+                                | crate::legacy::LegacyOp::CheckIndex20 { .. }
+                        )
+                )
+            })
+            || u64::from(ip) + u64::from(len) >= 0x10000
+            // RunningMemory's active block range is contiguous. End at
+            // the bus wrap so stores into the following low addresses
+            // cannot execute a stale instruction within the same walk.
+            || (((u64::from(cpu.cs) << 4) + u64::from(ip)) & 0xfffff)
+                + u64::from(len)
+                >= 0x100000;
+        if let Some(ir) = &mut combined {
+            // Remove the previous sequential terminator and walk marker.
+            let marker = ops.pop().unwrap();
+            let terminator = ops.pop().unwrap();
+            if let Some(bounds) = bounds.as_deref_mut() {
+                bounds.last_mut().unwrap().tail = Some([terminator, marker]);
+            }
+            ops.append(&mut part.ops);
+            ir.guest_len += part.guest_len;
+            ir.icount += 1;
+            ir.temp_count = tg.count();
+        } else {
+            ops.append(&mut part.ops);
+            combined = Some(part);
+        }
+        if let Some(bounds) = bounds.as_deref_mut() {
+            let ir = combined.as_ref().unwrap();
+            bounds.push(Boundary {
+                bytes: spans.iter().map(|(_, len)| *len as usize).sum(),
+                ops: ops.len(),
+                tail: None,
+                guest_len: ir.guest_len,
+                icount: ir.icount,
+                temp_count: ir.temp_count,
+                temps: tg.count(),
+                next,
+            });
+        }
+        if terminates {
+            break;
+        }
+        ip = next;
+    }
+    let mut ir = combined.expect("first instruction decoded");
+    // The dispatcher looks for a REP restart pair only in a one-instruction
+    // block (`legacy::run_dispatch`).
+    debug_assert!(
+        ir.icount == 1
+            || !ops.iter().any(|op| matches!(
+                op,
+                IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. })
+            ))
+    );
+    // One allocation of the block's size; `ops` keeps its capacity for the
+    // next lift.
+    let mut block = Vec::with_capacity(ops.len());
+    block.append(ops);
+    ir.ops = block;
+    Ok((ir, complete))
+}
+
+fn model_profile(vm: &Vm) -> &'static crate::ModelProfile {
+    vm.cpu_model
+        .expect("twenty-bit dispatch requires an 8086-family catalogue model")
+        .profile()
 }
 
 pub(super) fn resolve(
@@ -425,130 +669,24 @@ pub(super) fn resolve(
             return Ok((ir, BlockWalk::Shared));
         }
     }
+    let mut ops = Vec::with_capacity(64);
     loop {
         let source = crate::memory::LiftSource::new(&vm.mem);
         let generation = vm.cache.publication_generation();
         let permit = vm.mem.fetch_permit();
         let mut spans = Vec::new();
-        let profile = vm
-            .cpu_model
-            .expect("twenty-bit dispatch requires an 8086-family catalogue model")
-            .profile();
-        let nec_model = profile.isa == crate::ModelIsa::NecV20;
-        let mut ip = cpu.rip as u16;
-        let mut tg = crate::ir::TempGen::new();
-        let mut combined: Option<IrBlock> = None;
-        for _ in 0..16 {
-            let fetched = if nec_model {
-                fetch::<true>(vm, cpu, ip, &source, &mut spans, word, profile)
-            } else {
-                fetch::<false>(vm, cpu, ip, &source, &mut spans, word, profile)
-            };
-            let Decoded {
-                insn,
-                len,
-                restart,
-                bytes,
-                evidence,
-                nec,
-                carry,
-                lock,
-            } = match fetched {
-                Ok(value) => value,
-                Err(Exit::Interrupted) => return Err(Exit::Interrupted),
-                Err(_) if combined.is_some() => break,
-                Err(exit) => return Err(exit),
-            };
-            let next = if profile.quirks.wrap_sequential_ip {
-                ip.wrapping_add(len as u16)
-            } else {
-                u16::try_from(u64::from(ip) + u64::from(len))
-                    .map_err(|_| refusal(u64::from(ip), &bytes))?
-            };
-            let mut lifted = match &nec {
-                Some(form) => crate::lift::i8086::nec_form(
-                    form, &insn, &evidence, ip, len, next, profile, lock, &mut tg,
-                ),
-                None => crate::lift::i8086::instruction(
-                    &insn, &bytes, &evidence, ip, len, next, restart, profile, &mut tg,
-                ),
-            };
-            if lock {
-                lifted = lifted.and_then(|ir| crate::lift::i8086::locked(ir, &insn));
-            }
-            let mut part = match lifted {
-                Ok(ir) => ir,
-                Err(_) if combined.is_some() => break,
-                Err(_) => return Err(refusal(cpu.rip, &evidence)),
-            };
-            if carry {
-                carry_string(&mut part);
-            }
-            // REP interruption ownership starts at its own prefix sequence.
-            // Keep strings at block entry so a yield before their first element
-            // cannot acquire an in-progress repeat's restart IP.
-            if combined.is_some()
-                && part.ops.iter().any(|op| {
-                    matches!(
-                        op,
-                        IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. })
-                    )
-                })
-            {
-                break;
-            }
-            let terminates = nec.is_some_and(|form| form.terminates())
-                || insn.flow_control() != iced_x86::FlowControl::Next
-                || matches!(
-                    insn.mnemonic(),
-                    iced_x86::Mnemonic::Hlt | iced_x86::Mnemonic::Popf
-                )
-                // `IrOp::PortIo` ends its block: the walk hands off with IP
-                // at the block end, which must be the next instruction.
-                || part.ops.iter().any(|op| {
-                    matches!(
-                        op,
-                        IrOp::PortIo { .. }
-                            | IrOp::PortString { .. }
-                            | IrOp::Legacy(
-                                crate::legacy::LegacyOp::WrappedString { .. }
-                                    | crate::legacy::LegacyOp::Interrupt20 { .. }
-                                    | crate::legacy::LegacyOp::CheckIndex20 { .. }
-                            )
-                    )
-                })
-                || u64::from(ip) + u64::from(len) >= 0x10000
-                // RunningMemory's active block range is contiguous. End at
-                // the bus wrap so stores into the following low addresses
-                // cannot execute a stale instruction within the same walk.
-                || (((u64::from(cpu.cs) << 4) + u64::from(ip)) & 0xfffff)
-                    + u64::from(len)
-                    >= 0x100000;
-            if let Some(ir) = &mut combined {
-                // Remove the previous sequential terminator and walk marker.
-                ir.ops.truncate(ir.ops.len() - 2);
-                ir.ops.extend(part.ops);
-                ir.guest_len += part.guest_len;
-                ir.icount += 1;
-                ir.temp_count = tg.count();
-            } else {
-                combined = Some(part);
-            }
-            if terminates {
-                break;
-            }
-            ip = next;
-        }
-        let ir = combined.expect("first instruction decoded");
-        // The dispatcher looks for a REP restart pair only in a one-instruction
-        // block (`legacy::run_dispatch`).
-        debug_assert!(
-            ir.icount == 1
-                || !ir.ops.iter().any(|op| matches!(
-                    op,
-                    IrOp::Legacy(crate::legacy::LegacyOp::WrappedString { .. })
-                ))
-        );
+        let profile = model_profile(vm);
+        let (ir, _) = lift_block(
+            vm,
+            cpu,
+            word,
+            profile,
+            &mut Sink::Shared(&source),
+            &mut spans,
+            &mut ops,
+            None,
+            None,
+        )?;
         if !source.validate() || permit.as_ref().is_some_and(|p| !p.is_current()) {
             continue;
         }
@@ -576,5 +714,370 @@ pub(super) fn resolve(
         {
             return Ok((ir, BlockWalk::Shared));
         }
+    }
+}
+
+/// A block of a page that self-modifying code rewrites, kept by its vCPU
+/// outside the shared cache with the bytes it was lifted from.
+struct Retained {
+    rip: u64,
+    mxcsr: u32,
+    profile: &'static crate::ModelProfile,
+    ir: Arc<IrBlock>,
+    spans: Vec<(u64, u32)>,
+    bytes: Vec<u8>,
+    bounds: Vec<Boundary>,
+    /// The code-alias epoch at which no page of `spans` had an alias.
+    alias_epoch: u64,
+    /// Entries since the block was lifted, all finding its bytes unchanged.
+    matched: u32,
+}
+
+/// One vCPU's retained twenty-bit blocks, by physical entry address, and
+/// the ops buffer their lifts share.
+#[derive(Default)]
+pub(super) struct RetainedBlocks {
+    blocks: std::collections::HashMap<
+        u64,
+        Retained,
+        std::hash::BuildHasherDefault<crate::cache::cache_hash::BlockHasher>,
+    >,
+    ops: Vec<IrOp>,
+    /// Lifts that kept the instructions before a changed byte.
+    #[cfg(test)]
+    resumed: usize,
+}
+
+impl RetainedBlocks {
+    pub(super) fn clear(&mut self) {
+        self.blocks.clear();
+    }
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+// Bounds on what one vCPU retains: blocks, and bytes per block (a prefix run
+// can make one instruction arbitrarily long).
+const RETAINED_BLOCKS: usize = 128;
+const RETAINED_BYTES: usize = 256;
+// Entries of one block with unchanged bytes after which its page returns to
+// the shared cache; a store that drops a block there marks it again.
+const RETAINED_MATCHES: u32 = 1 << 16;
+
+/// The first fetched byte of `retained` that no longer reads as it did, or
+/// that no longer reads at all.
+fn changed(vm: &Vm, retained: &Retained) -> Option<usize> {
+    let mut at = 0;
+    let mut current = [0; 64];
+    for &(pa, len) in &retained.spans {
+        let mut offset = 0;
+        while offset < len as usize {
+            let n = (len as usize - offset).min(current.len());
+            if vm.mem.fetch_code(pa + offset as u64, &mut current[..n]) != Ok(n) {
+                return Some(at);
+            }
+            if let Some(i) = current[..n]
+                .iter()
+                .zip(&retained.bytes[at..at + n])
+                .position(|(now, then)| now != then)
+            {
+                return Some(at + i);
+            }
+            at += n;
+            offset += n;
+        }
+    }
+    None
+}
+
+/// Return the page of `physical` to the shared cache: it leaves the
+/// self-modifying set with every retained block that starts on it.
+fn demote(blocks: &mut RetainedBlocks, smc_pages: &mut Vec<u64>, physical: u64) {
+    let page = physical >> crate::memory::CODE_PAGE_BITS;
+    smc_pages.retain(|p| *p != page);
+    blocks
+        .blocks
+        .retain(|start, _| *start >> crate::memory::CODE_PAGE_BITS != page);
+}
+
+/// `resolve` for a page in the vCPU's self-modifying-code set (the 80286
+/// path's `smc_pages`): the block is not published to the shared cache, so
+/// stores to its page leave no invalidation work. Each entry compares the
+/// bytes the block was lifted from with memory; a block whose bytes changed
+/// keeps the instructions before the first changed byte and lifts the rest
+/// again. Lifting is a function of the bytes, the entry IP and the model, so
+/// the result equals a lift of the whole block from memory. Without a fetch
+/// policy only: its page approvals are not rechecked here.
+///
+/// The block is held by this vCPU alone: no store invalidates it or raises
+/// `DISPATCH_DIRTY`, its bytes are checked here instead. A dispatcher memo or
+/// block link that skips resolve must not keep or reuse a block resolved
+/// through this function (the dispatcher's `retained20`).
+///
+/// A page with a code alias stays with the shared cache: a store through the
+/// other view reaches a running block only through the code tags that a
+/// published block keeps on both views.
+pub(super) fn resolve_retained(
+    vm: &Vm,
+    cpu: &CpuState,
+    word: &AtomicU64,
+    physical: u64,
+    retained: &mut RetainedBlocks,
+    smc_pages: &mut Vec<u64>,
+) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
+    let profile = model_profile(vm);
+    let mxcsr = cpu.mxcsr & crate::interp::softfloat::MODE_MASK;
+    // Read before any alias check, so a declaration after it is noticed.
+    let alias_epoch = vm.mem.code_alias_epoch();
+    let mut resume = None;
+    let mut entry = None;
+    if let Some(block) = retained.blocks.get_mut(&physical).filter(|block| {
+        block.rip == cpu.rip && block.mxcsr == mxcsr && std::ptr::eq(block.profile, profile)
+    }) {
+        if block.alias_epoch != alias_epoch {
+            if vm.mem.code_aliased(&block.spans) {
+                demote(retained, smc_pages, physical);
+                return resolve(vm, cpu, word, physical);
+            }
+            block.alias_epoch = alias_epoch;
+        }
+        let Some(at) = changed(vm, block) else {
+            block.matched += 1;
+            let ir = block.ir.clone();
+            let tired = block.matched >= RETAINED_MATCHES;
+            if tired {
+                demote(retained, smc_pages, physical);
+            }
+            return Ok((ir, BlockWalk::Shared));
+        };
+        let mut block = retained.blocks.remove(&physical).unwrap();
+        let kept = block.bounds.iter().take_while(|b| b.bytes <= at).count();
+        if kept != 0 {
+            #[cfg(test)]
+            {
+                retained.resumed += 1;
+            }
+            let ops = &mut retained.ops;
+            let whole = kept == block.bounds.len();
+            let last = &mut block.bounds[kept - 1];
+            ops.clear();
+            if whole {
+                ops.extend_from_slice(&block.ir.ops);
+            } else {
+                // The kept instruction's terminator, which the next one
+                // replaced.
+                let tail = last.tail.take().expect("a replaced terminator");
+                ops.extend_from_slice(&block.ir.ops[..last.ops - 2]);
+                ops.extend(tail);
+            }
+            resume = Some(Resume {
+                ir: IrBlock {
+                    mode: block.ir.mode,
+                    guest_start: block.ir.guest_start,
+                    guest_len: last.guest_len,
+                    icount: last.icount,
+                    temp_count: last.temp_count,
+                    ops: Vec::new(),
+                    legacy_context: block.ir.legacy_context,
+                },
+                tg: crate::ir::TempGen::starting_at(last.temps),
+                ip: last.next,
+                done: kept,
+            });
+            let mut left = last.bytes;
+            block.bytes.truncate(left);
+            block.spans.retain_mut(|(_, len)| {
+                let take = (*len as usize).min(left);
+                *len = take as u32;
+                left -= take;
+                take != 0
+            });
+        } else {
+            block.bytes.clear();
+            block.spans.clear();
+        }
+        block.bounds.truncate(kept);
+        entry = Some(block);
+    }
+    // The previous block's vectors, reused.
+    let (mut spans, mut snapshot, mut bounds) = match entry {
+        Some(block) => (block.spans, block.bytes, block.bounds),
+        None => Default::default(),
+    };
+    let (ir, complete) = lift_block(
+        vm,
+        cpu,
+        word,
+        profile,
+        &mut Sink::Retained(&mut snapshot),
+        &mut spans,
+        &mut retained.ops,
+        resume,
+        Some(&mut bounds),
+    )?;
+    if vm.mem.code_aliased(&spans) {
+        demote(retained, smc_pages, physical);
+        return resolve(vm, cpu, word, physical);
+    }
+    let ir = Arc::new(ir);
+    let blocks = &mut retained.blocks;
+    // A block cut short by a failed fetch could grow once that fetch
+    // succeeds, which its bytes do not show: lift it again on each entry.
+    if complete && snapshot.len() <= RETAINED_BYTES {
+        if blocks.len() >= RETAINED_BLOCKS && !blocks.contains_key(&physical) {
+            // Make room by one block; an evicted block is lifted again.
+            let victim = *blocks.keys().next().unwrap();
+            blocks.remove(&victim);
+        }
+        blocks.insert(
+            physical,
+            Retained {
+                rip: cpu.rip,
+                mxcsr,
+                profile,
+                ir: ir.clone(),
+                spans,
+                bytes: snapshot,
+                bounds,
+                alias_epoch,
+                matched: 0,
+            },
+        );
+    } else {
+        blocks.remove(&physical);
+    }
+    Ok((ir, BlockWalk::Shared))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Prot, RegionKind, VmConfig};
+
+    const IP: u64 = 0x100;
+    // MOV AL,1; ADD AL,2; ADD DL,3; MOV byte [2000h],5; ES: MOV AL,[3000h];
+    // NOP; INC AX; LOCK INC byte [2001h]; JMP $.
+    const CODE: &[u8] = b"\xb0\x01\x04\x02\x80\xc2\x03\xc6\x06\x00\x20\x05\x26\xa0\x00\x30\x90\x40\xf0\xfe\x06\x01\x20\xeb\xfe";
+
+    fn vm(model: crate::CpuModel, code: &[u8]) -> (Vm, Vcpu) {
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.write_bytes(IP, code).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = IP;
+        (vm, cpu)
+    }
+
+    fn shown(result: Result<(Arc<IrBlock>, BlockWalk), Exit>) -> String {
+        match result {
+            Ok((ir, _)) => format!("{ir:?}"),
+            Err(exit) => format!("{exit:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retained_relift_equals_a_lift_of_the_whole_block() {
+        // Every byte of the block, rewritten with opcodes, prefixes and
+        // operand values that keep, lengthen or shorten its instructions:
+        // the retained relift (the kept prefix plus a lift of the rest)
+        // equals the shared path's lift of the rewritten bytes.
+        let word = AtomicU64::new(0);
+        for model in [crate::CpuModel::I8086, crate::CpuModel::NecV30] {
+            let mut resumed = 0;
+            for at in 0..CODE.len() {
+                for value in [
+                    0x90,
+                    0x04,
+                    0x26,
+                    0xf0,
+                    0xf3,
+                    0xeb,
+                    0xf4,
+                    0xcd,
+                    0x0f,
+                    CODE[at] ^ 1,
+                ] {
+                    let (vm, cpu) = self::vm(model, CODE);
+                    let mut retained = RetainedBlocks::default();
+                    let first =
+                        resolve_retained(&vm, &cpu.cpu, &word, IP, &mut retained, &mut Vec::new());
+                    assert_eq!(shown(first), shown(resolve(&vm, &cpu.cpu, &word, IP)));
+                    vm.write_bytes(IP + at as u64, &[value]).unwrap();
+                    let relift = shown(resolve_retained(
+                        &vm,
+                        &cpu.cpu,
+                        &word,
+                        IP,
+                        &mut retained,
+                        &mut Vec::new(),
+                    ));
+                    let mut code = CODE.to_vec();
+                    code[at] = value;
+                    let (fresh, cpu) = self::vm(model, &code);
+                    assert_eq!(
+                        relift,
+                        shown(resolve(&fresh, &cpu.cpu, &word, IP)),
+                        "{model:?} byte {at} = {value:#x}"
+                    );
+                    // An unchanged block is served as retained.
+                    if relift.starts_with("IrBlock") {
+                        let again = shown(resolve_retained(
+                            &vm,
+                            &cpu.cpu,
+                            &word,
+                            IP,
+                            &mut retained,
+                            &mut Vec::new(),
+                        ));
+                        assert_eq!(again, relift);
+                    }
+                    resumed += retained.resumed;
+                }
+            }
+            assert!(resumed > 100, "{resumed}");
+        }
+    }
+
+    #[test]
+    fn retained_blocks_are_bounded_by_eviction_and_their_page_returns_when_unchanged() {
+        let word = AtomicU64::new(0);
+        // HLT at each of RETAINED_BLOCKS + 1 addresses: one more block evicts
+        // one block, not the set.
+        let (vm, mut cpu) = self::vm(crate::CpuModel::I8086, &[0xf4; 0x400]);
+        let mut retained = RetainedBlocks::default();
+        let mut pages = vec![IP >> crate::memory::CODE_PAGE_BITS];
+        for i in 0..=RETAINED_BLOCKS as u64 {
+            cpu.cpu.rip = IP + i;
+            resolve_retained(&vm, &cpu.cpu, &word, IP + i, &mut retained, &mut pages).unwrap();
+        }
+        assert_eq!(retained.len(), RETAINED_BLOCKS);
+        // A block whose bytes keep matching returns its page to the shared
+        // cache, with the page's other blocks.
+        cpu.cpu.rip = IP + RETAINED_BLOCKS as u64;
+        for _ in 0..RETAINED_MATCHES {
+            assert_eq!(pages.len(), 1);
+            resolve_retained(&vm, &cpu.cpu, &word, cpu.cpu.rip, &mut retained, &mut pages).unwrap();
+        }
+        assert!(pages.is_empty());
+        assert_eq!(retained.len(), 0);
+    }
+
+    #[test]
+    fn a_code_alias_keeps_a_page_with_the_shared_cache() {
+        let word = AtomicU64::new(0);
+        let (vm, cpu) = self::vm(crate::CpuModel::I8086, CODE);
+        let mut retained = RetainedBlocks::default();
+        let mut pages = vec![IP >> crate::memory::CODE_PAGE_BITS];
+        resolve_retained(&vm, &cpu.cpu, &word, IP, &mut retained, &mut pages).unwrap();
+        assert_eq!(retained.len(), 1);
+        // Declared after the block was retained: the next entry notices.
+        vm.mem.declare_code_alias(0, 0x8000, 0x1000).unwrap();
+        resolve_retained(&vm, &cpu.cpu, &word, IP, &mut retained, &mut pages).unwrap();
+        assert!(pages.is_empty());
+        assert_eq!(retained.len(), 0);
+        assert!(vm.mem.is_code_page(0));
     }
 }

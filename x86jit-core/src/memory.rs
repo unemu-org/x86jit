@@ -621,6 +621,10 @@ fn code_page_range(addr: u64, len: u64) -> std::ops::RangeInclusive<u64> {
     (addr >> CODE_PAGE_BITS)..=(last >> CODE_PAGE_BITS)
 }
 
+// Process-wide, so that `Memory` keeps its layout; a declaration elsewhere
+// costs a retained twenty-bit block one alias recheck.
+static CODE_ALIAS_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// `(word index, bit mask)` for a guest page in a page bitset.
 #[inline]
 const fn word_bit(page: u64) -> (usize, u64) {
@@ -1786,6 +1790,7 @@ impl Memory {
         if !aliases.pairs.insert(pair) {
             return Ok(());
         }
+        CODE_ALIAS_EPOCH.fetch_add(1, Ordering::AcqRel);
         let mut affected = BTreeSet::new();
         CodeAliases::edges(a, b, len, |a, b| {
             *aliases.pages.entry(a).or_default().entry(b).or_default() += 1;
@@ -1803,6 +1808,23 @@ impl Memory {
             }
         }
         Ok(())
+    }
+
+    /// Advances whenever a code alias is declared, in any memory: a reader
+    /// that found no alias before an unchanged epoch still finds none.
+    pub(crate) fn code_alias_epoch(&self) -> u64 {
+        CODE_ALIAS_EPOCH.load(Ordering::Acquire)
+    }
+
+    /// Whether a page of `spans` has a declared code alias, or a removed one
+    /// that a live child view still holds.
+    pub(crate) fn code_aliased(&self, spans: &[(u64, u32)]) -> bool {
+        let aliases = self.code_aliases.lock().unwrap();
+        spans.iter().any(|&(addr, len)| {
+            code_page_range(addr, u64::from(len)).any(|page| {
+                aliases.pages.contains_key(&page) || aliases.retired_aliases.contains_key(&page)
+            })
+        })
     }
 
     /// Remove an exact declaration, accepting either order of its views. Returns
