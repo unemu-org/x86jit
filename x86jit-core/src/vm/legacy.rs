@@ -3839,7 +3839,13 @@ impl Vcpu {
                 // `ctx.ret_stack` holds the compiled TLB view exactly when this
                 // run compiles (decision-30 §4), so the loop keeps no flag.
                 if KIND == MACHINE_DISPATCH && ctx.ret_stack != 0 && vm.cache.machine_inflight() {
-                    compiled::drain(vm, exit_word, &self.engine_sections);
+                    let published = compiled::drain(vm, exit_word, &self.engine_sections);
+                    self.legacy_execution
+                        .as_mut()
+                        .unwrap()
+                        .machine_jit
+                        .counters()
+                        .compiled += published;
                 }
                 if refresh_boundary {
                     boundary = self.machine_boundary::<SINGLE, KIND>(options);

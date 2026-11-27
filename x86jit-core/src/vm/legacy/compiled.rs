@@ -64,7 +64,10 @@ impl MachineJitMode {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MachineJitCounters {
-    /// Units compiled (modes 2-3).
+    /// Units this vCPU published: compiled synchronously (modes 2-3), or
+    /// compiled by the background worker (production tier-up) and published
+    /// when this vCPU drained the completion (`drain`). A unit another vCPU
+    /// published, entered here through the shared map, is not counted.
     pub compiled: u64,
     /// Compiled (or scripted) units entered.
     pub entries: u64,
@@ -100,6 +103,92 @@ pub struct MachineJitCounters {
     pub compiled_retired_cpl3: u64,
     /// Compiled (or scripted) entries with paging on.
     pub paged_entries: u64,
+    /// Turns that ran the interpreted walk because an entry condition failed,
+    /// by the first failing condition, named by [`Self::REFUSAL_NAMES`]: the
+    /// class tests (E2; a block outside the ordinary walk by whether it holds
+    /// a string instruction, a port access, or neither), then E3-E10 in the
+    /// order `machine_progress` tests them. The E3-E10 entries, from
+    /// [`Self::FIRST_ENTRY_REFUSAL`] on, sum to [`Self::refused`].
+    pub refusals: [u64; REFUSALS],
+    /// Turns of an admitted, eligible block that ran the interpreted walk
+    /// because it had no unit to enter, named by [`Self::NO_UNIT_NAMES`].
+    pub no_unit: [u64; NO_UNITS],
+}
+
+/// Entry refusals (`MachineJitCounters::refusals`): E2's class tests, then
+/// E3 by its cause, E4, E5 by its input, E6-E8, and the paged entry's three
+/// tests (decision-32 §2).
+// Read by the test-only census alone (`Vcpu::refusal`, `walk_refusal`).
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+mod refuse {
+    pub(super) const REFUSE_SEGMENT_CLASS: usize = 0;
+    pub(super) const REFUSE_CPL: usize = 1;
+    pub(super) const REFUSE_WALK_STRING: usize = 2;
+    pub(super) const REFUSE_WALK_PORT: usize = 3;
+    pub(super) const REFUSE_WALK: usize = 4;
+    pub(super) const REFUSE_TRAP_FLAG: usize = 5;
+    pub(super) const REFUSE_SHADOW: usize = 6;
+    pub(super) const REFUSE_IRQ_PENDING: usize = 7;
+    pub(super) const REFUSE_DEVICE_INTR: usize = 8;
+    pub(super) const REFUSE_ONE_STEP_OTHER: usize = 9;
+    pub(super) const REFUSE_BUDGET: usize = 10;
+    pub(super) const REFUSE_RETRY: usize = 11;
+    pub(super) const REFUSE_TASK: usize = 12;
+    pub(super) const REFUSE_PENDING_IO: usize = 13;
+    pub(super) const REFUSE_FETCH_POLICY: usize = 14;
+    pub(super) const REFUSE_MXCSR: usize = 15;
+    pub(super) const REFUSE_RF: usize = 16;
+    pub(super) const REFUSE_PAGE_CROSSING: usize = 17;
+    pub(super) const REFUSE_PAGED_BUSY: usize = 18;
+    pub(super) const REFUSE_PAGED_PROOF: usize = 19;
+    pub(super) const REFUSALS: usize = 20;
+}
+use refuse::*;
+
+/// Why an eligible block had no unit (`MachineJitCounters::no_unit`).
+const NO_UNIT_COLD: usize = 0;
+const NO_UNIT_AWAITING: usize = 1;
+const NO_UNIT_FAILED: usize = 2;
+const NO_UNIT_DEMOTED: usize = 3;
+const NO_UNIT_DELAYED: usize = 4;
+const NO_UNITS: usize = 5;
+
+/// Test-only: which E2 walk refusal a block outside the ordinary walk is.
+#[cfg(any(test, feature = "test-hooks"))]
+#[cold]
+#[inline(never)]
+fn walk_refusal(ir: &IrBlock) -> usize {
+    use crate::ir::IrOp;
+    use crate::legacy::LegacyOp as L;
+    let has = |f: fn(&IrOp) -> bool| ir.ops.iter().any(f);
+    if has(|op| matches!(op, IrOp::Legacy(L::String { .. }))) {
+        REFUSE_WALK_STRING
+    } else if has(|op| {
+        matches!(
+            op,
+            IrOp::PortIo { .. }
+                | IrOp::PortString { .. }
+                | IrOp::Legacy(L::Privileged {
+                    kind: crate::legacy::PrivilegeCheck::IoPort { .. }
+                        | crate::legacy::PrivilegeCheck::RepIoPort { .. }
+                })
+        )
+    }) {
+        REFUSE_WALK_PORT
+    } else {
+        REFUSE_WALK
+    }
+}
+
+/// Test-only tally of a refusal or a missing unit.
+#[inline(always)]
+fn tally(counts: &mut [u64], index: usize) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        counts[index] += 1;
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = (counts, index);
 }
 
 /// Chain-end reasons (decision-31 §8): the edge's budget test, the dispatch
@@ -132,6 +221,37 @@ impl MachineJitCounters {
         "segment",
         "other",
     ];
+
+    /// The names of [`Self::refusals`]' entries, in order.
+    pub const REFUSAL_NAMES: [&'static str; REFUSALS] = [
+        "E2 segment class",
+        "E2 cpl 1 or 2",
+        "E2 walk: string",
+        "E2 walk: port io",
+        "E2 walk: other",
+        "E3 trap flag",
+        "E3 sti or ss shadow",
+        "E3 irq pending",
+        "E3 device intr",
+        "E3 other one-step",
+        "E4 budget",
+        "E5 retry",
+        "E5 task switch",
+        "E5 pending io",
+        "E6 fetch policy",
+        "E7 mxcsr",
+        "E8 rf",
+        "E9 page crossing",
+        "E9 paged transaction",
+        "E10 paged proof",
+    ];
+
+    /// The index of the first E3-E10 entry of [`Self::refusals`].
+    pub const FIRST_ENTRY_REFUSAL: usize = REFUSE_TRAP_FLAG;
+
+    /// The names of [`Self::no_unit`]'s entries, in order.
+    pub const NO_UNIT_NAMES: [&'static str; NO_UNITS] =
+        ["cold", "awaiting", "failed", "demoted", "delayed"];
 
     /// The names of [`Self::chain_ends`]' entries, in order.
     pub const CHAIN_END_NAMES: [&'static str; CHAIN_ENDS] = [
@@ -655,9 +775,10 @@ fn unit_sources(ir: &IrBlock, physical: u64) -> Vec<(u64, u32)> {
 /// top of a turn, as `drain_tier_up` does for Application.
 #[cold]
 #[inline(never)]
-pub(super) fn drain(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
+pub(super) fn drain(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) -> u64 {
     use crate::interruption::{CriticalSectionKind, EngineSection};
     let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::TierUpWait);
+    let mut count = 0;
     for fin in vm.backend.tier_up_finished() {
         vm.handle_smc(exit_word);
         vm.cache.record_tier_bg_completed();
@@ -677,11 +798,14 @@ pub(super) fn drain(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
                 }
             },
         );
-        if !published {
+        if published {
+            count += 1;
+        } else {
             vm.cache.release_source_tags(&vm.mem, &fin.spans);
             super::super::discard_materialized(vm, &fin.block);
         }
     }
+    count
 }
 
 impl Vcpu {
@@ -736,6 +860,17 @@ impl Vcpu {
                 matches!(walk, BlockWalk::Direct)
             })
         {
+            #[cfg(any(test, feature = "test-hooks"))]
+            {
+                let reason = if context.segment_class != crate::SegmentClass::Flat32 {
+                    REFUSE_SEGMENT_CLASS
+                } else if cpl != 0 && cpl != 3 {
+                    REFUSE_CPL
+                } else {
+                    walk_refusal(ir)
+                };
+                tally(&mut execution.machine_jit.counters().refusals, reason);
+            }
             return None;
         }
         let eligible = !boundary.one_step
@@ -752,6 +887,17 @@ impl Vcpu {
             && (!paged || paged_entry(execution.paging.as_deref(), ir));
         if !eligible {
             execution.machine_jit.counters().refused += 1;
+            #[cfg(any(test, feature = "test-hooks"))]
+            {
+                let reason = self.refusal(vm, ir, boundary, remaining, paged);
+                let counters = self
+                    .legacy_execution
+                    .as_mut()
+                    .unwrap()
+                    .machine_jit
+                    .counters();
+                tally(&mut counters.refusals, reason);
+            }
             return None;
         }
         let index = memo_index(ir);
@@ -838,6 +984,7 @@ impl Vcpu {
             && physical()
                 .is_none_or(|bus| state.demoted(bus >> crate::memory::CODE_PAGE_BITS, retired));
         if cold {
+            tally(&mut state.counters.no_unit, NO_UNIT_DEMOTED);
             return None;
         }
         let Compiling {
@@ -874,6 +1021,7 @@ impl Vcpu {
             Some(entry) if slot.delay == 0 => entry,
             Some(_) => {
                 slot.delay -= 1;
+                tally(&mut counters.no_unit, NO_UNIT_DELAYED);
                 return None;
             }
             None => {
@@ -904,6 +1052,12 @@ impl Vcpu {
                     Request::Failed => false,
                 };
                 if !ready {
+                    let reason = match slot.request {
+                        Request::None => NO_UNIT_COLD,
+                        Request::Waiting(_) => NO_UNIT_AWAITING,
+                        Request::Failed => NO_UNIT_FAILED,
+                    };
+                    tally(&mut counters.no_unit, reason);
                     return None;
                 }
                 let physical = physical()?;
@@ -916,12 +1070,24 @@ impl Vcpu {
                         ROUTED,
                         ORDER,
                     );
-                    tier_up(vm, ir, key, physical, generation, config, slot, exit_word)?
+                    let Some(unit) =
+                        tier_up(vm, ir, key, physical, generation, config, slot, exit_word)
+                    else {
+                        let reason = if slot.request == Request::Failed {
+                            NO_UNIT_FAILED
+                        } else {
+                            NO_UNIT_AWAITING
+                        };
+                        tally(&mut counters.no_unit, reason);
+                        return None;
+                    };
+                    unit
                 };
                 counters.compiled += u64::from(compiled);
                 slot.entry = Some((found, epoch));
                 slot.bus = physical;
                 if slot.delay != 0 {
+                    tally(&mut counters.no_unit, NO_UNIT_DELAYED);
                     return None;
                 }
                 found
@@ -1072,6 +1238,63 @@ impl Vcpu {
         );
         self.count_privilege(paged, cpl, before);
         Some((result, Some(Chain { prefix, ir: last })))
+    }
+
+    /// Test-only: the first entry condition (E3-E10) that refused this
+    /// turn's admitted block, as `machine_progress` tests them.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[cold]
+    #[inline(never)]
+    fn refusal(
+        &self,
+        vm: &Vm,
+        ir: &Arc<IrBlock>,
+        boundary: &MachineBoundary,
+        remaining: u64,
+        paged: bool,
+    ) -> usize {
+        let execution = self.legacy_execution.as_ref().unwrap();
+        let paging = execution.paging.as_deref();
+        if boundary.one_step {
+            return if boundary.single_step {
+                REFUSE_TRAP_FLAG
+            } else if self.sti_shadow || self.ss_shadow & SS_HOLD != 0 {
+                REFUSE_SHADOW
+            } else if boundary.irq_pending {
+                REFUSE_IRQ_PENDING
+            } else if (self.device_cpu().intr && self.cpu.flags.if_) || self.device_cpu().invalidate
+            {
+                REFUSE_DEVICE_INTR
+            } else {
+                REFUSE_ONE_STEP_OTHER
+            };
+        }
+        if remaining < u64::from(ir.icount) {
+            REFUSE_BUDGET
+        } else if boundary.instruction_retry
+            || execution.event_retry.is_some()
+            || self.cpu.mmio_retry_active
+        {
+            REFUSE_RETRY
+        } else if boundary.task_pending {
+            REFUSE_TASK
+        } else if boundary.pending_io || self.cpu.port_string_in.is_some() {
+            REFUSE_PENDING_IO
+        } else if vm.mem.fetch_policy.is_some() {
+            REFUSE_FETCH_POLICY
+        } else if self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK != 0 {
+            REFUSE_MXCSR
+        } else if self.cpu.rflags_system & (1 << 16) != 0 {
+            REFUSE_RF
+        } else if !paged {
+            unreachable!("an unpaged block refused by no condition")
+        } else if (ir.guest_start & 0xfff) + u64::from(ir.guest_len) > 0x1000 {
+            REFUSE_PAGE_CROSSING
+        } else if paging.is_none_or(|state| !state.idle()) {
+            REFUSE_PAGED_BUSY
+        } else {
+            REFUSE_PAGED_PROOF
+        }
     }
 
     /// Test-only: a compiled turn's instructions at CPL 3 and its entries
