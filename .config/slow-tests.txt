@@ -134,3 +134,5 @@ x86jit-tests::legacy legacy_census_386::seg32_cpl3_checked_census_forms_are_equa
 x86jit-tests::legacy legacy_seg32::whole_operand_edges_with_both_address_sizes_and_expand_down_b
 x86jit-tests::legacy legacy_rollback_sweep::protected_code32_fault_atomicity_sweep
 x86jit-tests::legacy legacy_smc_positions::stores_into_every_position_of_a_block_are_fetched
+x86jit-tests::legacy legacy_seg32::budgets_fault_ordinals_and_segment_loads_match_checked
+x86jit-tests::legacy legacy_seg16::budgets_fault_ordinals_and_segment_loads_match_checked
