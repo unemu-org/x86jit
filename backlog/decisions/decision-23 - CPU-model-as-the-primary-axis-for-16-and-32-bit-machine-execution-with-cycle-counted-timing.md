@@ -1538,3 +1538,15 @@ the alias SMC relift path fixed; release-only drift on `data-next-to-code` remai
 J2 with J2b cuts `machine32_loops` from 423 / 564 / 1043 to 20 / 36 / 66 host
 instructions per step (register / memory / callret). The per-run cost is tracked in
 xj-to9.66; this exception covers only that workload and only this landing.
+
+## Amendment: J2b lands over one layout-sensitive cell (2026-11-27, accepted)
+
+The maintainer accepted landing J2b (decision-31) with its gate run (Linux arm64, base
+641d4d96, candidate 0412e300) blocking on one cell only: `smc-rmw-64` on the Real16
+alias, release +2.03 %, perf +2.03 %. The blocking cell moved between rounds within the
+alias SMC relift family (smc-next-64 before the fix that made the Machine targets and
+chain counters lazy); lldb traces show J2b adds about one host instruction per SMC window
+there, with allocation sizes and order identical to the base, so the cost is heap layout.
+J2b cuts `machine32_loops` from 120 / 136 / 363 to 20 / 36 / 66 host instructions per
+step (register / memory / callret). Making that relift loop allocation-stable is tracked
+in xj-to9.71; this exception covers only that cell family and only this landing.
