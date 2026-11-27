@@ -345,13 +345,32 @@ impl LegacyContextStamp {
     }
     #[inline(always)]
     fn matches(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
-        self.compare(cpu, model, false)
+        self.compare(cpu, model, false, u32::MAX)
+    }
+
+    /// The paged proofs' identity (`paging::State`, xj-to9.70): the whole
+    /// stamp with CR0's MP, EM and TS clear. Those bits gate ESC and WAIT
+    /// (SDM Vol 3A §2.5; 80386 PRM §§11.1.2-11.1.4), which the interpreter
+    /// tests when it executes the instruction (`LegacyOp::Coprocessor`);
+    /// no lift reads them and no translation depends on them, so an
+    /// operating system that hands the FPU over keeps its paged proofs.
+    fn new_paged(cpu: &CpuState, model: LegacyCpuModel) -> Self {
+        let mut stamp = Self::new(cpu, model);
+        stamp.state.cr0 &= PAGED_IDENTITY_CR0;
+        stamp
+    }
+
+    /// Whether this stamp is the paged identity (`new_paged`) of `cpu`.
+    #[inline(always)]
+    fn matches_paged(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
+        self.compare(cpu, model, false, PAGED_IDENTITY_CR0)
     }
 
     // `matches`, or with `flat32` whether this is the paged Flat32 identity
-    // of `cpu` (`drop_fs_gs`): FS and GS held cleared.
+    // of `cpu` (`drop_fs_gs`): FS and GS held cleared. Only the CR0 bits in
+    // `cr0` are compared.
     #[inline(always)]
-    fn compare(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool) -> bool {
+    fn compare(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool, cr0: u32) -> bool {
         #[inline(always)]
         fn cache_bits(c: &crate::legacy::SegmentCache) -> (u64, u64) {
             (
@@ -392,7 +411,7 @@ impl LegacyContextStamp {
         let mut diff = u64::from(self.model != model)
             | u64::from(self.selectors != [cpu.cs, cpu.ds, cpu.es, cpu.ss, fs, gs])
             | (self.system_flags ^ (cpu.rflags_system & 0x27000))
-            | u64::from(a.cr0 ^ b.cr0)
+            | u64::from((a.cr0 ^ b.cr0) & cr0)
             | u64::from(a.cr3 ^ b.cr3)
             | (table_bits(&a.gdtr) ^ table_bits(&b.gdtr))
             | (table_bits(&a.idtr) ^ table_bits(&b.idtr))
@@ -423,6 +442,17 @@ impl LegacyContextStamp {
     /// `is_identity_of` confirms field by field.
     #[inline(always)]
     fn quick(cpu: &CpuState, flat32: bool) -> u64 {
+        Self::quick_masked(cpu, flat32, u32::MAX)
+    }
+
+    /// `quick` of the paged identity (`new_paged`).
+    #[inline(always)]
+    fn quick_paged(cpu: &CpuState) -> u64 {
+        Self::quick_masked(cpu, false, PAGED_IDENTITY_CR0)
+    }
+
+    #[inline(always)]
+    fn quick_masked(cpu: &CpuState, flat32: bool, cr0: u32) -> u64 {
         let l = &cpu.legacy;
         let fs_gs = if flat32 {
             0
@@ -434,7 +464,7 @@ impl LegacyContextStamp {
             | (u64::from(cpu.es) << 32)
             | (u64::from(cpu.ss) << 48);
         let tail = fs_gs | (u64::from(l.cpl) << 32) | ((cpu.rflags_system & 0x27000) << 28);
-        let control = u64::from(l.cr0) | (u64::from(l.cr3) << 32);
+        let control = u64::from(l.cr0 & cr0) | (u64::from(l.cr3) << 32);
         selectors ^ tail.rotate_left(8) ^ control.rotate_left(24)
     }
 
@@ -444,9 +474,13 @@ impl LegacyContextStamp {
     /// which a complete one holds zero and `matches` does not compare.
     #[inline(always)]
     fn is_identity_of(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool) -> bool {
-        self.state.cr2 == 0 && self.compare(cpu, model, flat32)
+        self.state.cr2 == 0 && self.compare(cpu, model, flat32, u32::MAX)
     }
 }
+
+/// CR0 as the paged identity names it: every bit but MP, EM and TS
+/// (`LegacyContextStamp::new_paged`).
+const PAGED_IDENTITY_CR0: u32 = !0xe;
 // Decision-20: the firmware-style transition loop uses four contexts. An
 // extended-memory runtime's interrupt reflection walks through more than
 // sixteen stamps (code, data and stack selectors, CR0.PE, IDTR) on every

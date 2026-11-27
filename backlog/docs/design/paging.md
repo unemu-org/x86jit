@@ -383,8 +383,14 @@ checks while its context, translation token, physical source publication generat
 and fetch permit remain valid. Keep its physical source registration alive rather
 than walking, fetching and registering again. The VM namespace issues non-reused
 tokens across all vCPUs; removing or replacing a TLB entry that an instruction
-fetch used conservatively expires retained source proofs, and physical SMC
-invalidation expires their publication generation. Replacing a data or stack
+fetch used advances the generation, and a retained proof validated at an older
+generation translates the first fetched byte of each of its code pages again
+(through the TLB, or the walk a fetch would make) before it is used: an
+unchanged bus address keeps it, another frame or a fault relifts it
+(xj-to9.70). Only a flush (CR3 load, PG/WP/CD/NW/PE, A20, model, explicit
+invalidation) drops every paged proof, and physical SMC invalidation expires
+their publication generation. CR0.MP/EM/TS are not part of the paged proof
+identity: ESC and WAIT test them when they execute. Replacing a data or stack
 entry expires nothing: no proof depends on it, and a fetch through that page
 later walks and marks its own entry (xj-to9.21). This
 also permits the architecturally allowed stale mapping until invalidation or

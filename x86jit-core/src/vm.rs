@@ -19,9 +19,11 @@ pub(crate) mod device;
 mod i8086;
 mod legacy;
 #[cfg(feature = "test-hooks")]
+pub(crate) use legacy::diag::TLB_ADVANCES;
+#[cfg(feature = "test-hooks")]
 pub use legacy::diag::{
     GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
-    ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass,
+    ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass, TlbAdvance, TlbStats,
 };
 pub(crate) use legacy::live::absorb_at_store;
 pub(crate) use legacy::paging_generation;

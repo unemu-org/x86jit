@@ -9,7 +9,12 @@ use std::cell::Cell;
 
 // Checked V86 loops retain one proof per instruction, including multiple
 // unrolled bodies. Keep their working set independently of context identities.
-const MAX_BLOCKS: usize = 256;
+// Proofs outlive TLB evictions (xj-to9.70), so a paged kernel's working set
+// across its interrupt, scheduler and driver paths stays proved: up to 4096
+// blocks, and at most 16 MiB of IR (`flat32::weight`), which 4096 blocks of
+// 4 KiB or 500 of 32 instructions reach.
+const MAX_BLOCKS: usize = 4096;
+const MAX_BLOCK_BYTES: usize = 16 << 20;
 const MAX_CONTEXTS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,8 +24,8 @@ struct Key {
     // an ordinary multi-instruction block.
     ordinary: bool,
     decode: LegacyBlockKey,
-    generation: u64,
     cr3: u32,
+    // `LegacyContextStamp::new_paged`'s CR0: MP, EM and TS clear.
     cr0: u32,
 }
 #[cfg(feature = "test-hooks")]
@@ -33,7 +38,6 @@ impl super::diag::DiagKey for Key {
         fields.extend([
             ("class", self.segment_class as u64),
             ("ordinary", u64::from(self.ordinary)),
-            ("tlb_generation", self.generation),
             ("cr3", u64::from(self.cr3)),
             ("cr0", u64::from(self.cr0)),
         ]);
@@ -46,7 +50,6 @@ impl Hash for Key {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.decode.hash(state);
-        state.write_u64(self.generation);
         state.write_u64(u64::from(self.cr3) | (u64::from(self.cr0) << 32));
         state.write_u64(self.segment_class as u64 | (u64::from(self.ordinary) << 8));
     }
@@ -59,13 +62,23 @@ struct Proof {
     // An ordinary block's instruction table, built with the proof.
     lanes: Option<Arc<[Insn]>>,
     permit: Option<crate::FetchPermit>,
+    // Each code page's first fetched byte: its linear address and the bus
+    // address its fetch translated it to (xj-to9.70).
+    pages: Box<[(u32, u64)]>,
+    // The TLB generation at which every page of `pages` last translated to
+    // its bus address. While the generation holds, no entry a fetch used
+    // has left the TLB, so the translations still hold.
+    validated: Cell<u64>,
     // Ordered post-A20 bus spans, never a linear length applied to one frame.
     _registration: crate::memory::CodeRegistration,
 }
 
 #[derive(Default)]
 pub(super) struct State {
+    // The TLB generation last reconciled, and the generation of its last
+    // flush: a flush expires every proof, an advance only their validation.
     generation: u64,
+    flushed: u64,
     pub(super) tlb: std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
     mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
@@ -193,6 +206,7 @@ impl State {
         self.lane_slots.clear();
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
+        self.flushed = self.tlb.get_mut().flushed;
         self.stamp = None;
         self.synced = None;
         self.contexts.clear();
@@ -228,12 +242,6 @@ impl State {
             self.memory = memory;
             self.mapping = Some(vm.mem.mapping_identity());
         }
-        // The diagnostics remember a drop across TLB generations.
-        #[cfg(feature = "test-hooks")]
-        self.blocks.set_history_key(|key| Key {
-            generation: 0,
-            ..*key
-        });
         // A write drops the proofs whose bus sources it overlaps.
         self.blocks.reconcile(&vm.cache);
         let serial = selection.map(|(serial, _)| serial);
@@ -247,7 +255,9 @@ impl State {
             // test build checks that none was missed.
             #[cfg(any(test, debug_assertions))]
             assert!(
-                self.stamp.as_ref().is_some_and(|s| s.matches(cpu, model)),
+                self.stamp
+                    .as_ref()
+                    .is_some_and(|s| s.matches_paged(cpu, model)),
                 "a stamped field changed at an unchanged selection serial"
             );
             #[cfg(test)]
@@ -278,7 +288,7 @@ impl State {
                 .position(|r| r.as_ref().is_some_and(|r| r.complete == complete))
             {
                 let entry = self.recent[slot].as_mut().unwrap();
-                debug_assert!(entry.stamp.matches(cpu, model));
+                debug_assert!(entry.stamp.matches_paged(cpu, model));
                 if self.context_id != entry.id || self.stamp.is_none() {
                     self.uses += 1;
                     entry.used = self.uses;
@@ -289,9 +299,14 @@ impl State {
                 return;
             }
         }
-        let quick = LegacyContextStamp::quick(cpu, false);
+        let quick = LegacyContextStamp::quick_paged(cpu);
         let complete = complete.unwrap_or(u64::MAX);
-        if self.quick == quick && self.stamp.as_ref().is_some_and(|s| s.matches(cpu, model)) {
+        if self.quick == quick
+            && self
+                .stamp
+                .as_ref()
+                .is_some_and(|s| s.matches_paged(cpu, model))
+        {
             if complete != u64::MAX {
                 if let Some(entry) = self
                     .recent
@@ -307,7 +322,7 @@ impl State {
         self.uses += 1;
         if let Some(slot) = self.recent.iter().position(|r| {
             r.as_ref()
-                .is_some_and(|r| r.quick == quick && r.stamp.matches(cpu, model))
+                .is_some_and(|r| r.quick == quick && r.stamp.matches_paged(cpu, model))
         }) {
             let entry = self.recent[slot].as_mut().unwrap();
             entry.used = self.uses;
@@ -319,7 +334,7 @@ impl State {
             self.quick = quick;
             return;
         }
-        let stamp = LegacyContextStamp::new(cpu, model);
+        let stamp = LegacyContextStamp::new_paged(cpu, model);
         let id = if let Some(id) = self.contexts.get(&stamp) {
             *id
         } else {
@@ -355,12 +370,17 @@ impl State {
         self.quick = quick;
     }
 
+    // A flush (a new translation context: CR3, the paging bits of CR0, A20,
+    // the model, or an explicit invalidation) drops every proof. Any other
+    // advance only makes the proofs validated before it translate their
+    // code pages again on their next hit (`resolve`).
     fn reconcile_generation(&mut self) {
-        let generation = self.tlb.get_mut().generation;
-        if self.generation != generation {
+        let tlb = self.tlb.get_mut();
+        if self.flushed != tlb.flushed {
             self.blocks.clear(why!(Paging));
-            self.generation = generation;
+            self.flushed = tlb.flushed;
         }
+        self.generation = tlb.generation;
     }
 
     fn key(
@@ -393,9 +413,8 @@ impl State {
                 linear_fetch,
                 mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
             },
-            generation: self.generation,
             cr3: cpu.legacy.cr3,
-            cr0: cpu.legacy.cr0,
+            cr0: cpu.legacy.cr0 & super::PAGED_IDENTITY_CR0,
         })
     }
 
@@ -419,7 +438,44 @@ impl State {
         loop {
             vm.handle_smc(exit_word);
             self.reconcile(vm, cpu, model, selection);
+            // The dispatcher's context notes and the TLB's generation
+            // advances, which only this resolver reaches on paged paths.
+            #[cfg(feature = "test-hooks")]
+            {
+                super::diag::drain_contexts(&vm.live_fields.diag);
+                vm.live_fields.diag.tlb(&mut self.tlb.get_mut().advances);
+            }
             let key = self.key(cpu, model, context, owner_id, ordinary)?;
+            let generation = self.tlb.get_mut().generation;
+            let mut moved = false;
+            if let Some(proof) = self
+                .blocks
+                .get(&key)
+                .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
+            {
+                // A fetched entry left the TLB since this proof's code pages
+                // last translated: translate them again, as the fetch would.
+                if proof.validated.get() != generation {
+                    let wrote = Cell::new(false);
+                    let held = pages_hold(vm, cpu, &proof.pages, &self.tlb, &wrote);
+                    walk_wrote.set(walk_wrote.get() | wrote.get());
+                    #[cfg(feature = "test-hooks")]
+                    vm.live_fields.diag.revalidated(held);
+                    if wrote.get() {
+                        // A walk's A update may have written code: drain it
+                        // and look again (the entries now hit).
+                        continue;
+                    }
+                    if !held {
+                        moved = true;
+                    } else if self.tlb.get_mut().generation == generation {
+                        proof.validated.set(generation);
+                    }
+                }
+            }
+            if moved {
+                self.blocks.remove(&key, why!(Translation));
+            }
             if let Some(proof) = self
                 .blocks
                 .get(&key)
@@ -450,7 +506,10 @@ impl State {
             let generation = vm.cache.proof_generation();
             let permit = vm.mem.fetch_permit();
             let mut live = super::live::Plan::default();
-            let (ir, sources) = lift(
+            // The generation the lift's translations hold at: a lift whose
+            // walks replace a fetched entry revalidates on its first hit.
+            let validated = self.tlb.get_mut().generation;
+            let (ir, sources, pages) = lift(
                 vm,
                 cpu,
                 context,
@@ -513,6 +572,9 @@ impl State {
             let key = self.key(cpu, model, context, owner_id, ordinary)?;
             self.lifts += 1;
             let link_exit = super::links::link_exit(&ir);
+            let mut ir = ir;
+            // The lift's spare capacity would count against the budget.
+            ir.ops.shrink_to_fit();
             let ir = Arc::new(IrBlock { link_exit, ..ir });
             if !source.publishable() {
                 #[cfg(feature = "test-hooks")]
@@ -536,15 +598,17 @@ impl State {
                 }
                 continue;
             }
+            let lanes = ordinary.then(|| crate::interp::legacy::paging::lanes(&ir));
+            let weight = super::flat32::weight(&ir, sources.len())
+                + lanes
+                    .as_ref()
+                    .map_or(0, |l| l.len() * std::mem::size_of::<Insn>());
             if !self.blocks.contains_key(&key) {
-                // A count bound only: 256 proofs of at most about 35 KiB
-                // (`flat32::MAX_PROOF_BYTES`) hold about 9 MiB.
                 self.blocks
-                    .make_room(MAX_BLOCKS, usize::MAX, 0, why!(Bound), |proof| {
+                    .make_room(MAX_BLOCKS, MAX_BLOCK_BYTES, weight, why!(Bound), |proof| {
                         Arc::strong_count(&proof.ir) > 1
                     });
             }
-            let lanes = ordinary.then(|| crate::interp::legacy::paging::lanes(&ir));
             self.blocks.insert(
                 key,
                 Proof {
@@ -552,10 +616,12 @@ impl State {
                     ordinary,
                     lanes: lanes.clone(),
                     permit,
+                    pages: pages.into_boxed_slice(),
+                    validated: Cell::new(validated),
                     _registration: registration.unwrap(),
                 },
                 &sources,
-                0,
+                weight,
             );
             self.last = Some((Arc::as_ptr(&ir) as usize, self.blocks.version()));
             let version = self.blocks.version();
@@ -607,23 +673,24 @@ fn lift(
     tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
     blocks: bool,
     live: &mut super::live::Plan,
-) -> Result<(IrBlock, Vec<(u64, u32)>), Exit> {
+) -> Result<Lifted, Exit> {
     let mut cursor = cpu.clone();
     let linear = cpu.legacy.segments[0].base.wrapping_add(cpu.rip as u32);
     let page_end = cpu.rip + (4096 - u64::from(linear & 4095));
     let mut block: Option<IrBlock> = None;
     let mut sources = Vec::new();
+    let mut pages = Vec::new();
     let mut reloaded = 0;
     loop {
         if cursor.rip + 15 > page_end {
             if let Some(block) = block.take() {
-                return Ok((block, sources));
+                return Ok((block, sources, pages));
             }
         }
         let fetched = fetch(vm, &mut cursor, context, source, walk_wrote, tlb);
-        let (bytes, spans) = match fetched {
+        let (bytes, spans, fetched_pages) = match fetched {
             Ok(fetched) => fetched,
-            Err(exit) => return block.map(|b| (b, sources)).ok_or(exit),
+            Err(exit) => return block.map(|b| (b, sources, pages)).ok_or(exit),
         };
         // Each byte's bus address, as this fetch translated it.
         let bus = |offset: u32| {
@@ -648,7 +715,7 @@ fn lift(
             Ok(ir) => ir,
             Err(error) => {
                 return block
-                    .map(|b| (b, sources))
+                    .map(|b| (b, sources, pages))
                     .ok_or_else(|| direct_refusal(&cursor, error))
             }
         };
@@ -658,10 +725,18 @@ fn lift(
             && crate::interp::legacy::flat32_ordinary(&instruction);
         if !ordinary {
             if let Some(block) = block.take() {
-                return Ok((block, sources));
+                return Ok((block, sources, pages));
             }
         }
         sources.extend(spans);
+        for page in fetched_pages {
+            if !pages
+                .iter()
+                .any(|&(linear, _)| linear >> 12 == page.0 >> 12)
+            {
+                pages.push(page);
+            }
+        }
         let mut decoder = Decoder::with_ip(
             u32::from(context.default_operand_bits),
             &bytes,
@@ -684,12 +759,49 @@ fn lift(
             || cursor.rip >= page_end
             || block.as_ref().unwrap().icount == 32
         {
-            return Ok((block.unwrap(), sources));
+            return Ok((block.unwrap(), sources, pages));
         }
     }
 }
 
-type Fetched = (Vec<u8>, Vec<(u64, u32)>);
+/// A lifted block, its ordered bus spans and its code pages: each page's
+/// first fetched byte, linear and as translated (`Proof::pages`).
+type Lifted = (IrBlock, Vec<(u64, u32)>, Vec<(u32, u64)>);
+type Fetched = (Vec<u8>, Vec<(u64, u32)>, Vec<(u32, u64)>);
+
+/// Whether every code page of a proof still translates its first fetched
+/// byte `linear` to the bus address `bus` it was fetched from: through a
+/// permitted TLB entry, or else through the walk a fetch would make (which
+/// sets A bits, reported in `wrote`, and fills the TLB). A walk that faults
+/// is a mismatch: the relift fetches again and takes the fault. Same linear
+/// page, another frame (a remapped PTE after INVLPG or an eviction) is a
+/// mismatch even when the bytes are equal (paging design §3.5).
+fn pages_hold(
+    vm: &Vm,
+    cpu: &CpuState,
+    pages: &[(u32, u64)],
+    tlb: &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
+    wrote: &Cell<bool>,
+) -> bool {
+    let mut walker: Option<CpuState> = None;
+    for &(linear, bus) in pages {
+        let hit = tlb.borrow_mut().fetch_hit(cpu, linear);
+        let found = match hit {
+            Some(physical) => crate::legacy::physical_span(cpu, u32::MAX, u64::from(physical), 1).0,
+            None => {
+                let walker = walker.get_or_insert_with(|| cpu.clone());
+                match fetch_bus_for_test(walker, &vm.mem, linear, wrote, Some(tlb)) {
+                    Ok(found) => found,
+                    Err(_) => return false,
+                }
+            }
+        };
+        if found != bus {
+            return false;
+        }
+    }
+    true
+}
 
 #[cold]
 #[inline(never)]
@@ -704,6 +816,7 @@ fn fetch(
     let ip = cpu.rip;
     let mut bytes = Vec::with_capacity(15);
     let mut sources: Vec<(u64, u32)> = Vec::new();
+    let mut pages: Vec<(u32, u64)> = Vec::new();
     // 80386 PRM §9.8.13 p. 9-17; Intel486 PRM §9.9.13 p. 9-21:
     // the maximum instruction length is fifteen bytes.
     for i in 0..15 {
@@ -720,6 +833,14 @@ fn fetch(
         } else {
             crate::legacy::physical_span(cpu, u32::MAX, linear, 1).0
         };
+        // Only a translated fetch has pages to revalidate.
+        if context.paging_enabled
+            && pages
+                .last()
+                .is_none_or(|&(page, _)| page >> 12 != linear as u32 >> 12)
+        {
+            pages.push((linear as u32, bus));
+        }
         if let Some(policy) = &vm.mem.fetch_policy {
             let verdict = policy.approve(bus >> crate::memory::CODE_PAGE_BITS, &vm.mem);
             if verdict != crate::FetchVerdict::Allow {
@@ -774,7 +895,7 @@ fn fetch(
             break;
         }
     }
-    Ok((bytes, sources))
+    Ok((bytes, sources, pages))
 }
 
 impl Vcpu {

@@ -4832,10 +4832,16 @@ where
                     // Central address lowering supplies the wrapped offset.
                     // There is no segment access, page walk or operand read.
                     if PAGED {
-                        let _linear = cpu.legacy.segments[*segment as usize]
+                        let linear = cpu.legacy.segments[*segment as usize]
                             .base
                             .wrapping_add(read_val(*offset, temps) as u32);
-                        outcome.translations_invalidated = true;
+                        // The named page only: its generation advance ends
+                        // the block and revalidates retained proofs. Without
+                        // a TLB (a reference entry), flush everything.
+                        match mem.tlb() {
+                            Some(tlb) => tlb.borrow_mut().invalidate_page(linear),
+                            None => outcome.translations_invalidated = true,
+                        }
                     }
                 }
                 L::I486Cpuid { signature } => {

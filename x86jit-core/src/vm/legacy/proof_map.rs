@@ -29,9 +29,6 @@ struct SourceIndex<K> {
     // Why each dropped proof went, for the relift diagnostics (xj-to9.53).
     #[cfg(feature = "test-hooks")]
     history: EngineMap<K, Dropped>,
-    // The history's key for a proof's key (`set_history_key`).
-    #[cfg(feature = "test-hooks")]
-    history_key: Option<fn(&K) -> K>,
     // The largest `weight` since the last `take_peak_weight`.
     #[cfg(feature = "test-hooks")]
     peak: usize,
@@ -69,8 +66,6 @@ impl<K, V> Default for ProofMap<K, V> {
                 written: Vec::new(),
                 #[cfg(feature = "test-hooks")]
                 history: EngineMap::default(),
-                #[cfg(feature = "test-hooks")]
-                history_key: None,
                 #[cfg(feature = "test-hooks")]
                 peak: 0,
             }),
@@ -150,16 +145,17 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.remove_because(key, why!(Unpublished), None);
         // A key with no proof still names why it lifts again.
         #[cfg(feature = "test-hooks")]
-        if let Some(entry) = self
-            .index
-            .history
-            .get_mut(&self.index.history_key.map_or(*key, |f| f(key)))
-        {
+        if let Some(entry) = self.index.history.get_mut(key) {
             entry.cause = why!(Unpublished);
         } else {
             self.index
                 .remember(*key, why!(Unpublished), None, Box::default());
         }
+    }
+
+    /// Drop the proof for `key`, if any, recording why.
+    pub(super) fn remove(&mut self, key: &K, why: Why) {
+        self.remove_because(key, why, None);
     }
 
     fn remove_because(&mut self, key: &K, _why: Why, _write: Option<(u64, u64)>) {
@@ -184,15 +180,7 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     /// never held (or has forgotten). Relift diagnostics only.
     #[cfg(feature = "test-hooks")]
     pub(super) fn dropped(&self, key: &K) -> Option<&Dropped> {
-        let key = self.index.history_key.map_or(*key, |f| f(key));
-        self.index.history.get(&key)
-    }
-
-    /// Remember drops under `f(key)`: a paged proof's key names its TLB
-    /// generation, which a CR3 load or INVLPG advances.
-    #[cfg(feature = "test-hooks")]
-    pub(super) fn set_history_key(&mut self, f: fn(&K) -> K) {
-        self.index.history_key = Some(f);
+        self.index.history.get(key)
     }
 
     /// Insert a proof registered over `sources` (address, length) that
@@ -206,10 +194,7 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
             .map(|&(start, len)| (start, start.saturating_add(u64::from(len))))
             .collect();
         #[cfg(feature = "test-hooks")]
-        {
-            let key = self.index.history_key.map_or(key, |f| f(&key));
-            self.index.history.remove(&key);
-        }
+        self.index.history.remove(&key);
         for page in source_pages(&sources) {
             let keys = self.index.pages.entry(page).or_default();
             if !keys.contains(&key) {
@@ -368,7 +353,6 @@ impl<K: Copy + Eq + Hash> SourceIndex<K> {
         write: Option<(u64, u64)>,
         sources: Box<[(u64, u64)]>,
     ) {
-        let key = self.history_key.map_or(key, |f| f(&key));
         if self.history.len() >= HISTORY && !self.history.contains_key(&key) {
             self.history.clear();
         }

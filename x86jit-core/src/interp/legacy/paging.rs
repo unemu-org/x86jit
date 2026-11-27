@@ -399,25 +399,51 @@ const _: () = assert!(TLB_ENTRIES.is_power_of_two());
 
 /// Paging design §3.2 / decision-27: tokens are issued by the VM namespace,
 /// never per-vCPU counters. Removing or replacing an entry that an instruction
-/// fetch used conservatively expires source proofs. A data or stack entry
-/// backs no proof: fetch translates through its own entries, and a page
-/// whose fetch entry was replaced walks again and takes a new token.
+/// fetch used advances the generation: a source proof whose code pages were
+/// translated at an older generation translates them again before it is
+/// used (`vm/legacy/paging.rs`, xj-to9.70). A data or stack entry backs no
+/// proof: fetch translates through its own entries, and a page whose fetch
+/// entry was replaced walks again. Only a flush (`flushed`) expires every
+/// proof.
 pub(crate) struct Tlb {
     entries: [Option<Entry>; TLB_ENTRIES],
     pub(crate) generation: u64,
+    /// The generation the last flush issued: it names the translation
+    /// context (CR3 and every other walk input) the entries belong to.
+    pub(crate) flushed: u64,
     context: Option<(u32, u32, u8, u32)>,
     /// The pages of the running `tlb_lane`, reset when one starts.
     lane: LaneWindows,
+    /// Generation advances by site since the relift diagnostics last read
+    /// them (`crate::vm::TlbAdvance` order).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) advances: [u64; crate::vm::TLB_ADVANCES],
 }
 impl Default for Tlb {
     fn default() -> Self {
         Self {
             entries: [None; TLB_ENTRIES],
             generation: 0,
+            flushed: 0,
             context: None,
             lane: LaneWindows::default(),
+            #[cfg(feature = "test-hooks")]
+            advances: [0; crate::vm::TLB_ADVANCES],
         }
     }
+}
+
+/// Why a TLB generation advances, in `crate::vm::TlbAdvance` order.
+#[derive(Clone, Copy)]
+pub(crate) enum Advance {
+    ContextFlush,
+    ExplicitFlush,
+    Replaced,
+    FaultRemoved,
+    Rewalked,
+    DirtyFailed,
+    InvalidatePage,
+    LaneUndone,
 }
 impl Tlb {
     #[inline]
@@ -429,10 +455,59 @@ impl Tlb {
         ((page ^ (page >> 8) ^ (page >> 16)) as usize) & (TLB_ENTRIES - 1)
     }
 
+    /// Advance the generation, counting why.
+    #[inline(always)]
+    fn advance(&mut self, _why: Advance) {
+        self.generation = crate::vm::paging_generation();
+        #[cfg(feature = "test-hooks")]
+        {
+            self.advances[_why as usize] += 1;
+        }
+    }
+
+    /// Flush every entry: a CR3 load, a reset or an explicit invalidation.
     pub(crate) fn invalidate(&mut self) {
+        self.flush(Advance::ExplicitFlush);
+    }
+
+    fn flush(&mut self, why: Advance) {
         self.entries.fill(None);
         self.context = None;
-        self.generation = crate::vm::paging_generation();
+        self.advance(why);
+        self.flushed = self.generation;
+    }
+
+    /// INVLPG: remove the entry of `linear`'s page (paging design §3.2;
+    /// Intel486 PRM §26 INVLPG p. 26-172; SDM Vol 3A §5.10.4.1 pp. 5-48-49).
+    /// As any removal, one a fetch used advances the generation, so every
+    /// retained proof translates its code pages again before it runs; INVLPG
+    /// is a singleton block, so no block runs on past it. A data or stack
+    /// entry backs no proof.
+    pub(crate) fn invalidate_page(&mut self, linear: u32) {
+        let slot = &mut self.entries[Self::index(linear)];
+        if slot.is_some_and(|e| e.page == linear >> 12) {
+            self.remove(linear, Advance::InvalidatePage);
+        }
+    }
+
+    /// The physical address of an instruction fetch of `linear` that this
+    /// TLB holds a permitted entry for, marking the entry fetched; `None`
+    /// when a fetch would walk (`translate_linear`'s hit path, without its
+    /// fault or rewalk arms). The context must be reconciled.
+    pub(crate) fn fetch_hit(&mut self, cpu: &CpuState, linear: u32) -> Option<u32> {
+        let privilege = if cpu.legacy.cpl == 3 {
+            Privilege::User
+        } else {
+            Privilege::Supervisor
+        };
+        let e = self.entries[Self::index(linear)]
+            .as_mut()
+            .filter(|e| e.page == linear >> 12)?;
+        if !permitted(cpu, AccessKind::Execute, privilege, e.rights) {
+            return None;
+        }
+        e.fetched = true;
+        Some((e.translation.physical & FRAME) | (linear & 0xfff))
     }
 
     pub(crate) fn reconcile(&mut self, cpu: &CpuState) {
@@ -446,7 +521,11 @@ impl Tlb {
             cpu.machine_flags_mask,
         );
         if self.context != Some(context) {
-            self.invalidate();
+            // A flush leaves no context and no entries: naming the new one
+            // needs no second flush.
+            if self.context.is_some() {
+                self.flush(Advance::ContextFlush);
+            }
             self.context = Some(context);
         }
     }
@@ -466,6 +545,10 @@ impl Tlb {
         let saved = std::mem::take(&mut self.lane.saved);
         for (index, entry) in saved.into_iter().flatten().rev() {
             self.entries[index] = entry;
+        }
+        #[cfg(feature = "test-hooks")]
+        if self.generation != self.lane.generation {
+            self.advances[Advance::LaneUndone as usize] += 1;
         }
         self.generation = self.lane.generation;
     }
@@ -493,17 +576,17 @@ impl Tlb {
             .collect()
     }
 
-    fn remove(&mut self, linear: u32) {
+    fn remove(&mut self, linear: u32, why: Advance) {
         let slot = &mut self.entries[Self::index(linear)];
         if slot.take().is_some_and(|e| e.fetched) {
-            self.generation = crate::vm::paging_generation();
+            self.advance(why);
         }
     }
 
     fn insert(&mut self, linear: u32, translation: Translation, rights: u32, fetched: bool) {
         let index = Self::index(linear);
         if self.entries[index].is_some_and(|e| e.fetched && e.page != linear >> 12) {
-            self.generation = crate::vm::paging_generation();
+            self.advance(Advance::Replaced);
         }
         self.entries[index] = Some(Entry {
             page: linear >> 12,
@@ -855,7 +938,7 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
             {
                 // SDM Vol 3A §5.10.4.1 p. 5-49: #PF invalidates the
                 // faulting translation, including its instruction-source proof.
-                tlb.remove(linear);
+                tlb.remove(linear, Advance::FaultRemoved);
                 return Err(PageFault {
                     linear,
                     access,
@@ -879,7 +962,7 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
                     ..e.translation
                 });
             }
-            tlb.remove(linear);
+            tlb.remove(linear, Advance::Rewalked);
         }
     }
     loop {
@@ -1002,7 +1085,7 @@ fn complete_dirty<const ROUTED: bool, const ORDER: u8>(
         .is_none()
         {
             if let Some(tlb) = mem.tlb() {
-                tlb.borrow_mut().remove(f.linear);
+                tlb.borrow_mut().remove(f.linear, Advance::DirtyFailed);
             }
             return Ok(false);
         }
@@ -1822,7 +1905,7 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
             .is_none()
             {
                 if let Some(tlb) = mem.tlb() {
-                    tlb.borrow_mut().remove(f.linear);
+                    tlb.borrow_mut().remove(f.linear, Advance::DirtyFailed);
                 }
                 return Ok(false);
             }

@@ -259,6 +259,6 @@ pub use vm::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
 #[cfg(feature = "test-hooks")]
 pub use vm::{
     GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
-    ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass,
+    ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass, TlbAdvance, TlbStats,
 };
 pub use x87::FpuKind;

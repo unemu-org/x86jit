@@ -225,7 +225,7 @@ fn reloading_fs_keeps_flat32_proofs() {
 }
 
 /// A paged loop: a hot inner loop of 10 blocks, which links, then a sweep
-/// of 300 blocks, more than the 256 paged proofs kept, each adding its own
+/// of 4200 blocks, more than the 4096 paged proofs kept, each adding its own
 /// immediate. The sweep fills the map, which drops a quarter of its proofs
 /// (the links into them end with the map's version); the hot loop entered
 /// again relinks, and every block executes its own bytes, so the sum is
@@ -235,7 +235,7 @@ fn a_full_paged_proof_map_drops_a_quarter_and_relinks() {
     const PD: u32 = 0x4000;
     const PT: u32 = 0x5000;
     const HOT: u32 = 10;
-    const SWEEP: u32 = 300;
+    const SWEEP: u32 = 4200;
     const INNER: u32 = 50;
     let block = |c: &mut Vec<u8>, imm: u32| {
         // ADD EBX, imm32 (81 C3 id); JMP $+2.
@@ -244,7 +244,7 @@ fn a_full_paged_proof_map_drops_a_quarter_and_relinks() {
         c.extend([0xeb, 0x00]);
     };
     // top: MOV ECX, INNER; hot: HOT blocks; DEC ECX; JNZ hot (rel32);
-    // SWEEP blocks; DEC EDI; JNZ top (rel32); HLT. 2.5 KiB, one page.
+    // SWEEP blocks; DEC EDI; JNZ top (rel32); HLT. About 33 KiB.
     let mut c = vec![0xb9];
     c.extend(INNER.to_le_bytes());
     let hot = c.len() as i64;
@@ -263,7 +263,7 @@ fn a_full_paged_proof_map_drops_a_quarter_and_relinks() {
     c.extend([0x0f, 0x85]);
     c.extend((rel as i32).to_le_bytes());
     c.push(0xf4);
-    assert!(c.len() < 0x1000);
+    assert!(CODE + (c.len() as u64) < SIZE);
     let (vm, mut cpu) = setup(&c);
     // 80386 PRM §5.2 pp. 5-7–11: identity-map the RAM, present, writable.
     vm.write_bytes(u64::from(PD), &(PT | 3).to_le_bytes())
@@ -288,7 +288,10 @@ fn a_full_paged_proof_map_drops_a_quarter_and_relinks() {
     );
     // A cleared map would relift about every sweep block of every pass.
     let blocks = u64::from(HOT + SWEEP + 3);
-    assert!(lifts <= blocks + (N - 1) * 200, "{lifts} lifts\n{d}");
+    assert!(
+        lifts <= blocks + (N - 1) * u64::from(SWEEP) / 2,
+        "{lifts} lifts\n{d}"
+    );
     assert!(links > N, "{links} links\n{d}");
 }
 
@@ -351,4 +354,55 @@ fn a_reflection_path_through_many_contexts_keeps_identities() {
     assert_eq!(d.contexts.evicted, 0, "{d}");
     // Every block lifts once: no identity, so no key, is minted twice.
     assert!(d.total(None) <= 4 * u64::from(SELECTORS) + 30, "{d}");
+}
+
+/// A paged ring-0 loop that turns the TLB over (xj-to9.70,
+/// `x86jit_tests::paged_churn`): every iteration reads 20 pages of a 4 MiB
+/// sweep, so fills replace the entries its code was fetched through, runs
+/// INVLPG on a data page, sets CR0.TS before a V86 round trip through a #GP
+/// monitor and clears it with CLTS, and loads a second data selector. Each
+/// eviction advances the TLB generation, and the proofs translate their code
+/// pages again instead of relifting: the loop lifts each block entry once.
+#[test]
+fn a_paged_loop_that_turns_the_tlb_over_lifts_each_block_once() {
+    use x86jit_tests::paged_churn;
+    const ITERATIONS: u32 = 300;
+    let (vm, mut cpu) = paged_churn::setup(CpuModel::I80486Dx, ITERATIONS);
+    vm.relift_diagnostics(true);
+    run(&vm, &mut cpu);
+    let d = vm.relift_diagnostics(true);
+    assert_eq!(
+        cpu.retired_instructions(),
+        paged_churn::expected_retired(ITERATIONS),
+        "{d}"
+    );
+    assert_eq!(cpu.cpu.gpr[5] as u32, paged_churn::expected_sum(ITERATIONS));
+    let mut word = [0; 4];
+    vm.read_bytes(paged_churn::MONITOR_COUNTER, &mut word)
+        .unwrap();
+    assert_eq!(u32::from_le_bytes(word), ITERATIONS);
+    vm.read_bytes(paged_churn::V86_COUNTER, &mut word[..2])
+        .unwrap();
+    assert_eq!(
+        u32::from(u16::from_le_bytes([word[0], word[1]])),
+        3 * ITERATIONS
+    );
+    let paged = Some(ProofClass::Paged);
+    let first = d.lifts(paged, ReliftCause::First);
+    assert_eq!(d.total(paged), first, "{d}");
+    assert!(first < 64, "{d}");
+    // The sweep evicted fetch entries; their proofs revalidated and held.
+    assert!(
+        d.tlb
+            .advances
+            .iter()
+            .any(|&(why, n)| why == x86jit_core::TlbAdvance::Replaced && n > 0),
+        "{d}"
+    );
+    assert!(d.tlb.revalidated > 0, "{d}");
+    assert_eq!(d.tlb.revalidation_failed, 0, "{d}");
+    // One key per entry address: neither the generation nor CR0.TS is one.
+    assert_eq!(d.keys.keys, d.keys.sites, "{d}");
+    // The dispatcher's context notes reach the paged diagnostics.
+    assert!(d.contexts.switches >= u64::from(ITERATIONS), "{d}");
 }

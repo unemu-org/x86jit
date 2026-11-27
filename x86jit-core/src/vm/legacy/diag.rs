@@ -92,7 +92,7 @@ pub enum ReliftCause {
     Promotion,
     /// A gap in the write record dropped every proof.
     Gap(GapKind),
-    /// The proof map reached its bound (8192 unpaged, 256 paged) and swept
+    /// The proof map reached its bound (8192 unpaged, 4096 paged, or their IR budgets) and swept
     /// a quarter of its proofs.
     Bound,
     /// The proof's context identity was evicted from the retained contexts
@@ -101,9 +101,14 @@ pub enum ReliftCause {
     ContextEvicted,
     /// A mapping change dropped every proof.
     Mapping,
-    /// Paged only: a TLB generation change (CR3, INVLPG, CR0/CR4 paging
-    /// bits), a full context table or a reset dropped every proof.
+    /// Paged only: a TLB flush (a CR3 load, a change of CR0's paging bits,
+    /// A20 or the model, an explicit invalidation), a full context table or
+    /// a reset dropped every proof.
     Paging,
+    /// Paged only: after a TLB generation advance (an eviction or INVLPG of
+    /// a page a fetch used), a code page of the proof no longer translated
+    /// to the frame it was fetched from, or its fetch would fault.
+    Translation,
     /// The proof's fetch permit went stale.
     Permit,
     /// The lift was repeated inside the same resolve.
@@ -130,6 +135,7 @@ impl ReliftCause {
         Self::ContextEvicted,
         Self::Mapping,
         Self::Paging,
+        Self::Translation,
         Self::Permit,
         Self::Retry(RetryKind::SourceChanged),
         Self::Retry(RetryKind::Demotion),
@@ -141,7 +147,60 @@ impl ReliftCause {
         Self::ALL.iter().position(|&c| c == self).unwrap()
     }
 }
-const CAUSES: usize = 21;
+const CAUSES: usize = 22;
+
+/// Why a paged vCPU's TLB generation advanced (xj-to9.70). A generation
+/// names the TLB's fetched entries: it advances when one of them leaves or is
+/// replaced, and with every flush. Paged proofs revalidate their code pages
+/// against the TLB once per generation (`paging.rs`); only a flush drops them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TlbAdvance {
+    /// The translation context changed: CR3, CR0.PG/CD/NW/WP/PE, A20 or the
+    /// model's flags mask (`Tlb::reconcile`).
+    ContextFlush,
+    /// An explicit flush: a CR3 load (equal values too), a task switch's CR3,
+    /// a reset, a mapping change or the embedder's paging invalidation.
+    ExplicitFlush,
+    /// A fill replaced a fetched entry of another page (eviction).
+    Replaced,
+    /// A #PF on a cached entry removed a fetched one.
+    FaultRemoved,
+    /// A write through a clean fetched entry, or a 486 protection retry,
+    /// removed it to walk again (paging design §3.2).
+    Rewalked,
+    /// A failed D-bit update removed a fetched entry.
+    DirtyFailed,
+    /// INVLPG of a page.
+    InvalidatePage,
+    /// A replayed lane restored its slots and their generation.
+    LaneUndone,
+}
+
+impl TlbAdvance {
+    pub const ALL: [Self; TLB_ADVANCES] = [
+        Self::ContextFlush,
+        Self::ExplicitFlush,
+        Self::Replaced,
+        Self::FaultRemoved,
+        Self::Rewalked,
+        Self::DirtyFailed,
+        Self::InvalidatePage,
+        Self::LaneUndone,
+    ];
+}
+pub(crate) const TLB_ADVANCES: usize = 8;
+
+/// Paged-proof translation checks (xj-to9.70): the TLB generation advances by
+/// site, and the proof hits that revalidated their code pages after one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlbStats {
+    /// Generation advances by site; nonzero only.
+    pub advances: Vec<(TlbAdvance, u64)>,
+    /// Proof hits that translated their code pages again: the frames
+    /// matched and the proof was kept, or one differed and it relifted.
+    pub revalidated: u64,
+    pub revalidation_failed: u64,
+}
 
 /// Why a patched range was not read live; it then relifts on every patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -469,6 +528,8 @@ pub(crate) struct Diag {
     refused: Mutex<VecDeque<RefusalRecord>>,
     contexts: Mutex<Contexts>,
     keys: Mutex<Keys>,
+    tlb: [AtomicU64; TLB_ADVANCES],
+    revalidated: [AtomicU64; 2],
 }
 
 fn push<T>(ring: &Mutex<VecDeque<T>>, item: T) {
@@ -513,6 +574,18 @@ impl Diag {
     }
     pub(crate) fn record(&self, record: ReliftRecord) {
         push(&self.recent, record);
+    }
+    /// Add a vCPU's TLB generation advances, by `TlbAdvance` index.
+    pub(crate) fn tlb(&self, advances: &mut [u64; TLB_ADVANCES]) {
+        for (counter, n) in self.tlb.iter().zip(advances.iter_mut()) {
+            if *n != 0 {
+                counter.fetch_add(std::mem::take(n), Relaxed);
+            }
+        }
+    }
+    /// A proof hit revalidated its code pages: kept (`true`) or not.
+    pub(crate) fn revalidated(&self, kept: bool) {
+        self.revalidated[usize::from(!kept)].fetch_add(1, Relaxed);
     }
 
     /// Note a lift of `key`; returns the key's text and its difference from
@@ -631,6 +704,16 @@ impl Diag {
                 }
                 stats
             },
+            tlb: TlbStats {
+                advances: TlbAdvance::ALL
+                    .into_iter()
+                    .zip(&self.tlb)
+                    .map(|(a, n)| (a, read(n)))
+                    .filter(|&(_, n)| n != 0)
+                    .collect(),
+                revalidated: read(&self.revalidated[0]),
+                revalidation_failed: read(&self.revalidated[1]),
+            },
         }
     }
 }
@@ -690,6 +773,8 @@ pub struct ReliftDiagnostics {
     /// Distinct proof keys per entry address, and the key fields that
     /// changed between lifts at one address.
     pub keys: KeyStats,
+    /// Paged TLB generation advances and proof revalidations.
+    pub tlb: TlbStats,
 }
 
 impl ReliftDiagnostics {
@@ -803,6 +888,16 @@ impl fmt::Display for ReliftDiagnostics {
         for (field, n) in &k.changes_by_field {
             writeln!(f, "  key changed at one address, {field}: {n}")?;
         }
+        let t = &self.tlb;
+        write!(
+            f,
+            "  tlb: revalidated {} failed {}",
+            t.revalidated, t.revalidation_failed
+        )?;
+        for (site, n) in &t.advances {
+            write!(f, " {site:?} {n}")?;
+        }
+        writeln!(f)?;
         for r in &self.refused {
             let (at, bytes, text) = &r.instruction;
             writeln!(

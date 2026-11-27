@@ -32,6 +32,8 @@ pub mod fuzz;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native;
 pub mod oracle;
+// The paged TLB-churn loop shared by a relift witness and a measurement.
+pub mod paged_churn;
 // Guest snippets shared by the differential and JIT suites — one copy, so the two
 // legs cannot drift onto different programs.
 pub mod snippets;
