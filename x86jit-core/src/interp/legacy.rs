@@ -666,7 +666,7 @@ impl<const ROUTED: bool, const ORDER: u8, M: LegacyMemory<ROUTED, ORDER>>
     const PAGED: bool = M::PAGED;
     // Windows carry their privilege; a supervisor access finds only a
     // supervisor-proved window (`paging::FastOperand`). Only strict lanes
-    // make system accesses: `fast_instruction` admits none.
+    // make system accesses: the `Fast` class admits none (`paging::classify`).
     fn fast_operand(&self) -> Option<&paging::FastOperand> {
         let operand = self.0.fast_operand();
         debug_assert!(
@@ -2921,6 +2921,7 @@ pub(crate) fn execute_instructions_from<const ROUTED: bool, const ORDER: u8>(
     let mask = legacy::physical_mask(context.generation);
     let mut pass = BlockPass::<ROUTED, ORDER, false, false>::new(
         ir,
+        &[],
         context,
         memory,
         LegacyAccess::new(memory, mask),
@@ -2961,6 +2962,9 @@ pub(super) enum Lane {
     Registers,
     /// Paged operands preflighted from the TLB (`paging::FastOperand`).
     Fast,
+    /// The Fast lane of an instruction whose operand window is still to be
+    /// proved at its first access, for a write or a read (`paging::Class::Fast`).
+    Lazy { write: bool },
     /// A system lane over proved windows that replays on a miss.
     Strict,
     /// The two-phase operand transaction.
@@ -3005,8 +3009,9 @@ pub(super) struct BlockPass<
     task_switch: &'a mut tasks::SwitchState,
     exit_word: &'a std::sync::atomic::AtomicU64,
     limit: u64,
-    /// The paged walk's TLB and its generation at block entry.
-    tlb: Option<(&'a std::cell::RefCell<paging::Tlb>, u64)>,
+    /// The paged walk's TLB, its generation at block entry and the block's
+    /// instruction table (`paging::lanes_into`).
+    tlb: Option<(&'a std::cell::RefCell<paging::Tlb>, u64, &'a [paging::Insn])>,
     /// No transaction is retained; read where each walk segment starts, as
     /// only a yielded instruction changes it.
     retry_none: bool,
@@ -3033,6 +3038,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
     #[inline(always)]
     fn new(
         ir: &'a IrBlock,
+        insns: &'a [paging::Insn],
         context: MachineContext,
         memory: &'a Memory,
         registers: LegacyAccess<'a, ROUTED, ORDER>,
@@ -3044,7 +3050,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         let tlb = paged
             .as_ref()
             .and_then(|paged| paged.paging.tlb)
-            .map(|tlb| (tlb, tlb.borrow().generation));
+            .map(|tlb| (tlb, tlb.borrow().generation, insns));
         Self {
             ir,
             context,
@@ -3144,10 +3150,11 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         }
     }
 
-    /// Enter the instruction at `at`. The paged walk locates it and chooses
-    /// its lane at once; the unpaged walk locates it only when an op of its
-    /// own, a failure or the walk's end needs its bounds (`locate`), and
-    /// otherwise learns its end at the next instruction's marker.
+    /// Enter the instruction at `at`. The paged walk takes its bounds and
+    /// lane class from the block's table and chooses its lane at once; the
+    /// unpaged walk locates it only when an op of its own, a failure or the
+    /// walk's end needs its bounds (`locate`), and otherwise learns its end
+    /// at the next instruction's marker.
     #[inline(always)]
     fn prepare(&mut self, at: usize, guest_addr: u64, cpu: &mut CpuState, temps: &mut [u64]) {
         self.start = at;
@@ -3162,9 +3169,23 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
             proven: true,
         };
         if LANES {
-            self.locate();
-            let (tlb, _) = self.tlb.expect("paged walk");
+            let (tlb, _, insns) = self.tlb.expect("paged walk");
+            let insn = insns[at];
+            self.end = insn.end as usize;
+            self.view.ops = &self.ir.ops[at..self.end];
+            self.view.guest_len = insn.len;
+            #[cfg(debug_assertions)]
+            {
+                // The table holds `locate`'s bounds.
+                self.end = 0;
+                self.locate();
+                debug_assert_eq!(
+                    (self.end, self.view.guest_len),
+                    (insn.end as usize, insn.len)
+                );
+            }
             (self.lane, self.fast) = paging::ordinary_lane(
+                insn.class,
                 &self.view,
                 cpu,
                 self.memory,
@@ -3211,7 +3232,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
     /// `execute_instruction`'s entry for an instruction the walk runs.
     #[inline(always)]
     fn begin(&mut self, cpu: &CpuState) {
-        if LANES && self.lane == Lane::Fast {
+        if LANES && matches!(self.lane, Lane::Fast | Lane::Lazy { .. }) {
             let paged = self.paged.as_mut().expect("paged walk");
             paged.paging.fast_operand = self.fast;
             paged.read_index.set(0);
@@ -3241,6 +3262,66 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
             ..Outcome::default()
         };
         self.in_flight = true;
+    }
+
+    /// An op of a `Fast` instruction before its operand is proved, on the
+    /// Fast lane's adapter. Its first Load or Store proves the window its
+    /// class names (`paging::access_operand`) for the linear address the
+    /// walk computed and then runs as on the Fast lane; the ops before it
+    /// change only temporaries. A refusal, or any failure or transfer before
+    /// it, sends the instruction to the transaction lane (`abandon`). Kept
+    /// apart from `execute`, whose result match stays as the other lanes
+    /// have it.
+    #[inline(always)]
+    fn lazy(&mut self, op: &IrOp, cpu: &mut CpuState, temps: &mut [u64]) -> Option<WalkResult> {
+        let Lane::Lazy { write } = self.lane else {
+            unreachable!("a lazy Fast instruction")
+        };
+        let access = matches!(op, IrOp::Load { .. } | IrOp::Store { .. });
+        if let IrOp::Load { addr, size, .. } | IrOp::Store { addr, size, .. } = op {
+            let (tlb, ..) = self.tlb.expect("paged walk");
+            let linear = read_val(*addr, temps);
+            let Some(operand) = paging::access_operand(cpu, self.memory, tlb, linear, *size, write)
+            else {
+                return self.abandon();
+            };
+            self.lane = Lane::Fast;
+            self.fast = Some(operand);
+            self.paged.as_mut().expect("paged walk").paging.fast_operand = self.fast;
+        }
+        let result = execute_op::<ROUTED, ORDER, true, V86>(
+            op,
+            &self.view,
+            cpu,
+            self.paged.as_ref().expect("paged walk"),
+            temps,
+            self.context,
+            self.task_switch,
+            &mut self.outcome,
+        );
+        match result {
+            Ok(false) => None,
+            Ok(true) if access => Some(WalkResult::Continue),
+            Err(exit) if access => self.failed(op, exit, cpu, temps),
+            // Before its operand is proved the instruction has changed only
+            // temporaries: the transaction lane runs it instead.
+            _ => self.abandon(),
+        }
+    }
+
+    /// A `Fast` instruction left before its operand was proved, with only
+    /// temporaries changed: the transaction lane runs it from its start, as
+    /// for an instruction whose operand the TLB does not prove.
+    #[cold]
+    #[inline(never)]
+    fn abandon(&mut self) -> Option<WalkResult> {
+        debug_assert!(LANES && matches!(self.lane, Lane::Lazy { .. }) && self.fast.is_none());
+        self.in_flight = false;
+        self.before = None;
+        self.lane = Lane::Transaction;
+        self.outcome = Outcome::default();
+        self.flow = Some(Flow::Yield);
+        Some(WalkResult::Continue)
     }
 
     /// `execute_instruction`'s exit for an instruction the walk completed:
@@ -3409,7 +3490,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         self.in_flight = false;
         self.locate();
         let before = self.before.take();
-        if LANES && self.lane == Lane::Fast {
+        if LANES && matches!(self.lane, Lane::Fast | Lane::Lazy { .. }) {
             leave_instruction(
                 Err(exit),
                 &self.view,
@@ -3466,6 +3547,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
                     self.task_switch,
                 )
             }
+            Lane::Lazy { .. } => unreachable!("a lane on its own is proved before it runs"),
             Lane::Strict => {
                 self.paged.as_mut().expect("paged walk").paging.fast_operand = self.fast;
                 paging::strict_instruction::<ROUTED, ORDER, V86>(
@@ -3519,7 +3601,7 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         // returns (`Memory::note_code_write`, `ChildDispatch::notify`).
         let polled = || self.exit_word.load(std::sync::atomic::Ordering::Relaxed) != 0;
         if LANES {
-            let (tlb, token) = self.tlb.expect("paged walk");
+            let (tlb, token, _) = self.tlb.expect("paged walk");
             if last
                 || self.steps == self.limit
                 || outcome.exit.is_some()
@@ -3592,6 +3674,9 @@ impl<const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool>
     #[inline(always)]
     fn execute(&mut self, op: &IrOp, cpu: &mut CpuState, temps: &mut [u64]) -> Option<WalkResult> {
         self.locate();
+        if LANES && matches!(self.lane, Lane::Lazy { .. }) {
+            return self.lazy(op, cpu, temps);
+        }
         let result = if LANES && self.lane == Lane::Fast {
             execute_op::<ROUTED, ORDER, true, V86>(
                 op,
@@ -3668,6 +3753,10 @@ impl<const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool>
             || (LANES && matches!(self.lane, Lane::Strict | Lane::Transaction))
         {
             self.locate();
+            if LANES && matches!(self.lane, Lane::Lazy { .. }) {
+                // A lane on its own has its operand proved before it runs.
+                self.lane = Lane::Transaction;
+            }
             self.flow = Some(Flow::Yield);
             return Some(WalkResult::Continue);
         }

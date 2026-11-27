@@ -84,9 +84,10 @@ struct Window {
 /// before any window write, and replays on the transaction path. Its only
 /// earlier commit is the descriptor's accessed-bit CAS (`strict_lane`).
 ///
-/// A non-strict operand is installed only by `fast_instruction`, whose
-/// admitted operations make no system (`Supervisor`) or task-stage
-/// (`AddressKeyed`) access; those views assert that they never meet one.
+/// A non-strict operand is installed only by a `Fast` instruction's first
+/// access (`access_operand`), whose class (`classify`) admits operations that
+/// make no system (`Supervisor`) or task-stage (`AddressKeyed`) access; those
+/// views assert that they never meet one.
 #[derive(Clone, Copy)]
 pub(crate) struct FastOperand {
     windows: [Option<Window>; 2],
@@ -166,7 +167,7 @@ impl FastOperand {
         let found = self.windows[1].filter(fits);
         if found.is_none() {
             // A non-strict operand covers the whole access set of the
-            // instructions `fast_instruction` admits; no system access.
+            // instructions of the `Fast` class (`classify`); no system access.
             debug_assert!(self.strict, "an access outside the proved operand");
             // A lane proved access by access has no windows: its caller
             // proves the access (`lane_access`).
@@ -534,7 +535,7 @@ fn permitted(cpu: &CpuState, access: AccessKind, privilege: Privilege, rights: u
 #[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     /// The lanes that skip the transaction (`tlb_lane`, and the
-    /// read-modify-write operand of `fast_instruction`) are off.
+    /// read-modify-write operand of the `Fast` class) are off.
     static FAST_LANES_OFF: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -2721,7 +2722,7 @@ fn register_effect(op: &IrOp) -> bool {
 /// a register write before a faulting op carries the lift's checkpoint, which
 /// `execute_instruction` restores, as for the Jcc and JMP target checks of
 /// `Branch` and `Jump`. The check stays out of `register_effects`, whose
-/// other caller, `fast_instruction`, admits a CS check only after a load and
+/// other caller, `classify`, admits a CS check only after a load and
 /// never after a store.
 fn register_lane(ops: &[IrOp]) -> bool {
     ops.iter().all(|op| {
@@ -3356,12 +3357,271 @@ fn strict_lane<const ROUTED: bool, const ORDER: u8>(
     None
 }
 
-/// Prove the entire instruction before transferring RAM. Address preparation
-/// reuses the shared integer helpers with flags disabled and changes only temps.
-/// A second operand, a locked operation or an unclassified effect falls back.
-/// ENTER and LEAVE never arrive: `flat32_ordinary` keeps them out of ordinary
-/// blocks, and their SS-relative frames go through the transaction path.
-fn fast_instruction(
+/// How an instruction of a paged ordinary block takes its lane: the part of
+/// `ordinary_lane` that depends only on its ops, decided once per block when
+/// its proof is made (`lanes`). A class is a promise about the ops alone; the
+/// run-time proof (`ordinary_lane`, and a `Fast` instruction's first access)
+/// can still send the instruction to the operand transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Class {
+    /// `register_lane`: register effects and a near JMP's CS target check.
+    Registers,
+    /// No proved lane admits these ops: the operand transaction.
+    Transaction,
+    /// MOV Sreg from a register (`data_segment_load`) after ops that write
+    /// only temporaries, then register effects only: the descriptor window
+    /// is proved before the instruction runs (`segment_operand`) and the
+    /// strict lane runs it.
+    Segment,
+    /// One RAM operand after ops that write only temporaries, then register
+    /// effects only: the walk runs the instruction and proves the operand's
+    /// window from the TLB at its first access (`access_operand`). The
+    /// operand is a Store's, a Load's, or a read-modify-write's (ADD, INC,
+    /// shifts and the like to memory): a Load and one Store to the same
+    /// address temporary and width. `write` is the access the window is
+    /// proved for, a Store's for a read-modify-write, whose write window also
+    /// admits the load before it; both transfers then hit RAM through one
+    /// translation, as the transaction's would (SDM Vol 3A §5.6.1; 80386 PRM
+    /// §6.4.1 p. 6-20).
+    Fast { write: bool, rmw: bool },
+}
+
+/// One instruction of a paged ordinary block, at its `InsnStart` index in the
+/// block's table (`lanes`): the op index where it ends (the next marker, or
+/// the block's end), its guest length and its lane class.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Insn {
+    pub(super) end: u32,
+    pub(super) len: u32,
+    pub(super) class: Class,
+}
+
+/// The instruction table of a paged ordinary block: one entry per op,
+/// meaningful at each `InsnStart` (`Insn`). Built once per proof
+/// (`vm::legacy::paging`) and for a block that runs without one.
+pub(crate) fn lanes_into(ir: &IrBlock, insns: &mut Vec<Insn>) {
+    let ops = &ir.ops;
+    insns.clear();
+    insns.resize(
+        ops.len(),
+        Insn {
+            end: 0,
+            len: 0,
+            class: Class::Transaction,
+        },
+    );
+    let mut at = 0;
+    while at < ops.len() {
+        let IrOp::InsnStart { guest_addr } = ops[at] else {
+            unreachable!("instruction marker")
+        };
+        let end = ops[at + 1..]
+            .iter()
+            .position(|op| matches!(op, IrOp::InsnStart { .. }))
+            .map_or(ops.len(), |offset| at + 1 + offset);
+        let next = match ops.get(end) {
+            Some(IrOp::InsnStart { guest_addr }) => *guest_addr,
+            _ => ir.guest_start + u64::from(ir.guest_len),
+        };
+        insns[at] = Insn {
+            end: end as u32,
+            len: (next - guest_addr) as u32,
+            class: classify(&ops[at..end]),
+        };
+        at = end;
+    }
+}
+
+/// [`lanes_into`] for a proof to keep.
+pub(crate) fn lanes(ir: &IrBlock) -> std::sync::Arc<[Insn]> {
+    let mut insns = Vec::new();
+    lanes_into(ir, &mut insns);
+    insns.into()
+}
+
+/// The lane class of one instruction's ops (`Class`).
+pub(super) fn classify(ops: &[IrOp]) -> Class {
+    if register_lane(ops) {
+        return Class::Registers;
+    }
+    let Some(at) = ops.iter().position(|op| !prepares(op)) else {
+        return Class::Transaction;
+    };
+    let rest = &ops[at + 1..];
+    match &ops[at] {
+        IrOp::Legacy(op @ L::LoadSegment { .. })
+            if super::data_segment_load(op).is_some() && register_effects(rest) =>
+        {
+            Class::Segment
+        }
+        IrOp::Store { .. } if register_effects(rest) => Class::Fast {
+            write: true,
+            rmw: false,
+        },
+        IrOp::Load {
+            dst, addr, size, ..
+        } => {
+            // A near RET checks its target immediately after loading a 16/32-bit
+            // offset. Flat32 CS admits every such offset (decision-27). A Segmented
+            // or V86 target check still runs, and can fault, in the execution: it
+            // follows only the load, so a fault leaves RAM and registers as
+            // they were (SDM Vol 2B RET, Protected Mode Exceptions).
+            let checked = *size <= 4
+                && rest.first().is_some_and(|op| {
+                    matches!(op,
+                        IrOp::Legacy(L::Flat32Address { segment: SegmentId::Cs,
+                            offset, bytes: 1, access: AccessKind::Execute, .. }
+                        | L::SegmentedAddress { segment: SegmentId::Cs,
+                            offset, bytes: 1, access: AccessKind::Execute, .. }
+                        | L::Address { segment: SegmentId::Cs,
+                            offset, bytes: 1, access: AccessKind::Execute, .. })
+                            if *offset == Val::Temp(*dst)
+                    )
+                });
+            let rest = &rest[usize::from(checked)..];
+            let Some(at) = rest.iter().position(|op| !register_effect(op)) else {
+                return Class::Fast {
+                    write: false,
+                    rmw: false,
+                };
+            };
+            match &rest[at] {
+                IrOp::Store {
+                    addr: a, size: s, ..
+                } if a == addr && s == size && register_effects(&rest[at + 1..]) => Class::Fast {
+                    write: true,
+                    rmw: true,
+                },
+                _ => Class::Transaction,
+            }
+        }
+        _ => Class::Transaction,
+    }
+}
+
+/// The ops a proved lane may run before its operand: they write only
+/// temporaries (`prepare`). The alignment-refusal regime is excluded before
+/// any proved lane (`ordinary_lane`), so the 486 gate admits.
+fn prepares(op: &IrOp) -> bool {
+    match op {
+        IrOp::InsnStart { .. }
+        | IrOp::Legacy(
+            L::Checkpoint
+            | L::I486Gate
+            | L::LiveField { .. }
+            | L::SegmentedAddress { .. }
+            | L::Flat32Address { .. }
+            | L::Address { .. },
+        )
+        | IrOp::ReadReg { .. } => true,
+        IrOp::Add { set_flags, .. }
+        | IrOp::Sub { set_flags, .. }
+        | IrOp::And { set_flags, .. }
+        | IrOp::Shl { set_flags, .. } => *set_flags == FlagMask::NONE,
+        _ => false,
+    }
+}
+
+/// One op `prepares` admits, as the instruction's execution would run it,
+/// into temporaries only; None where it would fault.
+fn prepare(
+    op: &IrOp,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    temps: &mut [u64],
+    context: MachineContext,
+) -> Option<()> {
+    match op {
+        IrOp::InsnStart { .. } | IrOp::Legacy(L::Checkpoint | L::I486Gate) => {}
+        IrOp::ReadReg { dst, reg } => temps[*dst as usize] = crate::interp::read_reg(cpu, *reg),
+        IrOp::Legacy(L::LiveField {
+            dst,
+            bus,
+            bytes,
+            extend,
+        }) => temps[*dst as usize] = super::live_field(memory, *bus, *bytes, *extend).ok()?,
+        IrOp::Add {
+            dst,
+            a,
+            b,
+            size,
+            set_flags,
+        } => {
+            crate::interp::integer::exec_add(cpu, temps, dst, a, b, size, set_flags);
+        }
+        IrOp::Sub {
+            dst,
+            a,
+            b,
+            size,
+            set_flags,
+        } => {
+            crate::interp::integer::exec_sub(cpu, temps, dst, a, b, size, set_flags);
+        }
+        IrOp::And {
+            dst,
+            a,
+            b,
+            size,
+            set_flags,
+        } => {
+            crate::interp::integer::exec_and(cpu, temps, dst, a, b, size, set_flags);
+        }
+        IrOp::Shl {
+            dst,
+            a,
+            b,
+            size,
+            set_flags,
+        } => {
+            crate::interp::integer::exec_shl(cpu, temps, dst, a, b, size, set_flags);
+        }
+        IrOp::Legacy(L::SegmentedAddress {
+            dst,
+            offset,
+            bytes,
+            proof,
+            ..
+        }) => {
+            temps[*dst as usize] = proof.address(read_val(*offset, temps), *bytes)?;
+        }
+        IrOp::Legacy(L::Flat32Address {
+            dst,
+            segment,
+            offset,
+            bytes,
+            access,
+        }) => {
+            temps[*dst as usize] =
+                flat32_address(cpu, *segment, read_val(*offset, temps), *bytes, *access).ok()?;
+        }
+        // The live Checked access: Flat32 FS/GS, Segmented operands after an
+        // in-block reload of their segment, and V86 (`execute_op`).
+        IrOp::Legacy(L::Address {
+            dst,
+            segment,
+            offset,
+            bytes,
+            access,
+        }) => {
+            let offset = read_val(*offset, temps);
+            temps[*dst as usize] = if context.regime == legacy::MachineRegime::Virtual8086 {
+                legacy::virtual8086_access(cpu, *segment, offset, *bytes, *access)
+            } else {
+                legacy::access(cpu, context.generation, *segment, offset, *bytes, *access)
+            }
+            .ok()?;
+        }
+        _ => unreachable!("an op `prepares` refuses: {op:?}"),
+    }
+    debug_assert!(prepares(op));
+    Some(())
+}
+
+/// The descriptor window of a `Segment` instruction, proved before it runs:
+/// the selector is known before the load (`descriptor_window`). None if an
+/// op before the load would fault: the transaction lane runs it then.
+fn segment_operand(
     ops: &[IrOp],
     cpu: &mut CpuState,
     memory: &Memory,
@@ -3369,198 +3629,59 @@ fn fast_instruction(
     temps: &mut [u64],
     context: MachineContext,
 ) -> Option<FastOperand> {
-    if memory.host_fault_recovery() || cpu.mmio_retry_active {
-        return None;
-    }
-    let mut operand = None;
-    let mut loaded_target = None;
-    let mut stored = false;
     for op in ops {
-        if operand.is_some() {
-            // A near RET checks its target immediately after loading a 16/32-bit
-            // offset. Flat32 CS admits every such offset (decision-27). A Segmented
-            // or V86 target check still runs, and can fault, in the execution: it
-            // follows only the load, so a fault leaves RAM and registers as
-            // they were (SDM Vol 2B RET, Protected Mode Exceptions).
-            if loaded_target.take().is_some_and(|target| {
-                matches!(op,
-                    IrOp::Legacy(L::Flat32Address { segment: SegmentId::Cs,
-                        offset, bytes: 1, access: AccessKind::Execute, .. }
-                    | L::SegmentedAddress { segment: SegmentId::Cs,
-                        offset, bytes: 1, access: AccessKind::Execute, .. }
-                    | L::Address { segment: SegmentId::Cs,
-                        offset, bytes: 1, access: AccessKind::Execute, .. }) if *offset == target
-                )
-            }) {
-                continue;
-            }
-            if !register_effects(std::slice::from_ref(op)) {
-                // A read-modify-write (ADD, INC, shifts and the like to
-                // memory) stores to the operand it loaded: the same address
-                // temporary and width. Prove that operand again for the
-                // write, whose window also admits the load before it; both
-                // transfers then hit RAM through one translation, as the
-                // transaction path's would (SDM Vol 3A §5.6.1; 80386 PRM
-                // §6.4.1 p. 6-20). One store only.
-                if stored || fast_lanes_off() {
-                    return None;
-                }
-                let IrOp::Store { addr, size, .. } = op else {
-                    return None;
-                };
-                // The operand is the instruction's first and only Load:
-                // `fast_instruction` stops at any other memory operation.
-                if !ops
-                    .iter()
-                    .any(|op| matches!(op, IrOp::Load { addr: a, size: s, .. } if a == addr && s == size))
-                {
-                    return None;
-                }
-                operand = Some(fast_operand(
-                    cpu,
-                    memory,
-                    tlb,
-                    read_val(*addr, temps),
-                    *size,
-                    AccessKind::Write,
-                )?);
-                stored = true;
-            }
-            continue;
+        if let IrOp::Legacy(L::LoadSegment { value, .. }) = op {
+            let selector = read_val(*value, temps) as u16;
+            return Some(FastOperand {
+                windows: [
+                    descriptor_window(cpu, memory, tlb, selector, context).ok()?,
+                    None,
+                ],
+                strict: true,
+                tlb: false,
+            });
         }
-        match op {
-            // execute_flat32 excluded the alignment-refusal regime first.
-            IrOp::InsnStart { .. } | IrOp::Legacy(L::Checkpoint | L::I486Gate) => {}
-            IrOp::ReadReg { dst, reg } => temps[*dst as usize] = crate::interp::read_reg(cpu, *reg),
-            IrOp::Legacy(L::LiveField {
-                dst,
-                bus,
-                bytes,
-                extend,
-            }) => temps[*dst as usize] = super::live_field(memory, *bus, *bytes, *extend).ok()?,
-            IrOp::Add {
-                dst,
-                a,
-                b,
-                size,
-                set_flags,
-            } if *set_flags == FlagMask::NONE => {
-                crate::interp::integer::exec_add(cpu, temps, dst, a, b, size, set_flags);
-            }
-            IrOp::Sub {
-                dst,
-                a,
-                b,
-                size,
-                set_flags,
-            } if *set_flags == FlagMask::NONE => {
-                crate::interp::integer::exec_sub(cpu, temps, dst, a, b, size, set_flags);
-            }
-            IrOp::And {
-                dst,
-                a,
-                b,
-                size,
-                set_flags,
-            } if *set_flags == FlagMask::NONE => {
-                crate::interp::integer::exec_and(cpu, temps, dst, a, b, size, set_flags);
-            }
-            IrOp::Shl {
-                dst,
-                a,
-                b,
-                size,
-                set_flags,
-            } if *set_flags == FlagMask::NONE => {
-                crate::interp::integer::exec_shl(cpu, temps, dst, a, b, size, set_flags);
-            }
-            IrOp::Legacy(L::SegmentedAddress {
-                dst,
-                offset,
-                bytes,
-                proof,
-                ..
-            }) => {
-                temps[*dst as usize] = proof.address(read_val(*offset, temps), *bytes)?;
-            }
-            IrOp::Legacy(L::Flat32Address {
-                dst,
-                segment,
-                offset,
-                bytes,
-                access,
-            }) => {
-                temps[*dst as usize] =
-                    flat32_address(cpu, *segment, read_val(*offset, temps), *bytes, *access)
-                        .ok()?;
-            }
-            // The live Checked access: Flat32 FS/GS, Segmented operands after an
-            // in-block reload of their segment, and V86 (`execute_op`).
-            IrOp::Legacy(L::Address {
-                dst,
-                segment,
-                offset,
-                bytes,
-                access,
-            }) => {
-                let offset = read_val(*offset, temps);
-                temps[*dst as usize] = if context.regime == legacy::MachineRegime::Virtual8086 {
-                    legacy::virtual8086_access(cpu, *segment, offset, *bytes, *access)
-                } else {
-                    legacy::access(cpu, context.generation, *segment, offset, *bytes, *access)
-                }
-                .ok()?;
-            }
-            IrOp::Load {
-                dst, addr, size, ..
-            } => {
-                operand = Some(fast_operand(
-                    cpu,
-                    memory,
-                    tlb,
-                    read_val(*addr, temps),
-                    *size,
-                    AccessKind::Read,
-                )?);
-                loaded_target = (*size <= 4).then_some(Val::Temp(*dst));
-            }
-            IrOp::Store { addr, size, .. } => {
-                operand = Some(fast_operand(
-                    cpu,
-                    memory,
-                    tlb,
-                    read_val(*addr, temps),
-                    *size,
-                    AccessKind::Write,
-                )?);
-            }
-            // MOV Sreg from a register: the selector is known before the
-            // load, so its descriptor is proved here (`descriptor_window`).
-            IrOp::Legacy(op @ L::LoadSegment { value, .. })
-                if super::data_segment_load(op).is_some() =>
-            {
-                let selector = read_val(*value, temps) as u16;
-                operand = Some(FastOperand {
-                    windows: [
-                        descriptor_window(cpu, memory, tlb, selector, context).ok()?,
-                        None,
-                    ],
-                    strict: true,
-                    tlb: false,
-                });
-            }
-            _ => return None,
-        }
+        prepare(op, cpu, memory, temps, context)?;
     }
-    operand
+    unreachable!("a Segment instruction loads a segment")
+}
+
+/// The operand window of a `Fast` instruction, proved at its first access
+/// (`write` as its class names it). The ops before that access wrote only
+/// temporaries, so this is the window the TLB grants before the instruction
+/// for the same linear address. None sends the instruction, which has
+/// changed nothing else, to the transaction lane.
+#[inline(always)]
+pub(super) fn access_operand(
+    cpu: &CpuState,
+    memory: &Memory,
+    tlb: &std::cell::RefCell<Tlb>,
+    linear: u64,
+    size: u8,
+    write: bool,
+) -> Option<FastOperand> {
+    fast_operand(
+        cpu,
+        memory,
+        &tlb.borrow(),
+        linear,
+        size,
+        if write {
+            AccessKind::Write
+        } else {
+            AccessKind::Read
+        },
+    )
 }
 
 /// Paged Flat32, Segmented and V86 blocks execute effect-proved registers and
 /// preflighted RAM once; all other instructions retain the full operand
 /// transaction ledger. V86 takes the same walk with V86 address checks.
+/// `insns` is the block's instruction table (`lanes`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     ir: &IrBlock,
+    insns: &[Insn],
     cpu: &mut CpuState,
     memory: &Memory,
     scratch: &mut impl ScratchBuffer,
@@ -3576,6 +3697,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     {
         return execute_ordinary::<ROUTED, ORDER, true>(
             ir,
+            insns,
             cpu,
             memory,
             scratch,
@@ -3588,6 +3710,7 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     }
     execute_ordinary::<ROUTED, ORDER, false>(
         ir,
+        insns,
         cpu,
         memory,
         scratch,
@@ -3599,12 +3722,14 @@ pub(crate) fn execute_flat32<const ROUTED: bool, const ORDER: u8>(
     )
 }
 
-/// The lane of one ordinary paged instruction: register effects alone, RAM
-/// operands preflighted from existing translations (strict for a system
-/// lane), or the full operand transaction. Address preparation by
-/// `fast_instruction` changes only temps.
+/// The lane of one ordinary paged instruction of class `class`: register
+/// effects alone, a RAM operand proved from existing translations at its
+/// access (`Lane::Lazy`), a descriptor window proved now for the strict lane,
+/// or the full operand transaction.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn ordinary_lane(
+    class: Class,
     view: &InstructionView<'_>,
     cpu: &mut CpuState,
     memory: &Memory,
@@ -3613,33 +3738,38 @@ pub(super) fn ordinary_lane(
     context: MachineContext,
     retry_none: bool,
 ) -> (super::Lane, Option<FastOperand>) {
+    use super::Lane;
     let once = retry_none
         && !(cpu.legacy.cpl == 3
             && cpu.legacy.cr0 & (1 << 18) != 0
             && cpu.rflags_system & (1 << 18) != 0);
-    // A near JMP's CS target check stays on the register lane (`register_lane`).
-    let registers_only = once && register_lane(view.ops);
-    let fast = if once && !registers_only {
-        fast_instruction(view.ops, cpu, memory, &tlb.borrow(), temps, context)
-    } else {
-        None
-    };
-    let lane = match fast {
-        Some(operand) if operand.strict => super::Lane::Strict,
-        Some(_) => super::Lane::Fast,
-        None if registers_only => super::Lane::Registers,
-        None => super::Lane::Transaction,
-    };
-    (lane, fast)
+    if !once {
+        return (Lane::Transaction, None);
+    }
+    match class {
+        Class::Registers => (Lane::Registers, None),
+        Class::Transaction => (Lane::Transaction, None),
+        _ if memory.host_fault_recovery() || cpu.mmio_retry_active => (Lane::Transaction, None),
+        Class::Fast { rmw: true, .. } if fast_lanes_off() => (Lane::Transaction, None),
+        Class::Fast { write, .. } => (Lane::Lazy { write }, None),
+        Class::Segment => {
+            match segment_operand(view.ops, cpu, memory, &tlb.borrow(), temps, context) {
+                Some(operand) => (Lane::Strict, Some(operand)),
+                None => (Lane::Transaction, None),
+            }
+        }
+    }
 }
 
 /// The ordinary paged walk of Flat32, Segmented and V86 blocks, in one pass
 /// (`super::BlockPass`): register and preflighted instructions run in the
 /// walk, strict and transaction instructions on their own.
+/// The table has an entry per op of `ir` (`lanes_into`).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     ir: &IrBlock,
+    insns: &[Insn],
     cpu: &mut CpuState,
     memory: &Memory,
     scratch: &mut impl ScratchBuffer,
@@ -3655,6 +3785,7 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     mem.paging.tlb = Some(tlb);
     let mut pass = super::BlockPass::<ROUTED, ORDER, true, V86>::new(
         ir,
+        insns,
         context,
         memory,
         LegacyAccess::<ROUTED, ORDER>::new(memory, u32::MAX),
@@ -3677,9 +3808,178 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
 mod tests {
     use super::*;
 
+    /// The lane classes of one instruction's ops (`classify`), for the
+    /// shapes the lifter gives register, load, store, read-modify-write,
+    /// near RET and MOV Sreg instructions.
+    #[test]
+    fn classify_names_each_lane_shape() {
+        use crate::ir::{MemOrder, MemoryAccess, Temp};
+        use crate::state::Reg;
+        let start = || IrOp::InsnStart { guest_addr: 0 };
+        let read = |dst: Temp, reg| IrOp::ReadReg { dst, reg };
+        let address = |dst: Temp, offset, segment, bytes, access| {
+            IrOp::Legacy(L::Flat32Address {
+                dst,
+                segment,
+                offset,
+                bytes,
+                access,
+            })
+        };
+        let load = |dst: Temp, addr| IrOp::Load {
+            fault: MemoryAccess::new(4, false, false),
+            dst,
+            addr,
+            size: 4,
+        };
+        let store = |addr, src, size| IrOp::Store {
+            fault: MemoryAccess::new(4, false, false),
+            addr,
+            src,
+            size,
+            order: MemOrder::None,
+        };
+        let add = |dst: Temp, a, b, set_flags| IrOp::Add {
+            dst,
+            a,
+            b,
+            size: 4,
+            set_flags,
+        };
+        let write = |src| IrOp::WriteReg {
+            reg: Reg::Rax,
+            src,
+            size: 4,
+        };
+        let (t0, t1, t2) = (Val::Temp(0), Val::Temp(1), Val::Temp(2));
+        let ds = |access| address(1, t0, SegmentId::Ds, 4, access);
+        // ADD EAX, ECX
+        assert_eq!(
+            classify(&[
+                start(),
+                read(0, Reg::Rax),
+                read(1, Reg::Rcx),
+                add(2, t0, t1, FlagMask::ALL),
+                write(t2),
+            ]),
+            Class::Registers
+        );
+        // MOV EAX, [ECX]
+        let ops = [
+            start(),
+            read(0, Reg::Rcx),
+            ds(AccessKind::Read),
+            load(2, t1),
+            write(t2),
+        ];
+        assert_eq!(
+            classify(&ops),
+            Class::Fast {
+                write: false,
+                rmw: false
+            }
+        );
+        // MOV [ECX], EAX
+        let ops = [
+            start(),
+            read(0, Reg::Rcx),
+            ds(AccessKind::Write),
+            read(2, Reg::Rax),
+            store(t1, t2, 4),
+        ];
+        assert_eq!(
+            classify(&ops),
+            Class::Fast {
+                write: true,
+                rmw: false
+            }
+        );
+        // ADD [ECX], EAX: one Store to the operand the Load read.
+        let rmw = |addr, size| {
+            [
+                start(),
+                read(0, Reg::Rcx),
+                ds(AccessKind::Write),
+                load(2, t1),
+                IrOp::ReadReg {
+                    dst: 3,
+                    reg: Reg::Rax,
+                },
+                add(4, t2, Val::Temp(3), FlagMask::ALL),
+                store(addr, Val::Temp(4), size),
+            ]
+        };
+        assert_eq!(
+            classify(&rmw(t1, 4)),
+            Class::Fast {
+                write: true,
+                rmw: true
+            }
+        );
+        // A Store elsewhere, or of another width, is a second operand.
+        assert_eq!(classify(&rmw(t0, 4)), Class::Transaction);
+        assert_eq!(classify(&rmw(t1, 2)), Class::Transaction);
+        // A flag-setting op before the operand changes more than temporaries.
+        assert_eq!(
+            classify(&[
+                start(),
+                read(0, Reg::Rcx),
+                add(1, t0, t0, FlagMask::ALL),
+                load(2, t1),
+                write(t2),
+            ]),
+            Class::Transaction
+        );
+        // Two loads.
+        assert_eq!(
+            classify(&[
+                start(),
+                read(0, Reg::Rcx),
+                load(1, t0),
+                load(2, t0),
+                write(t2),
+            ]),
+            Class::Transaction
+        );
+        // A near RET: the CS check of the loaded target follows the load.
+        let ret = |target| {
+            [
+                start(),
+                read(0, Reg::Rsp),
+                address(1, t0, SegmentId::Ss, 4, AccessKind::Read),
+                load(2, t1),
+                address(3, target, SegmentId::Cs, 1, AccessKind::Execute),
+                IrOp::Jump { target: t2 },
+            ]
+        };
+        assert_eq!(
+            classify(&ret(t2)),
+            Class::Fast {
+                write: false,
+                rmw: false
+            }
+        );
+        // A CS check of another value after the load is not the RET's.
+        assert_eq!(classify(&ret(t0)), Class::Transaction);
+        // MOV DS, AX, and MOV SS, AX, which ends an ordinary block.
+        let mov = |segment, inhibit| {
+            [
+                start(),
+                read(0, Reg::Rax),
+                IrOp::Legacy(L::LoadSegment {
+                    segment,
+                    value: t0,
+                    inhibit,
+                }),
+            ]
+        };
+        assert_eq!(classify(&mov(SegmentId::Ds, false)), Class::Segment);
+        assert_eq!(classify(&mov(SegmentId::Ss, true)), Class::Transaction);
+    }
+
     #[test]
     fn enter_and_leave_keep_blocks_off_the_ordinary_walk() {
-        // `fast_instruction` has no ENTER/LEAVE lane: their frames are
+        // The `Fast` class has no ENTER/LEAVE lane: their frames are
         // SS-relative, so they must stay out of ordinary blocks.
         for op in [
             L::Enter {

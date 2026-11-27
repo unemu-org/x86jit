@@ -3,6 +3,7 @@
 use super::*;
 #[cfg(feature = "test-hooks")]
 use crate::interp::legacy::paging::execute_for_test;
+use crate::interp::legacy::paging::Insn;
 use crate::interp::legacy::paging::{fetch_bus_for_test, publish_cr2};
 use std::cell::Cell;
 
@@ -55,6 +56,8 @@ struct Proof {
     ir: Arc<IrBlock>,
     // Computed once at lift: whether the block takes the ordinary walk.
     ordinary: bool,
+    // An ordinary block's instruction table, built with the proof.
+    lanes: Option<Arc<[Insn]>>,
     permit: Option<crate::FetchPermit>,
     // Ordered post-A20 bus spans, never a linear length applied to one frame.
     _registration: crate::memory::CodeRegistration,
@@ -92,6 +95,59 @@ pub(super) struct State {
     // Resolves that found the serial unchanged and compared nothing.
     #[cfg(test)]
     skips: u64,
+    // The instruction tables of ordinary blocks resolve returned from a
+    // proof, direct-mapped by block address (`lanes_slot`) and empty until
+    // the first. A slot names the map's version when it was filled: an
+    // unchanged version means the proof that held the block still holds it,
+    // alive, so its address names that block (`holds`). Successor links
+    // name the version too, so a block run after any change of it was
+    // resolved again first and its slot refilled.
+    lane_slots: Vec<Option<LaneSlot>>,
+    // The table of an ordinary block run without one in `lane_slots`.
+    lane_scratch: Vec<Insn>,
+}
+
+struct LaneSlot {
+    ir: usize,
+    version: u64,
+    insns: Arc<[Insn]>,
+}
+
+const LANE_SLOTS: usize = 512;
+
+/// The `lane_slots` index of the block at `ir`.
+#[inline(always)]
+fn lanes_slot(ir: *const IrBlock) -> usize {
+    ((ir as usize >> 4).wrapping_mul(0x9e37_79b9) >> 7) & (LANE_SLOTS - 1)
+}
+
+/// Keep the table of the block a proof of map version `version` just
+/// returned, for its run (`State::lane_slots`).
+#[inline(always)]
+fn remember_lanes(
+    slots: &mut Vec<Option<LaneSlot>>,
+    version: u64,
+    ir: &Arc<IrBlock>,
+    lanes: Option<&Arc<[Insn]>>,
+) {
+    let Some(lanes) = lanes else {
+        return;
+    };
+    if slots.is_empty() {
+        slots.resize_with(LANE_SLOTS, || None);
+    }
+    let address = Arc::as_ptr(ir) as usize;
+    let slot = &mut slots[lanes_slot(Arc::as_ptr(ir))];
+    if !slot
+        .as_ref()
+        .is_some_and(|slot| slot.ir == address && slot.version == version)
+    {
+        *slot = Some(LaneSlot {
+            ir: address,
+            version,
+            insns: lanes.clone(),
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -133,6 +189,8 @@ impl State {
 
     pub(super) fn invalidate(&mut self) {
         self.blocks.clear(why!(Paging));
+        // Every slot names an older version now; drop the tables they keep.
+        self.lane_slots.clear();
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
         self.stamp = None;
@@ -369,6 +427,13 @@ impl State {
             {
                 probe!(PROOFS);
                 self.last = Some((Arc::as_ptr(&proof.ir) as usize, self.blocks.version()));
+                let version = self.blocks.version();
+                remember_lanes(
+                    &mut self.lane_slots,
+                    version,
+                    &proof.ir,
+                    proof.lanes.as_ref(),
+                );
                 return Ok((proof.ir.clone(), proof.ordinary));
             }
             probe!(LIFTS);
@@ -479,11 +544,13 @@ impl State {
                         Arc::strong_count(&proof.ir) > 1
                     });
             }
+            let lanes = ordinary.then(|| crate::interp::legacy::paging::lanes(&ir));
             self.blocks.insert(
                 key,
                 Proof {
                     ir: ir.clone(),
                     ordinary,
+                    lanes: lanes.clone(),
                     permit,
                     _registration: registration.unwrap(),
                 },
@@ -491,6 +558,8 @@ impl State {
                 0,
             );
             self.last = Some((Arc::as_ptr(&ir) as usize, self.blocks.version()));
+            let version = self.blocks.version();
+            remember_lanes(&mut self.lane_slots, version, &ir, lanes.as_ref());
             return Ok((ir, ordinary));
         }
     }
@@ -866,8 +935,23 @@ impl Vcpu {
         if ordinary || ordinary_block(context, ir) {
             execution.rep_flags = None;
             let state = paging_state(&mut execution.paging);
+            let version = state.blocks.version();
+            let insns: &[Insn] = match state.lane_slots.get(lanes_slot(Arc::as_ptr(ir))) {
+                Some(Some(slot))
+                    if slot.ir == Arc::as_ptr(ir) as usize && slot.version == version =>
+                {
+                    &slot.insns
+                }
+                // A retained retry slice, a snapshot run once unpublished, or
+                // a slot another block took.
+                _ => {
+                    crate::interp::legacy::paging::lanes_into(ir, &mut state.lane_scratch);
+                    &state.lane_scratch
+                }
+            };
             let progress = crate::interp::legacy::paging::execute_flat32::<ROUTED, ORDER>(
                 ir,
+                insns,
                 &mut self.cpu,
                 &vm.mem,
                 &mut self.interp_scratch,

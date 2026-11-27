@@ -4907,3 +4907,251 @@ cells drift (call-ret +1.0..+1.8 %, store and alu +0.6..+1.0 %, smc-next-64 +1.2
 inlined op executor cost the unpaged protected cells +4..+10 per step in both profiles (+0.4 %
 to +1.0 %); the match now lives in the out-of-line exit path (`BlockPass::failed`), behind one
 load of the published-hook count.
+
+## Interpreter speed spike (xj-to9.51) — MEASURED 2026-11-27
+
+Why: a PC-class embedder measured its ceiling loops against another emulator's interpreter
+(a performance baseline only, M instructions/s, x86jit vs the other): real16 97–113 vs 161,
+flat32 63–71 vs 116, paged32 45–51 vs 123, **paged protected16 at CPL 3 19–21 vs 103, paged V86
+at IOPL 0 with a trapped IN 19–21 vs 106**. The last two are about 5× apart. In this repository
+they are `machine32_loops` `segmix` on `machine-paged16-cpl3` (1303 host instructions per step,
+20.5 M/s here) and `machine-paged-v86-gp` `v86gp` (1232, 22 M/s); the `register` loop on the same
+paths costs 590 (54 M/s) and is not the embedder's shape.
+
+Tree `7e6a66cc`, default release profile with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`,
+macOS 27 on the Apple-silicon workstation, load average 4–15. Host instructions per retired
+guest instruction (`proc_pid_rusage` `ri_instructions`), `machine32_loops 100000 3` (all paths,
+one process), `machine32_loops 20000 3 machine-paged-v86-gp`, `real16_loops 8 3`; medians of
+three rounds, spread under 0.3 %. Samples: `xctrace` Time Profiler (`--launch`, 4 s, 2,400–4,000
+samples), each leaf PC symbolized with its inline chain (`atos -i` against a `dsymutil` dSYM,
+outer frames demangled with `c++filt`) and assigned to the category of its innermost matching
+frame. No wall time is used.
+
+### Where the time goes — MEASURED (percent of samples)
+
+| Category | `segmix` paged16 CPL3 | `v86gp` | `segmix`, spike on | `v86gp`, spike on |
+|---|---:|---:|---:|---:|
+| Paged lane choice (`register_lane`, `fast_instruction`, `ordinary_lane`) | **18.2** | **17.6** | 3.7 | 3.9 |
+| Per-instruction boundary (`prepare`, `begin`, `commit`, `complete`) | 10.5 | 9.4 | 16.4 | 17.3 |
+| Instruction bounds (`locate`'s scan for the next `InsnStart`) | 4.7 | 5.0 | 0.4 | 0.7 |
+| Memory access path (paged `read`/`write`, windows, `Memory`, MMIO-part probe) | 11.2 | 8.3 | 12.3 | 8.3 |
+| Dispatcher loop, block lookup and links | 9.1 | 8.5 | 11.6 | 9.8 |
+| Far transfers, segment loads and checks, descriptors, strict lane | 8.2 | 4.9 | 7.5 | 6.2 |
+| `execute_op` body (the Machine op executor) | 7.7 | 7.4 | 9.4 | 9.5 |
+| Context and paging state per turn (`State::resolve`, reselection) | 6.3 | 7.4 | 6.4 | 9.1 |
+| Op dispatch (walk loop, `match`, op fields) | 6.3 | 8.2 | 9.5 | 11.0 |
+| Walk entry/exit (`BlockPass::new`, scratch, lockstep bracket, drops) | 5.8 | 4.6 | 6.2 | 5.9 |
+| Register, ALU and flags | 3.9 | 7.1 | 5.6 | 5.6 |
+| Single-instruction lanes (`execute_instruction`, transaction) | 1.8 | 1.8 | 1.9 | 2.4 |
+| Other binaries, unassigned | 6.3 | 9.8 | 9.1 | 10.3 |
+
+- **Lane choice is the largest single cost on both cells.** Every instruction of a paged
+  ordinary block scans its ops in `register_lane`, and an instruction with a memory operand runs
+  `fast_instruction`, which evaluates the address ops once to prove the TLB window before the
+  walk evaluates them again. Both depend on the ops alone except for the window.
+- **The rest is spread.** After the lane choice no category is above 17 %: the per-instruction
+  commit protocol, the paged memory path, per-block dispatch and context work, op execution.
+  The instruction walk proper (op dispatch, registers, ALU, flags) is 10–15 %.
+- **What the walk executes** (spike build, per-instruction counters of the paged pass printed
+  with `X86JIT_INTERP_SPIKE_STATS` set; one relaxed load per instruction otherwise, included in
+  the spike's figures below): on `segmix`, 61 % of the pass instructions are register-only (3.9 ops each),
+  30 % have one RAM operand (7.4 ops), 9 % are data-segment loads (3 ops); `v86gp` the same
+  within 1 %. The far CALL/RETF pair runs outside the pass. About 4.8 ops per pass instruction
+  at the ~27 host instructions of the cheapest op (second ceiling study) is ~130 per step for
+  dispatch and operand plumbing together, about 10 % of these steps.
+- **The real-mode floor of the same bytes.** A spike-branch variant of `machine32_loops` ran
+  `segmix` on `machine-real16` (the V86 path's body and segments without protection or paging;
+  the cell did not land): **640**
+  per step, against 1161 in V86 and 1303 in paged protected16 at CPL 3. There the dispatcher,
+  block lookup and links take about a third of the samples and `derive_legacy_context` 5 %:
+  this body ends six blocks per 25 instructions (far transfers, segment reloads). Even with every
+  protected and paged cost removed the interpreter would run it at about 43 M/s.
+- **#GP delivery for the trapped IN** is no longer visible: `v86gp` minus `v86gp-free` is
+  146 per step (12 %), the round trip that xj-to9.42 shortened; the V86 body dominates.
+
+### Prototypes — MEASURED
+
+Built on the spike branch behind an `interp-spike` cargo feature of `x86jit-core` (and
+`x86jit-bench`), off by default; the feature did not land. Prototype 1 landed in its production
+form (next section); prototype 2 did not.
+
+1. **Instruction table and lazy Fast lane** (`interp/legacy/paging/spike.rs`, option (a)). Once
+   per paged ordinary block (kept per thread, direct-mapped by block address, 512 entries, each
+   holding its `Arc<IrBlock>`), every instruction gets its op bounds, guest length and the part of
+   its lane that depends only on its ops: `Registers` (`register_lane` holds), `Transaction`
+   (`fast_instruction` refuses it for every state), `Eager` (a data-segment load or an unusual
+   operand shape: the existing pre-pass runs) or `Lazy` (one RAM operand, or a read-modify-write
+   of it, after ops that write only temporaries). `BlockPass::prepare` takes the bounds and lane
+   from the table, so `locate`'s scan and `register_lane` disappear. A `Lazy` instruction enters
+   the walk on the Fast lane with no operand yet; its first Load or Store proves the window
+   `fast_instruction` would have proved, for the same temporary and access (a write window for a
+   store or a read-modify-write's load), and any refusal there, or any failure or transfer
+   before it, abandons the instruction, which has changed only temporaries, to the transaction
+   lane, as a `None` from `fast_instruction` would have.
+2. **Light boundary** (option (a), on top of 1): an instruction of a `Registers` or `Lazy`
+   class that runs to the next marker sets no outcome field, so its boundary keeps only the
+   retirement, the RF clear and the budget, exit-word and TLB-generation tests before preparing
+   the next one. `X86JIT_INTERP_SPIKE=table` turns it off in the same binary, `=0` both.
+
+Options (b) build-time superinstructions and (c) closure threading were not built: they remove
+op dispatch and operand plumbing, which is about 10 % of these steps (above), so their ceiling
+here is −5..−8 % (ASSUMED: a threaded op at ~10 host instructions instead of ~27) against a
+second executable form of every op family. They are a real-mode item (op dispatch 17–40 % of its
+samples in the second study), not a lever for the 5× cells.
+
+Host instructions per step, clean build → prototype 1 → prototypes 1 + 2 (separate binaries):
+
+| Cell | Clean | Table + lazy lane | + light boundary |
+|---|---:|---:|---:|
+| `segmix` paged16 CPL3 (embedder's protected16 CPL3 shape) | 1303 | 1212 (−6.9 %) | **1207 (−7.3 %)** |
+| `v86gp` (embedder's V86 IOPL 0 shape) | 1232 | 1131 (−8.3 %) | **1125 (−8.7 %)** |
+| `v86gp-free` | 1086 | 992 (−8.6 %) | 986 (−9.2 %) |
+| `segmix` paged V86 | 1161 | 1069 (−7.9 %) | 1064 (−8.4 %) |
+| `register` paged32, paged16 (CPL 0/3), V86 | 587–594 | 560–567 (−4.5 %) | 556–557 (−5.7 %) |
+| `memory` paged32, paged16, V86 | 872–889 | 771–783 (−11.5 %) | 768–776 (−12.2 %) |
+| `callret` paged32, paged16, V86 | 1458–1487 | 1352–1376 (−7.2 %) | 1353–1373 (−7.1 %) |
+| `farcall` paged | 627–792 | −0.5..−0.7 % | −1.6..−1.9 % |
+| `farseg` paged16, V86 | 1727–2184 | +0.7..+0.9 % | +0.8..+1.0 % |
+| every unpaged protected cell (Flat32, Segmented, protected16) | 419–1788 | +0.1..+0.4 % | +0.1..+0.4 % |
+| `machine-real16`, `application-*` | 18–497 | ±0.0 % | ±0.0 % |
+| `real16_loops`, every path and workload | 175–9750 | | −1.6..+0.24 % |
+
+The table's gain matches the second study's doubling ceilings (`register_lane` ~60 per paged
+instruction, half of `fast_instruction`'s ~395 per memory instruction). The light boundary adds
+only −1.5..−3 %. The `farseg` loss is the per-block table lookup (two thread-local probes) on
+blocks of one to three instructions. The unpaged cells move with layout (the pass's new fields
+and branches, never taken there). In the same feature binary the runtime switch off costs
++5..+7 % on the paged cells against the clean build, so the switch-on deltas against that binary
+(−9..−16 %) overstate the gain; the table above is against the clean build. In the embedder's
+units the two slow cells would go from about 20.5 and 22 to about 22 and 24 M/s (by the
+host-instruction ratio, ASSUMED): the gap to the other emulator stays above 4×.
+
+### Equality — MEASURED
+
+- `cargo nextest run -p x86jit-tests -p x86jit-core --features x86jit-core/interp-spike -E
+  'binary(legacy) | (package(x86jit-core) & kind(lib))'`: 1960 passed, 9 skipped (both
+  prototypes on; debug build with the walk's debug assertions, including the light boundary's
+  plain-outcome assertion).
+- Coverage check: the same run with the lazy lane deliberately broken (stores proved for read
+  windows and refusals ignored instead of abandoned) fails 91 of them, in `legacy_segment_blocks`,
+  `legacy_v86_round_trip`, `legacy_paging`, `legacy_flat32`, `legacy_census_386`, `legacy_seg32`,
+  `legacy_one_pass`, the SMC suites and the core `vm` tests: the suite reaches the lazy lane with
+  stores and with TLB refusals.
+- `cargo clippy --all-targets --all-features -D warnings` and `cargo fmt --check` pass for
+  `x86jit-core` and `x86jit-bench`. Not run: the lockstep tracer, the fuzz binary, the ladder.
+
+### Cost to finish and maintain — ASSUMED
+
+- **Prototype 1 as a change**: keep the table with the paged proof that already holds the block
+  (`paging::State::blocks` entries carry `ir` and `ordinary`), built where the proof is made,
+  instead of the thread-local cache and its raw pointer (that also removes the `farseg` loss);
+  derive `register_lane`, the table's classifier and `fast_instruction`'s operand rules from one
+  op classification, or cross-check the lazy lane against the eager pre-pass in test builds, so
+  the two cannot drift; witnesses for a fault in the address ops, a TLB refusal at the access, a
+  read-modify-write without PTE.D and the AC regime. About 1–2 days with review; maintenance low
+  to medium (every new op that may enter the fast lane meets the classifier).
+- **Prototype 2**: a second commit path that must track every test `commit` grows, for
+  −1.5..−3 %. Not worth keeping.
+- **(b) / (c)**: weeks for every op family to get a second executable form generated from the
+  same semantics, a ceiling of −5..−8 % on these cells.
+
+### Recommendation
+
+1. Productionize prototype 1 (−4.5..−12.2 % on every paged and V86 cell, −7 % / −8 % on the
+   embedder's two slow shapes, zero elsewhere), as a normal bead with the cost above; drop
+   prototype 2; do not build superinstructions or closure threading for these cells.
+2. Do not expect the interpreter to close the 5× gap. Even the real-mode walk of the same
+   bytes costs 640 per step (about 43 M/s), dominated by per-block dispatch for a body that ends
+   a block every four instructions; the protected and paged premium on top (about 570 per step
+   after the spike) is spread over the commit protocol, the paged memory path, context work and
+   far transfers, none above 17 %. The lever for these regimes is the compiled Machine path with
+   paging and privilege (decisions 30–32), plus cheaper block-to-block transfer in the
+   dispatcher (links across far transfers and segment reloads), which the real-mode floor says is
+   the larger half.
+
+## Paged instruction table and lazy Fast lane (xj-to9.67) — MEASURED 2026-11-27
+
+Prototype 1 of the spike above, in production form; no feature switch.
+
+- **One classification.** `paging::classify` decides, from an instruction's ops alone, its lane
+  class: `Registers` (`register_lane`), `Transaction`, `Segment` (MOV Sreg from a register:
+  the descriptor window is proved before the instruction, for the strict lane) or `Fast` (one
+  RAM operand, a Load, a Store or a read-modify-write of it, after ops that write only
+  temporaries, then register effects). `fast_instruction`, the pre-pass that evaluated the
+  address ops to prove the TLB window before the walk evaluated them again, is gone:
+  `ordinary_lane` applies the run-time conditions (one transaction at most, the alignment
+  regime, host-fault recovery, an MMIO retry, the read-modify-write witness switch) to the
+  class, `segment_operand` proves a `Segment` instruction's descriptor, and a `Fast`
+  instruction runs in the walk on `Lane::Lazy` until its first Load or Store, which proves the
+  window for the linear address the walk computed (`access_operand`). A refusal there, or any
+  failure or transfer before it, sends the instruction, which has changed only temporaries,
+  to the transaction lane (`BlockPass::abandon`), as a refusal of the pre-pass did.
+- **The table lives with the paged proof.** `paging::lanes` builds, once per proof, each
+  instruction's op bounds, guest length and class (`Insn`, indexed by op). The paging state
+  keeps the tables of the blocks resolve returned in a direct-mapped slot array keyed by block
+  address and the proof map's version: an unchanged version means the proof that held the block
+  still holds it, so its address names it (the argument of `State::holds`), and successor links
+  name the version, so a block reached after any change of it was resolved again and its slot
+  refilled. A block run without a slot (a retained retry slice, an unpublished snapshot, a slot
+  another block took) gets its table built into a scratch buffer for that run.
+  `BlockPass::prepare` takes the bounds and class from the table: `locate`'s scan and
+  `register_lane` leave the per-instruction path.
+- **The unpaged walk is unchanged.** The table rides in the paged walk's TLB tuple and the
+  lazy state in the `Lane` enum, so `BlockPass` gains no field, and the lazy op path is its own
+  method (`BlockPass::lazy`) entered before `execute`'s result match. A first candidate that
+  added the lazy abandon as a guarded arm of that match cost every unpaged protected cell
+  +0.4..+1.2 % in both profiles (callret +10..+12 host instructions per step): the extra arm, though
+  constant-false there, made the compiler materialize the walk result on the stack per op.
+
+`machine32_loops 100000 3` (all paths), `machine32_loops 20000 3 machine-paged-v86-gp` and
+`real16_loops 8 3`, two processes per side, host instructions per step (median), base `641d4d96`,
+default release profile:
+
+| Cell | Base | P1 | Change |
+|---|---:|---:|---:|
+| `segmix` paged16 CPL 3 (embedder's protected16 CPL 3 shape) | 1302 | 1180 | **−9.4 %** |
+| `v86gp` (embedder's V86 IOPL 0 shape) | 1235 | 1101 | **−10.9 %** |
+| `v86gp-free` | 1087 | 963 | −11.4 % |
+| `segmix` paged V86, paged16, paged32seg (CPL 0/3) | 1161–1302 | 1036–1180 | −9.3..−10.7 % |
+| `register` paged32, paged16, paged32seg, V86 (CPL 0/3) | 586–593 | 526–533 | −10.0..−10.1 % |
+| `memory` same paths | 871–888 | 734–745 | −15.4..−16.1 % |
+| `callret` same paths | 1455–1484 | 1272–1296 | −12.2..−13.0 % |
+| `farcall` paged | 628–792 | 609–774 | −2.3..−3.0 % |
+| `farseg` paged16, paged32seg, V86 | 1726–2183 | 1702–2161 | −1.0..−1.4 % |
+| every unpaged protected cell (Flat32, Segmented, protected16, 32seg, CPL 0/3) | 122–1781 | | +0.02..+0.21 % |
+| `machine-real16`, `application-*` | | | −0.03..+0.15 % |
+| `real16_loops`, every path and workload | | | −0.01..+0.21 % |
+
+Against the spike's prototype 1 (−6.9 % / −8.3 % on the two embedder cells) the production form
+gains about 3 points more on every paged cell: the Fast lane's ops no longer pass the pre-pass,
+and the walk's per-op test for the lazy state sits before the shared executor instead of in its
+result handling. `farseg`, +0.7..+0.9 % with the spike's per-block thread-local lookup, is now
+−1.0..−1.4 %: the slot probe is a version compare and a pointer compare. In the embedder's units
+the two slow cells would go from about 20.5 and 22 to about 22.6 and 24.6 M/s (by the
+host-instruction ratio, ASSUMED); the gap to the other emulator stays above 4×.
+
+The `perf` profile (one codegen unit for the core and the bench), the same runs: `segmix` paged16
+CPL 3 1273 → 1162 (−8.7 %), `v86gp` 1196 → 1076 (−10.0 %), `v86gp-free` −10.5 %; per workload
+over the paged and V86 paths `segmix` −8.7..−10.0 %, `register` −8.2..−8.3 %, `memory`
+−13.6..−14.3 %, `callret` −11.1..−11.8 %, `farcall` −1.4..−1.9 %, `farseg` −1.1..−1.4 %; every
+unpaged protected, real-mode Machine and Application cell −0.01..+0.18 %.
+
+`scripts/perf-campaign.sh 641d4d96 <tree>` (real16_loops on every workload and path and the
+store probe, both profiles): release PASS; `perf` misses the gate on `smc-rmw-64` on the four
+twenty-bit paths (I8088, I8086, V20, V30: +1.24..+1.31 %), which release puts at −0.30..−0.33 %;
+every other cell of both profiles is within ±0.09 %. Combined verdict DRIFT. The twenty-bit
+SMC path runs none of the changed code (its walk is `execute_shared20`, and the shared unpaged
+walk's cells are flat), and the two profiles move it in opposite directions: code layout, not
+work.
+
+Equality: `cargo nextest run -p x86jit-core --lib` (613 passed), `cargo nextest run -p
+x86jit-tests --profile ci -E 'binary(legacy) | binary(memory)'` (1917 passed), `application_codegen`
+(3 passed), clippy `--all-targets --all-features -D warnings`, `fmt --check`. Debug builds check
+the table's bounds against `locate`'s scan at every paged instruction. A new unit witness
+(`classify_names_each_lane_shape`) pins the class of the register, load, store,
+read-modify-write, near RET and MOV Sreg shapes and of their near misses. Coverage check: with
+the lazy lane deliberately proving a read window for every access, 82 of `binary(legacy)` and
+the core lib tests fail (the TLB D-bit and write-protect witnesses, the SMC and code-alias
+suites, `legacy_flat32`, `legacy_seg16`/`seg32`, `legacy_segment_blocks`, `legacy_census_386`,
+`legacy_one_pass`, the core `vm` tests). Not run: the lockstep tracer, the fuzz binary, the
+ladder.
