@@ -4592,3 +4592,254 @@ The Machine Flat32 interpreter is 13.5–23× the Compat32 JIT on the same bytes
 21–32×. Decision-29 derives an expected compiled Machine range of 50–102 (register),
 77–133 (memory) and 166–326 (callret) unpaged, under stated per-turn and TLB-probe
 assumptions.
+
+## Interpreter ceiling study 2 — MEASURED 2026-11-27
+
+A second pass of the [first study](#interpreter-ceiling-study--measured-2026-11-26) after block
+links and near-RET links, the 486 alignment-gate fix, selective proof drops, live fields,
+store-site absorb, 64 → 256 contexts, the reduced unpaged identity and J1 (off by default)
+landed. Tree `2816c7c2`, default release profile with `debug = "line-tables-only"`
+(`CARGO_PROFILE_RELEASE_DEBUG`), macOS 27 on the Apple-silicon workstation, load average
+4–33 during the runs. Every number is host instructions (`proc_pid_rusage` `ri_instructions`)
+per retired guest instruction, or a share of time samples; no wall time is used. All code
+changes below were throwaway and are reverted.
+
+### Method — MEASURED / READ
+
+- **Counts.** `machine32_loops 100000 3` (all paths, one process, rotating) for I80386 and
+  I80486Dx; `machine32_loops 20000 3 machine-paged-v86-gp`; `real16_loops 8 3 <workload>`
+  (all nine paths per process); `machine_exits 20000 3 <mode> store|planar` with
+  `EXIT_PATH=handler`. Medians of three rounds; round-to-round spread under 0.3 %.
+- **Samples.** `xctrace` Time Profiler attached for 3 s (3,300–3,750 samples) to a one-cell
+  process. `xctrace export` already carries each leaf PC's inline chain with source lines;
+  each sample is assigned to the category of the innermost frame (inline chain, then callers)
+  that matches a category rule. Shares are of time.
+- **Ceiling experiments.** One switch binary, each site gated by a relaxed atomic load (the
+  BlockPass switch read once into the pass). With every switch off it costs +14 (+3 %) on
+  `protected32` `register`, +50..+70 (+5 %) on the paged cells; deltas are against that
+  binary with every switch off. Two kinds of experiment:
+  - *Removal*: **light boundary** — `BlockPass::boundary` for an in-flight instruction with a
+    plain outcome, no rollback image and no MMIO retry only counts the step, moves `rip` and
+    the instruction start, and (paged) chooses the next lane; it skips `complete`, `commit`'s
+    tests (exit word included), `prepare`'s view rebuild and `begin`'s rollback test, task marks
+    and `Outcome` reset.
+  - *Doubling*: run a pure piece once more under `black_box`; the delta is what one evaluation
+    costs per step, the most that removing or precomputing it can save. Doubled:
+    `paging::register_lane` and `paging::fast_instruction` in `ordinary_lane`;
+    `paging::State::reconcile` (second call takes the unchanged-stamp path);
+    `LegacyContextStamp::new` plus the `stamp !=` test and the `recent` search, in
+    `paging::State::reconcile` and in `Execution::sync_class`; the `recent[..=slot]` rotate (a
+    right and a left rotate); `legacy_context_for_run`; `paging::State::resolve` on a hit;
+    the `Load` and `Store` arms of `execute_op`; `machine_boundary`; `follow_link`.
+  - *One more op*: a separate build in which `walk_ops` dispatches every `ReadReg` twice (that
+    build is +17 % heavier, so the figure is an upper bound).
+  - *Call counts*: throwaway counters (per retired instruction) for `State::reconcile`,
+    `sync_class`, `legacy_context_for_run`, `State::resolve`, boundary refreshes,
+    `ordinary_lane` and `fast_instruction`.
+  - *Unrolled loops*: `register-xK` and `memory-xK` repeat the three-instruction body K times
+    before `DEC DI; JNZ` (3K+2 retired per block), K = 1, 2, 4, 8; a straight-line fit of host
+    instructions per block against instructions per block gives the per-block and
+    per-instruction cost.
+
+### Baseline: host instructions per guest step — MEASURED
+
+`machine32_loops`, I80386. The I80486Dx equals the I80386 within 0.1 % in every cell (the
+first study's 486 premium was the alignment gate):
+
+| Path | `register` | `memory` | `callret` | `farcall` | `segmix` | `farseg` |
+|---|---:|---:|---:|---:|---:|---:|
+| `machine-real16` | 285 | 365 | 496 | — | — | — |
+| `machine-protected32` (and `-cpl3`) | 422 | 564 | 1042 | 557 / 562 | — | — |
+| `machine-protected16` (and `-cpl3`) | 418 | 558 | 1025 | 560 | 946 | 1762 |
+| `machine-protected32seg` | 418 | 558 | 1025 | 563 | 951 | 1778 |
+| `machine-paged32` / `-cpl3` | 593 / 596 | 881 / 884 | 1481 / 1484 | 828 / 837 | — | — |
+| `machine-paged16` / `-cpl3` | 589 / 592 | 875 / 878 | 1462 / 1465 | 821 / 824 | 1455 / 1458 | 2528 / 2531 |
+| `machine-paged32seg` | 589 | 875 | 1462 | 824 | 1460 | 2544 |
+| `machine-paged-v86` | 592 | 892 | 1491 | 725 | 1321 | 2089 |
+| `application-interp32` | 276 | 299 | 472 | — | — | — |
+| `application-jit32` | 18 | 42 | 69 | — | — | — |
+
+`machine-paged-v86-gp`: `v86gp` (IOPL 0, a ring-0 #GP monitor every 266 retired) 1434,
+`v86gp-free` 1236 (I80486Dx 1436 / 1236): the monitor round trip is about 53,000 host
+instructions, as after xj-to9.42.
+
+`real16_loops` (the I8088 and the NEC paths equal the I8086, the I80386 and A20-off paths equal
+the I80286):
+
+| Workload | Alias | I8086 | I80286 |
+|---|---:|---:|---:|
+| `alu` | 299 | 303 | 302 |
+| `load` | 404 | 426 | 410 |
+| `store` | 379 | 405 | 385 |
+| `push-pop` | 334 | 364 | 336 |
+| `call-ret` | 662 | 709 | 681 |
+| `dos-mixed` | 346 | 453 | 351 |
+| `rep-movsw` | 175 | 256 | 175 |
+| `ip-boundary-64` | 301 | 332 | 335 |
+
+Handled MMIO stores (`machine_exits`, handler path, I80386), host instructions per store
+including the N−1 register instructions of each iteration:
+
+| Mode | `planar` N=3 | N=4 | N=5 | `store` N=10 | N=25 | N=100 |
+|---|---:|---:|---:|---:|---:|---:|
+| `real16` (in-block, xj-to9.23) | 1567 | 1773 | 1979 | 3009 | 6099 | 21549 |
+| `seg16` (Segmented) | 5758 | 6026 | 6299 | 7669 | 11779 | 35381 |
+| `flat32` | 5786 | 6060 | 6334 | 7704 | 11815 | 35419 |
+| `paged32` | 21991 | 22415 | 22846 | 24985 | 31405 | 67730 |
+
+Subtracting the surrounding instructions at their slope (≈ 206 real16, ≈ 275 Flat32 and
+Segmented per INC), one handled store costs about **950** in the real-mode shared walk,
+**4,950** in an unpaged protected block and **21,000** paged.
+
+### Where the time goes — MEASURED (percent of samples)
+
+| Category | p32 `register` | p32 `memory` | p32 `callret` | pg32 `memory` | pg16 CPL3 `segmix` | V86 `segmix` | `v86gp` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Op dispatch: walk loop, `match`, op fields | 19 | 16 | 13 | 16 | 12 | 13 | 13 |
+| Register and temporary access | 5 | 4 | 3 | 2 | 2 | 2 | 2 |
+| ALU results and flags | 10 | 6 | 11 | 4 | 3 | 3 | 4 |
+| Memory access path | 1 | 8 | 5 | 7 | 10 | 5 | 7 |
+| Machine op executor (`execute_op`) body | 4 | 17 | 16 | 7 | 9 | 8 | 8 |
+| Control-transfer targets | 2 | 1 | 2 | 1 | · | · | · |
+| Per-instruction boundary (BlockPass `prepare`/`begin`/`commit`, `locate`) | 26 | 25 | 17 | 21 | 12 | 13 | 11 |
+| Paged lane choice (`ordinary_lane`, `register_lane`, `fast_instruction`) | · | · | · | 22 | 16 | 17 | 16 |
+| Walk entry/exit (`BlockPass::new`, scratch, lockstep, drops) | 10 | 6 | 9 | 6 | 4 | 5 | 4 |
+| Dispatcher loop | 12 | 9 | 12 | 7 | 6 | 7 | 5 |
+| Block links | 6 | 4 | 6 | 4 | 1 | 1 | 1 |
+| Context and paging state per turn (`reconcile`, `resolve`, stamps, rotate) | · | · | · | 1 | 16 | 18 | 18 |
+| Block-entry checks (`machine_boundary`) | 3 | 2 | 3 | 1 | 1 | 1 | 1 |
+| SMC/dirty poll | 1 | 1 | 1 | · | · | 1 | 1 |
+| Far transfers, segment loads, descriptors | · | · | · | · | 4 | 3 | 3 |
+| Delivery, IRET, system lanes | · | · | · | · | 1 | 1 | 2 |
+| Retry/transaction path, allocator | 1 | 1 | 1 | · | 2 | 1 | 3 |
+
+| Category | r16 `alu` I8086 | r16 `alu` I80286 | r16 `call-ret` I8086 | r16 `call-ret` I80286 | MMIO `flat32` planar 3 | MMIO `paged32` planar 3 |
+|---|---:|---:|---:|---:|---:|---:|
+| Op dispatch (walk loop, its `InsnStart` handling) | 40 | 33 | 31 | 17 | 10 | 5 |
+| Register access, ALU and flags | 18 | 20 | · | 1 | 3 | 1 |
+| Memory access path | · | · | 3 | 6 | 10 | 10 |
+| `execute_op` body / per-instruction boundary | 4 | 6 | 1 | 4 | 17 | 7 |
+| Walk entry/exit | 15 | 17 | 24 | 27 | 17 | 10 |
+| Dispatcher loop | 12 | 12 | 21 | 23 | 23 | 6 |
+| Block links | 8 | 9 | 13 | 16 | 4 | 1 |
+| SMC/dirty poll | 3 | 2 | 6 | 6 | 3 | 1 |
+| Context per turn, block-entry checks | · | · | · | · | 9 | 10 |
+| Retry/transaction path, `CpuState` clones, allocator | · | · | · | · | 3 | 47 |
+
+- **Unpaged protected.** The one-pass walk (BlockPass) removed the first study's
+  per-instruction restart; what is left per instruction is the BlockPass boundary (17–26 %),
+  op dispatch (13–19 %) and, for memory and transfer ops, the `execute_op` adapter (16–17 %:
+  `locate`'s scan for the next `InsnStart`, then the executor's own `match`). The per-block
+  part (walk entry/exit, dispatcher, link, entry checks, SMC poll) is 27–32 %.
+- **Paged and V86.** Two costs absent from unpaged code: the lane choice of every instruction
+  (16–22 %) and, wherever a far transfer or a segment reload ends a block, context reselection
+  (16–18 %: two full `LegacyContextStamp` builds and compares per reselection — one in
+  `Execution::sync_class`, one in `paging::State::reconcile` — the `recent` searches and
+  rotates, `derive_legacy_context`, `paging::State::resolve`). In `v86gp` the #GP round trip
+  itself (delivery, `tlb_lane`, the monitor's IRETD, the refused IN) is now about 8 % of the
+  samples; the V86 body dominates.
+- **MMIO in protected code.** A Flat32 handled store leaves the walk (`BlockPass::fail`), the
+  dispatcher serves it (`Run::access`), and the instruction is retried through
+  `retry_slice` / `resolve_flat32` / `roll_back` (dispatcher 23 %, walk entry/exit 17 %). A
+  paged one takes `execute_with_retry`: `CpuState` clones 32 %, `memmove` 26 %, allocator
+  11 %.
+- **Real mode.** `call-ret` (one-instruction blocks) is 65–70 % per-block work; `alu` is 33–40 %
+  walk dispatch.
+
+The PC-class embedder's own profiles at `f0785d5a` (supplied, `sample`, % of main-thread
+samples) show the same shapes: in its 486 paged V86 at IOPL 0 and paged protected16 CPL3
+cells (17.1 and 17.6 M steps/s) the lane choice (`fast_instruction` 6.4, `register_lane`
+5.4, `fast_window` 2.0 self) and context reselection (`reconcile`, `resolve`,
+`SegmentCache`/`LegacyCpuState`/`SystemSegment` equality, `derive_legacy_context`,
+`sync_class`, the `recent` rotate, `Option<Box<paging::State>>::get_or_insert_with`: about
+18 % self, 15–25 % inclusive); in its 486 protected game (23.4 M steps/s) `walk_instruction`
+is 34 % self (the walk and its inlined BlockPass boundary) and the MMIO retry path
+(`retry_slice`, `retry_instruction`, `BlockPass::fail`, `resolve_flat32`) about 5–9 %
+inclusive besides the embedder's own device code.
+
+### What each item removes — MEASURED (host instructions per guest step)
+
+Switch build; "step" is its own cost with every switch off. Each column is the extra cost of
+one more evaluation (doubling) or, for the light boundary, the saving.
+
+| Cell | Step | Light boundary | `register_lane` | `fast_instruction` | Paging stamp + search | `sync_class` stamp + search | Rotates (×2) | `legacy_context_for_run` | Paging `resolve` hit | Load | Store | `machine_boundary` | `follow_link` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| protected32 `register` | 436 | −54 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | +16 | +28 |
+| protected32 `memory` | 579 | −47 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | +27 | +37 | +16 | +28 |
+| protected32 `callret` | 1068 | −35 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | +27 | +37 | +49 | +83 |
+| protected32 `farcall` | 572 | −54 | 0 | 0 | 0 | 0 | 0 | +33 | 0 | 0 | 0 | +16 | +6 |
+| protected16 CPL3 `segmix` | 963 | −44 | +1 | 0 | 0 | 0 | 0 | +44 | 0 | +17 | +30 | +20 | +11 |
+| paged32 `register` | 635 | −55 | +59 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | +16 | +37 |
+| paged32 `memory` | 929 | −55 | +58 | +158 | 0 | 0 | 0 | 0 | 0 | +35 | +37 | +16 | +37 |
+| paged32 `callret` | 1547 | −35 | +71 | +211 | 0 | 0 | 0 | 0 | 0 | +42 | +37 | +49 | +110 |
+| paged16 CPL3 `farcall` | 866 | −55 | +28 | 0 | +133 | +48 | +4 | +29 | +111 | 0 | 0 | +16 | +7 |
+| paged16 CPL3 `segmix` | 1528 | −49 | +56 | +145 | +130 | +70 | +68 | +43 | +110 | +22 | +30 | +19 | +14 |
+| paged V86 `segmix` | 1389 | −48 | +58 | +140 | +132 | +72 | +69 | +50 | +111 | +23 | +31 | +20 | +16 |
+| `v86gp` (IOPL 0) | 1502 | −50 | +60 | +145 | +138 | +75 | +75 | +53 | +118 | +25 | +37 | +17 | +9 |
+| `v86gp-free` | 1301 | −52 | +57 | +131 | +123 | +67 | +62 | +46 | +105 | +21 | +29 | +16 | +8 |
+| real16 `register` / `memory` / `callret` | 286 / 367 / 501 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | +26 / +25 / +76 |
+
+The doublings add up: on paged16 CPL3 `segmix` the four context columns together cost +311
+(sum of the parts 311), the two lane columns +203 (sum 204), all six +517 (−34 % of the step);
+on `v86gp` +340, +204 and +544 (−36 %); on paged32 `memory` the lanes +216 (−23 %).
+
+Per call, from the counters (per retired instruction on `segmix`: `State::reconcile` 0.24,
+`State::resolve` 0.16, `sync_class` 0.12, `legacy_context_for_run` 0.24, `ordinary_lane`
+0.92, `fast_instruction` 0.36; on paged `memory` 1.0 and 0.4):
+
+| Piece | Host instructions per call |
+|---|---:|
+| `register_lane` | ~60 per paged instruction |
+| `fast_instruction` | ~395 per paged memory instruction |
+| `paging::State::reconcile`, unchanged stamp | ~265 |
+| paging stamp build + compare + `recent` search | ~540 |
+| `sync_class` full stamp build + compare + `recent` search | ~580 |
+| one `recent` rotate (four stamps) | ~125 |
+| `legacy_context_for_run` | ~210 |
+| `paging::State::resolve` on a hit | ~690 |
+| Load / Store, unpaged (`execute_op` arm and access path) | ~135 / ~185 |
+| Load / Store, paged fast lane | ~175 / ~185 |
+| `machine_boundary` | ~80 per block |
+| `follow_link`, hit | ~140 unpaged, ~185 paged, ~125 real16 |
+| cheapest op (`ReadReg`), one-more-op build | ~27 (protected, paged and real16 alike) |
+
+Unrolled loops (switch build), host instructions per block = a + b × instructions:
+
+| Path | Per block a | Per INC/ADD/XOR b | b with the light boundary |
+|---|---:|---:|---:|
+| `machine-real16` | 369 | 213 | 213 |
+| `machine-protected32` | 717 | 293 | 225 |
+| `machine-paged32` | 732 | 489 | 420 |
+| `machine-paged16-cpl3` | 713 | 491 | 422 |
+
+A protected block costs twice a real-mode block before its first instruction, and a paged
+register instruction costs 1.7× an unpaged one (+196, of which `register_lane` 60 and the rest
+`locate`'s scan, the paged `commit` tests and the lane adapter). A memory instruction adds
+about 355 unpaged and 735 paged over a register instruction (`memory-x4` against
+`register-x4`), 395 of the paged figure in `fast_instruction`.
+
+### Ranked next items — MEASURED / ASSUMED
+
+Gains are host instructions per guest step at most, against the cell's own step; "ASSUMED"
+marks a derived estimate.
+
+| # | Item | Gain | Evidence | Effort | Risk |
+|---|---|---|---|---|---|
+| 1 | **One context identity per reselection** (paged, V86, far transfers and reloads): build the stamp once per reselection and share it between `sync_class` and `paging::State::reconcile`, compare a cheap fingerprint first (selectors, descriptor-table and CR generation) before full equality, and keep `recent` as indices instead of rotating stamps | ceiling −311 on paged16 CPL3 `segmix` (−20 %), −340 on `v86gp` (−23 %), −315 V86 `segmix`, −214 paged16 CPL3 `farcall`; a fingerprint keeping one full compare per change: about half to two-thirds of that (ASSUMED) | MEASURED doublings, additive | medium | medium: decision-20 identity rules; a fingerprint miss must fall back to full equality |
+| 2 | **Lane choice from lift** (paged): `register_lane` is a pure function of the instruction's ops and can be a per-instruction bit in the IR; `fast_instruction`'s operand scan can be precomputed too, leaving only the TLB window test | `register_lane`: −28..−71 on every paged and V86 cell (−3..−9 %), MEASURED; `fast_instruction`: −131..−211 where memory operands are (−10..−17 %), of which the precomputable scan is perhaps half (ASSUMED) | MEASURED doublings | low (bit) / medium (operand plan) | low / medium |
+| 3 | **In-block handled MMIO in the BlockPass and the paged fast lane** (memory-heavy flat code writing device memory) | Flat32/Segmented handled store 4,950 → about 950 as in the real-mode walk (−4,000 per store, −69 % on `planar` N=3, ASSUMED from the real-mode figure); paged 21,000 → under 2,000 (ASSUMED); the embedder game's MMIO retry path is 5–9 % of its samples | MEASURED per-store costs; profiles | medium-high: the BlockPass already commits per instruction, which the in-block rule needs | medium: the sole-access and no-later-fault rules of spec.md §5.4 |
+| 4 | **Plain BlockPass boundary**: when the outcome is plain and no rollback image is held, keep only the step count, budget and exit-word test | −35..−55 on every protected, paged and V86 cell (−3..−12 %), 68 per instruction in the unrolled fit, MEASURED less the exit-word load (a few) | light-boundary switch | low-medium | low-medium: every `commit` test must be reachable from a non-plain outcome |
+| 5 | **Cheaper block entry in protected and paged code**: a block costs ~715–730 before its first instruction against ~370 in real mode; `follow_link` is ~140–185 per hit (its filter compares eight fields and clones the block `Arc`), `machine_boundary` ~80 | `follow_link` compaction (one generation word plus the identity, no `Arc` round trip): about −100 per block (ASSUMED): −20 per step on five-instruction loops, −60 on `callret`, against doubling ceilings of −28..−37 and −83..−110, and −125 on real16 `call-ret` (MEASURED ceiling); continuing a linked successor inside the walk: up to the protected-minus-real gap, ~350 per block (−16 % on protected32 `register`, ASSUMED) | doublings, unrolled fit | medium (links) / high (chaining) | medium |
+| 6 | **Memory access path** (memory-heavy flat code): per access ~135 load / ~185 store unpaged, the `execute_op` adapter's `locate` scan per memory instruction, `mmio_part` probe per RAM read | at most −27 / −37 per step on protected32 `memory` (load / store doubling, MEASURED); a leaner RAM path perhaps half (ASSUMED) | doublings, profiles (`execute_op` 16–17 %) | low-medium | low |
+| 7 | **Compact op dispatch** (first study's .26) | the cheapest op costs ~27; op dispatch is 12–19 % of protected and paged samples and 17–40 % of real mode; −10..−20 % (ASSUMED) | one-more-op, profiles | high | medium |
+| 8 | Small: `get_or_insert_with` on the paging state per turn (0.6–0.8 % of samples), SMC poll (1–6 %), the twenty-bit `dos-mixed` gap (453 vs 351) | each under 3 % here | profiles | low | low |
+
+- **V86 at IOPL 0 and paged protected16 CPL3** (the embedder's lowest cells, 17–18 M steps/s):
+  items 1 and 2 are both measured on exactly these shapes and add up to −517 / −544 per step
+  (−34..−36 %) at their ceilings, which would take those cells to about 26–27 M steps/s at the
+  same per-instruction rate scaling (ASSUMED); item 4 adds −49. Nothing V86-specific remains
+  large: the #GP round trip is ~8 % of `v86gp`.
+- **Memory-heavy flat code** (the embedder's game renderer): item 3 if it writes device memory
+  through MMIO, then items 4, 6 and 5; the paged items do not apply to unpaged Flat32.
+- **Real mode** is already the cheapest regime; its remaining items are 5 (links, `call-ret`)
+  and 7.
