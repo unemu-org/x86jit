@@ -1747,6 +1747,12 @@ impl Memory {
         self.mapping_identity.clone()
     }
 
+    /// Whether `identity` is the current `mapping_identity`, without a clone.
+    #[inline(always)]
+    pub(crate) fn is_mapping_identity(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.mapping_identity, identity)
+    }
+
     /// Tag every page spanned by `[addr, addr+len)` as backing translated code
     /// (§10). Called through `&self` when a block is cached, so a later store to
     /// the page is caught. Idempotent.

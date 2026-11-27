@@ -79,8 +79,30 @@ pub(super) struct State {
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
     pub(super) transaction: Option<crate::interp::legacy::paging::Transaction>,
     pub(super) event_transaction: Option<crate::interp::legacy::paging::Transaction>,
-    // Most recent first; every entry is a member of `contexts`.
-    recent: Box<[Option<(LegacyContextStamp, u64)>; 4]>,
+    // Every entry is a member of `contexts`; the least recently used one
+    // (`uses`) leaves first.
+    recent: Box<[Option<Recent>; 4]>,
+    uses: u64,
+    // `LegacyContextStamp::quick` of `stamp`.
+    quick: u64,
+    // The selection serial (`Execution::selection`) at which the per-turn
+    // resolve last compared `stamp` with the live state; `None` after any
+    // other comparison (xj-to9.59).
+    synced: Option<u64>,
+    // Resolves that found the serial unchanged and compared nothing.
+    #[cfg(test)]
+    skips: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Recent {
+    stamp: LegacyContextStamp,
+    id: u64,
+    quick: u64,
+    used: u64,
+    // The `Execution` identity id whose complete stamp this is, or
+    // `u64::MAX` (`Execution::paging_selection`).
+    complete: u64,
 }
 
 impl State {
@@ -114,27 +136,39 @@ impl State {
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
         self.stamp = None;
+        self.synced = None;
         self.contexts.clear();
         *self.recent = [None; 4];
     }
 
-    pub(super) fn reconcile(&mut self, vm: &Vm, cpu: &CpuState, model: LegacyCpuModel) {
-        let stamp = LegacyContextStamp::new(cpu, model);
+    /// Brings the context identity, the TLB context and the proofs up to
+    /// the live state. `selection` is `Execution::paging_selection` for the
+    /// dispatcher's per-turn resolve, `None` for every other caller: while
+    /// its serial is the one this identity was last compared at, no stamped
+    /// field has changed, and the stamp is not compared again; an identity
+    /// id it names is the live state's complete stamp, so the recent entry
+    /// recorded for that id is it, unread (xj-to9.59).
+    pub(super) fn reconcile(
+        &mut self,
+        vm: &Vm,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        selection: Option<(u64, Option<u64>)>,
+    ) {
         let memory = &vm.mem as *const Memory as usize;
-        let mapping = vm.mem.mapping_identity();
         if self.model != Some(model)
             || self.memory != memory
             || self
                 .mapping
                 .as_ref()
-                .is_none_or(|m| !Arc::ptr_eq(m, &mapping))
+                .is_none_or(|m| !vm.mem.is_mapping_identity(m))
         {
             self.blocks
                 .reset(vm.cache.proof_generation(), why!(Mapping));
             self.invalidate();
             self.model = Some(model);
             self.memory = memory;
-            self.mapping = Some(mapping);
+            self.mapping = Some(vm.mem.mapping_identity());
         }
         // The diagnostics remember a drop across TLB generations.
         #[cfg(feature = "test-hooks")]
@@ -144,37 +178,123 @@ impl State {
         });
         // A write drops the proofs whose bus sources it overlaps.
         self.blocks.reconcile(&vm.cache);
-        if self.stamp != Some(stamp) {
-            self.context_id = if let Some(slot) = self
-                .recent
-                .iter()
-                .position(|r| r.as_ref().is_some_and(|(s, _)| *s == stamp))
+        let serial = selection.map(|(serial, _)| serial);
+        if serial.is_none() || self.synced != serial || self.stamp.is_none() {
+            let complete = selection.and_then(|(_, id)| id);
+            self.reconcile_identity(cpu, model, complete);
+            self.synced = serial;
+        } else {
+            // Every writer of a stamped field outside a block walk marks it
+            // (`Execution::context_dirty`); a walk reports its own. Every
+            // test build checks that none was missed.
+            #[cfg(any(test, debug_assertions))]
+            assert!(
+                self.stamp.as_ref().is_some_and(|s| s.matches(cpu, model)),
+                "a stamped field changed at an unchanged selection serial"
+            );
+            #[cfg(test)]
             {
-                self.recent[..=slot].rotate_right(1);
-                self.recent[0].unwrap().1
-            } else {
-                let id = if let Some(id) = self.contexts.get(&stamp) {
-                    *id
-                } else {
-                    // Bound context identities as well as blocks. Clear both before
-                    // reusing an ID; this does not expire cached translations.
-                    if self.contexts.len() == MAX_CONTEXTS {
-                        self.blocks.clear(why!(Paging));
-                        self.contexts.clear();
-                        *self.recent = [None; 4];
-                    }
-                    let id = self.contexts.len() as u64;
-                    self.contexts.insert(stamp, id);
-                    id
-                };
-                self.recent.rotate_right(1);
-                self.recent[0] = Some((stamp, id));
-                id
-            };
-            self.stamp = Some(stamp);
+                self.skips += 1;
+            }
         }
         self.tlb.get_mut().reconcile(cpu);
         self.reconcile_generation();
+    }
+
+    /// The TLB context alone, after a walk changed the CPU context: the
+    /// identity waits for the next resolve, after the dispatcher's
+    /// `sync_class` has advanced the selection serial.
+    pub(super) fn reconcile_translation(&mut self, cpu: &CpuState) {
+        self.tlb.get_mut().reconcile(cpu);
+        self.reconcile_generation();
+    }
+
+    // The identity of the complete stamp of `cpu`: the last one, a recent
+    // one or a retained one, compared where it is kept (`quick` first), or a
+    // new one.
+    fn reconcile_identity(&mut self, cpu: &CpuState, model: LegacyCpuModel, complete: Option<u64>) {
+        if let Some(complete) = complete {
+            if let Some(slot) = self
+                .recent
+                .iter()
+                .position(|r| r.as_ref().is_some_and(|r| r.complete == complete))
+            {
+                let entry = self.recent[slot].as_mut().unwrap();
+                debug_assert!(entry.stamp.matches(cpu, model));
+                if self.context_id != entry.id || self.stamp.is_none() {
+                    self.uses += 1;
+                    entry.used = self.uses;
+                    self.context_id = entry.id;
+                    self.stamp = Some(entry.stamp);
+                    self.quick = entry.quick;
+                }
+                return;
+            }
+        }
+        let quick = LegacyContextStamp::quick(cpu, false);
+        let complete = complete.unwrap_or(u64::MAX);
+        if self.quick == quick && self.stamp.as_ref().is_some_and(|s| s.matches(cpu, model)) {
+            if complete != u64::MAX {
+                if let Some(entry) = self
+                    .recent
+                    .iter_mut()
+                    .flatten()
+                    .find(|r| r.id == self.context_id)
+                {
+                    entry.complete = complete;
+                }
+            }
+            return;
+        }
+        self.uses += 1;
+        if let Some(slot) = self.recent.iter().position(|r| {
+            r.as_ref()
+                .is_some_and(|r| r.quick == quick && r.stamp.matches(cpu, model))
+        }) {
+            let entry = self.recent[slot].as_mut().unwrap();
+            entry.used = self.uses;
+            if complete != u64::MAX {
+                entry.complete = complete;
+            }
+            self.context_id = entry.id;
+            self.stamp = Some(entry.stamp);
+            self.quick = quick;
+            return;
+        }
+        let stamp = LegacyContextStamp::new(cpu, model);
+        let id = if let Some(id) = self.contexts.get(&stamp) {
+            *id
+        } else {
+            // Bound context identities as well as blocks. Clear both before
+            // reusing an ID; this does not expire cached translations.
+            if self.contexts.len() == MAX_CONTEXTS {
+                self.blocks.clear(why!(Paging));
+                self.contexts.clear();
+                *self.recent = [None; 4];
+            }
+            let id = self.contexts.len() as u64;
+            self.contexts.insert(stamp, id);
+            id
+        };
+        let slot = self
+            .recent
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                (0..self.recent.len())
+                    .min_by_key(|&i| self.recent[i].as_ref().unwrap().used)
+                    .unwrap()
+            });
+        self.recent[slot] = Some(Recent {
+            stamp,
+            id,
+            quick,
+            used: self.uses,
+            complete,
+        });
+        self.context_id = id;
+        self.stamp = Some(stamp);
+        self.quick = quick;
     }
 
     fn reconcile_generation(&mut self) {
@@ -233,13 +353,14 @@ impl State {
         owner_id: u64,
         exit_word: &AtomicU64,
         ordinary: bool,
+        selection: Option<(u64, Option<u64>)>,
     ) -> Result<(Arc<IrBlock>, bool), Exit> {
         let walk_wrote = Cell::new(false);
         #[cfg(feature = "test-hooks")]
         let mut retry = None;
         loop {
             vm.handle_smc(exit_word);
-            self.reconcile(vm, cpu, model);
+            self.reconcile(vm, cpu, model, selection);
             let key = self.key(cpu, model, context, owner_id, ordinary)?;
             if let Some(proof) = self
                 .blocks
@@ -373,6 +494,21 @@ impl State {
             return Ok((ir, ordinary));
         }
     }
+}
+
+/// The vCPU's paging state, made on first use.
+#[inline(always)]
+fn paging_state(paging: &mut Option<Box<State>>) -> &mut State {
+    if paging.is_none() {
+        new_paging_state(paging);
+    }
+    paging.as_deref_mut().unwrap()
+}
+
+#[cold]
+#[inline(never)]
+fn new_paging_state(paging: &mut Option<Box<State>>) {
+    *paging = Some(Box::default());
 }
 
 /// Whether a paged block takes the ordinary Flat32, Segmented or V86 walk.
@@ -686,7 +822,8 @@ impl Vcpu {
             self.cpu.clear_mmio_parts();
             execution.instruction_retry = None;
         }
-        let state = execution.paging.get_or_insert_with(Default::default);
+        let selection = execution.paging_selection();
+        let state = paging_state(&mut execution.paging);
         state.transaction = None;
         state
             .resolve(
@@ -697,6 +834,7 @@ impl Vcpu {
                 execution.owner_id,
                 &self.exit_request.word,
                 true,
+                Some(selection),
             )
             // Paging always uses a protected or V86 context. Reuse the
             // dispatcher's system-walk gate before selecting paged execution.
@@ -727,8 +865,8 @@ impl Vcpu {
         // A retained retry slice arrives as Protected; classify it here.
         if ordinary || ordinary_block(context, ir) {
             execution.rep_flags = None;
-            let state = execution.paging.get_or_insert_with(Default::default);
-            return crate::interp::legacy::paging::execute_flat32::<ROUTED, ORDER>(
+            let state = paging_state(&mut execution.paging);
+            let progress = crate::interp::legacy::paging::execute_flat32::<ROUTED, ORDER>(
                 ir,
                 &mut self.cpu,
                 &vm.mem,
@@ -739,6 +877,13 @@ impl Vcpu {
                 &mut state.transaction,
                 &state.tlb,
             );
+            // A walk that reloaded a data segment and then stopped with an
+            // exit reports no context change (`BlockPass::reloaded`): the
+            // next resolve compares the paging stamp again (xj-to9.59).
+            if progress.outcome.as_ref().is_some_and(|o| o.is_err()) {
+                execution.context_dirty();
+            }
+            return progress;
         }
         let comparing = ir.ops.iter().any(|op| {
             matches!(
@@ -769,7 +914,7 @@ impl Vcpu {
         } else {
             execution.rep_flags = None;
         }
-        let state = execution.paging.get_or_insert_with(Default::default);
+        let state = paging_state(&mut execution.paging);
         let v86 = context.regime == MachineRegime::Virtual8086;
         // Same-level far transfers of the ordinary classes skip the operand
         // transaction when their descriptor and frame are proved RAM.
@@ -827,10 +972,17 @@ impl Vcpu {
             if outcome.translations_invalidated {
                 state.invalidate();
             } else if outcome.context_changed {
-                state.reconcile(vm, &self.cpu, self.legacy_model.unwrap());
+                // The dispatcher's `sync_class` follows.
+                state.reconcile_translation(&self.cpu);
             }
             outcome
         });
+        if !outcome
+            .as_ref()
+            .is_ok_and(|o| !o.context_changed && !o.translations_invalidated)
+        {
+            execution.context_dirty();
+        }
         if let Some(saved) = execution.rep_flags.as_mut() {
             let fault = outcome.as_ref().is_err_and(|exit| {
                 matches!(exit, Exit::UnmappedMemory { .. })
@@ -964,6 +1116,7 @@ impl Vcpu {
             execution.owner_id,
             &self.exit_request.word,
             false,
+            None,
         );
         let ir = match result {
             Ok((ir, _)) => ir,
@@ -1053,7 +1206,7 @@ impl Vcpu {
         if outcome.translations_invalidated {
             state.invalidate();
         } else if outcome.context_changed {
-            state.reconcile(vm, &self.cpu, model.legacy_model());
+            state.reconcile(vm, &self.cpu, model.legacy_model(), None);
         }
         self.cpu.finish_mmio_retry(outcome.exit.as_ref());
         outcome.exit.map_or(Ok(()), Err)
@@ -1162,8 +1315,236 @@ fn execute_retained<const ROUTED: bool, const ORDER: u8>(
 }
 
 #[cfg(test)]
+impl Vcpu {
+    /// Paged resolves that compared no stamp (xj-to9.59).
+    pub(in crate::vm) fn paging_skips_for_test(&self) -> u64 {
+        self.legacy_execution
+            .as_ref()
+            .and_then(|e| e.paging.as_ref())
+            .map_or(0, |s| s.skips)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    // xj-to9.59: a paged USE16 ring-0 loop whose every iteration writes each
+    // class of stamped field from inside a block walk: data-segment loads
+    // with two descriptors, LIDT and LGDT with two tables each, INT n and
+    // IRET through a 286 interrupt gate, LLDT with two LDTs, a far CALL into
+    // a second code segment and RETF, MOV CR0 toggling TS, POPF toggling
+    // IOPL, and a #DE delivered between walks; an STI window takes a queued
+    // IRQ between walks. LTR runs once. Every following resolve finds the
+    // selection serial advanced or the stamp unchanged (the reconcile
+    // assertion): a writer that left the serial still fails it.
+    fn paged_writers(model: crate::CpuModel) -> (Vm, Vcpu) {
+        let mut vm = Vm::new(crate::VmConfig::flat(0x20000));
+        vm.set_cpu_model(model);
+        vm.set_exception_delivery(crate::ExceptionDelivery::InGuest);
+        vm.map(0, 0x20000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+        for page in 0..32u32 {
+            vm.write_bytes(
+                0x2000 + u64::from(page * 4),
+                &((page << 12) | 7).to_le_bytes(),
+            )
+            .unwrap();
+        }
+        let descriptor = |base: u32, limit: u16, access: u8| -> [u8; 8] {
+            let [l0, l1] = limit.to_le_bytes();
+            let [b0, b1, b2, b3] = base.to_le_bytes();
+            [l0, l1, b0, b1, b2, access, 0, b3]
+        };
+        let gdt = [
+            [0; 8],
+            descriptor(0, 0xffff, 0x9b),      // 08h: code
+            descriptor(0x6000, 0xffff, 0x93), // 10h: data A
+            descriptor(0x7000, 0xffff, 0x93), // 18h: data B
+            descriptor(0, 0xffff, 0x9b),      // 20h: second code segment
+            descriptor(0x5400, 7, 0x82),      // 28h: LDT A
+            descriptor(0x5408, 7, 0x82),      // 30h: LDT B
+            descriptor(0, 0xffff, 0x93),      // 38h: stack
+            descriptor(0x5600, 0x2b, 0x81),   // 40h: 286 TSS
+        ]
+        .concat();
+        vm.write_bytes(0x5000, &gdt).unwrap();
+        vm.write_bytes(0x5200, &gdt).unwrap();
+        // 286 interrupt gates to 20h: #DE at 4820h, 40h at 4810h, 41h at 4830h.
+        for idt in [0x5800u64, 0x5c00] {
+            for (vector, ip) in [(0u64, 0x4820u16), (0x40, 0x4810), (0x41, 0x4830)] {
+                let [i0, i1] = ip.to_le_bytes();
+                vm.write_bytes(idt + vector * 8, &[i0, i1, 0x20, 0, 0, 0x86, 0, 0])
+                    .unwrap();
+            }
+        }
+        // LIDT and LGDT operands, DS-relative to data A.
+        vm.write_bytes(
+            0x6100,
+            &[
+                0xff, 3, 0, 0x58, 0, 0, 0xff, 3, 0, 0x5c, 0, 0, 0x47, 0, 0, 0x50, 0, 0, 0x47, 0, 0,
+                0x52, 0, 0,
+            ],
+        )
+        .unwrap();
+        #[rustfmt::skip]
+        let code: &[u8] = &[
+            0xb8, 0x40, 0x00,             // 4000: mov ax,40h
+            0x0f, 0x00, 0xd8,             //       ltr ax
+            0xb8, 0x10, 0x00,             // 4006: mov ax,10h
+            0x8e, 0xd8,                   //       mov ds,ax
+            0xff, 0x06, 0x10, 0x00,       //       inc word [10h]
+            0x0f, 0x01, 0x1e, 0x00, 0x01, //       lidt [100h]
+            0x0f, 0x01, 0x16, 0x0c, 0x01, //       lgdt [10ch]
+            0xcd, 0x40,                   //       int 40h
+            0x0f, 0x01, 0x1e, 0x06, 0x01, //       lidt [106h]
+            0x0f, 0x01, 0x16, 0x12, 0x01, //       lgdt [112h]
+            0xb8, 0x28, 0x00,             //       mov ax,28h
+            0x0f, 0x00, 0xd0,             //       lldt ax
+            0xb8, 0x18, 0x00,             //       mov ax,18h
+            0x8e, 0xd8,                   //       mov ds,ax
+            0xff, 0x06, 0x10, 0x00,       //       inc word [10h]
+            0x9a, 0x00, 0x48, 0x20, 0x00, //       call 20h:4800h
+            0xb8, 0x30, 0x00,             //       mov ax,30h
+            0x0f, 0x00, 0xd0,             //       lldt ax
+            0x0f, 0x20, 0xc0,             //       mov eax,cr0
+            0x66, 0x35, 0x08, 0, 0, 0,    //       xor eax,8 (TS)
+            0x0f, 0x22, 0xc0,             //       mov cr0,eax
+            0x9c, 0x58,                   //       pushf; pop ax
+            0x35, 0x00, 0x10,             //       xor ax,1000h (IOPL)
+            0x50, 0x9d,                   //       push ax; popf
+            0xb3, 0x00,                   //       mov bl,0
+            0xb8, 0x07, 0x00,             //       mov ax,7
+            0xf6, 0xf3,                   //       div bl (#DE once)
+            0xfb, 0x90, 0xfa,             //       sti; nop; cli
+            0x49,                         //       dec cx
+            0x75, 0xa7,                   //       jnz 4006h
+            0xf4,                         //       hlt
+        ];
+        vm.write_bytes(0x4000, code).unwrap();
+        vm.write_bytes(0x4800, &[0x46, 0xcb]).unwrap(); // inc si; retf
+        vm.write_bytes(0x4810, &[0x47, 0xcf]).unwrap(); // inc di; iret
+        vm.write_bytes(0x4820, &[0x45, 0xb3, 0x01, 0xcf]).unwrap(); // inc bp; mov bl,1; iret
+        vm.write_bytes(0x4830, &[0x42, 0xcf]).unwrap(); // inc dx; iret
+        let mut cpu = vm.new_vcpu();
+        let cache = |base: u32, attributes: u16| crate::SegmentCache {
+            base,
+            limit: 0xffff,
+            attributes,
+            ..Default::default()
+        };
+        let l = &mut cpu.cpu.legacy;
+        l.cr0 = 0x8000_0001;
+        l.cr3 = 0x1000;
+        l.cpl = 0;
+        l.segments = [
+            cache(0, 0x9b),
+            cache(0x6000, 0x93),
+            cache(0x6000, 0x93),
+            cache(0, 0x93),
+            crate::SegmentCache {
+                unusable: 1,
+                ..Default::default()
+            },
+            crate::SegmentCache {
+                unusable: 1,
+                ..Default::default()
+            },
+        ];
+        l.gdtr = crate::legacy::TableRegister {
+            base: 0x5000,
+            limit: 0x47,
+            reserved: 0,
+        };
+        l.idtr = crate::legacy::TableRegister {
+            base: 0x5800,
+            limit: 0x3ff,
+            reserved: 0,
+        };
+        [
+            cpu.cpu.cs, cpu.cpu.ds, cpu.cpu.es, cpu.cpu.ss, cpu.cpu.fs, cpu.cpu.gs,
+        ] = [8, 0x10, 0x10, 0x38, 0, 0];
+        cpu.cpu.rip = 0x4000;
+        cpu.cpu.gpr[4] = 0x9000;
+        cpu.cpu.flags.if_ = false;
+        cpu.set_a20_enabled(true);
+        (vm, cpu)
+    }
+
+    // The counters the loop keeps: data A and B, SI (far calls), DI (INT
+    // 40h), BP (#DE), DX (IRQ 41h), CX (iterations left).
+    fn writer_counts(vm: &Vm, cpu: &Vcpu) -> [u64; 6] {
+        let word = |at| {
+            let mut w = [0; 2];
+            vm.read_bytes(at, &mut w).unwrap();
+            u64::from(u16::from_le_bytes(w))
+        };
+        [
+            word(0x6010),
+            word(0x7010),
+            cpu.reg(Reg::Rsi) & 0xffff,
+            cpu.reg(Reg::Rdi) & 0xffff,
+            cpu.reg(Reg::Rbp) & 0xffff,
+            cpu.reg(Reg::Rdx) & 0xffff,
+        ]
+    }
+
+    fn paging_skips(cpu: &Vcpu) -> u64 {
+        cpu.paging_skips_for_test()
+    }
+
+    #[test]
+    fn every_writer_of_a_stamped_field_advances_the_selection() {
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            let (vm, mut cpu) = paged_writers(model);
+            cpu.set_reg(Reg::Rcx, 40);
+            let options = crate::StepOptions::default();
+            // A run takes the IRQ queued before it in its first STI window.
+            let mut runs = 0;
+            loop {
+                cpu.inject_irq(0x41);
+                runs += 1;
+                let run = cpu.run_steps(&vm, 400, options).unwrap();
+                if matches!(run.stop(), crate::StepStop::Exit(Exit::Hlt)) {
+                    break;
+                }
+                assert!(runs < 100, "{model:?}: {:?}", run.stop());
+            }
+            assert_eq!(cpu.reg(Reg::Rcx) & 0xffff, 0, "{model:?}");
+            let counts = writer_counts(&vm, &cpu);
+            assert_eq!(counts[..5], [40; 5], "{model:?}");
+            assert!((1..=runs).contains(&counts[5]), "{model:?}: {counts:?}");
+            // An even count of toggles leaves TS and IOPL as they were.
+            assert_eq!(cpu.cpu.legacy.cr0 & 8, 0);
+            assert_eq!(cpu.cpu.rflags_system & 0x3000, 0);
+            assert!(
+                paging_skips(&cpu) > 40 * 5,
+                "{model:?}: {}",
+                paging_skips(&cpu)
+            );
+        }
+    }
+
+    // Host edits between runs: another table, IOPL, a restored image.
+    #[test]
+    fn a_host_edit_between_runs_advances_the_selection() {
+        let (vm, mut cpu) = paged_writers(crate::CpuModel::I80386);
+        cpu.set_reg(Reg::Rcx, 1000);
+        let options = crate::StepOptions::default();
+        assert_eq!(cpu.run_steps(&vm, 300, options).unwrap().steps(), 300);
+        let saved = cpu.cpu.clone();
+        for edit in 0..12 {
+            match edit % 4 {
+                0 => cpu.cpu.legacy.idtr.base ^= 0x5800 ^ 0x5c00,
+                1 => cpu.cpu.legacy.gdtr.base ^= 0x5000 ^ 0x5200,
+                2 => cpu.cpu.rflags_system ^= 0x1000,
+                _ => cpu.cpu = saved.clone(),
+            }
+            assert_eq!(cpu.run_steps(&vm, 97, options).unwrap().steps(), 97);
+        }
+        assert!(paging_skips(&cpu) > 0);
+    }
 
     #[test]
     fn sliced_far_calls_retain_blocks_and_translations_with_distant_data() {
@@ -1477,6 +1858,7 @@ mod tests {
                     1,
                     &exit,
                     true,
+                    None,
                 )
                 .unwrap()
                 .0;
@@ -1504,6 +1886,7 @@ mod tests {
                     1,
                     &exit,
                     true,
+                    None,
                 )
                 .unwrap()
                 .0;
@@ -1527,6 +1910,7 @@ mod tests {
                     1,
                     &exit,
                     true,
+                    None,
                 )
                 .unwrap()
                 .0;
@@ -1568,6 +1952,7 @@ mod tests {
                         1,
                         &exit,
                         true,
+                        None,
                     )
                     .unwrap()
                     .0

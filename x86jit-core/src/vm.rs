@@ -2580,6 +2580,10 @@ impl Vcpu {
             self.legacy_execution.as_mut().unwrap().pending_a20_enabled = Some(enabled);
         } else {
             self.cpu.legacy.a20_enabled = u8::from(enabled);
+            // A device handler sets the line inside a run (xj-to9.59).
+            if let Some(execution) = &mut self.legacy_execution {
+                execution.context_dirty();
+            }
         }
     }
 
@@ -2619,6 +2623,7 @@ impl Vcpu {
                 .and_then(|e| e.pending_a20_enabled.take())
             {
                 self.cpu.legacy.a20_enabled = u8::from(enabled);
+                self.legacy_execution.as_mut().unwrap().context_dirty();
             }
         }
     }

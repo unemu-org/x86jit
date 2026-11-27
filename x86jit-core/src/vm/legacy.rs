@@ -345,6 +345,13 @@ impl LegacyContextStamp {
     }
     #[inline(always)]
     fn matches(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
+        self.compare(cpu, model, false)
+    }
+
+    // `matches`, or with `flat32` whether this is the paged Flat32 identity
+    // of `cpu` (`drop_fs_gs`): FS and GS held cleared.
+    #[inline(always)]
+    fn compare(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool) -> bool {
         #[inline(always)]
         fn cache_bits(c: &crate::legacy::SegmentCache) -> (u64, u64) {
             (
@@ -381,15 +388,22 @@ impl LegacyContextStamp {
         // normalized state. CR2 remains output-only (decision-23 §5).
         let a = &self.state;
         let b = &cpu.legacy;
+        let (fs, gs) = if flat32 { (0, 0) } else { (cpu.fs, cpu.gs) };
         let mut diff = u64::from(self.model != model)
-            | u64::from(self.selectors != [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs])
+            | u64::from(self.selectors != [cpu.cs, cpu.ds, cpu.es, cpu.ss, fs, gs])
             | (self.system_flags ^ (cpu.rflags_system & 0x27000))
             | u64::from(a.cr0 ^ b.cr0)
             | u64::from(a.cr3 ^ b.cr3)
             | (table_bits(&a.gdtr) ^ table_bits(&b.gdtr))
             | (table_bits(&a.idtr) ^ table_bits(&b.idtr))
             | u64::from(tail_bits(a) ^ tail_bits(b));
-        for (a, b) in a.segments.iter().zip(&b.segments) {
+        let cleared = crate::legacy::SegmentCache::default();
+        for (i, (a, b)) in a.segments.iter().zip(&b.segments).enumerate() {
+            let b = if flat32 && i >= SegmentId::Fs as usize {
+                &cleared
+            } else {
+                b
+            };
             let (a0, a1) = cache_bits(a);
             let (b0, b1) = cache_bits(b);
             diff |= (a0 ^ b0) | (a1 ^ b1);
@@ -400,6 +414,37 @@ impl LegacyContextStamp {
             diff |= (a0 ^ b0) | (a1 ^ b1);
         }
         diff == 0
+    }
+
+    /// A prefilter of the complete identity of `cpu` (`new`, less FS and GS
+    /// for a paged Flat32 identity): its selectors, CPL, CR0, CR3 and stamped
+    /// EFLAGS bits folded into one word (xj-to9.59). Equal identities have
+    /// equal words; an equal word only names a candidate, which
+    /// `is_identity_of` confirms field by field.
+    #[inline(always)]
+    fn quick(cpu: &CpuState, flat32: bool) -> u64 {
+        let l = &cpu.legacy;
+        let fs_gs = if flat32 {
+            0
+        } else {
+            u64::from(cpu.fs) | (u64::from(cpu.gs) << 16)
+        };
+        let selectors = u64::from(cpu.cs)
+            | (u64::from(cpu.ds) << 16)
+            | (u64::from(cpu.es) << 32)
+            | (u64::from(cpu.ss) << 48);
+        let tail = fs_gs | (u64::from(l.cpl) << 32) | ((cpu.rflags_system & 0x27000) << 28);
+        let control = u64::from(l.cr0) | (u64::from(l.cr3) << 32);
+        selectors ^ tail.rotate_left(8) ^ control.rotate_left(24)
+    }
+
+    /// Whether this stamp `==` the complete identity of `cpu` (`new`, then
+    /// `drop_fs_gs` when `flat32`), read without building that stamp. A
+    /// reduced identity (`reduced_identity`) carries its class tag in CR2,
+    /// which a complete one holds zero and `matches` does not compare.
+    #[inline(always)]
+    fn is_identity_of(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool) -> bool {
+        self.state.cr2 == 0 && self.compare(cpu, model, flat32)
     }
 }
 // Decision-20: the firmware-style transition loop uses four contexts. An
@@ -424,6 +469,41 @@ const MAX_CHECKED_BLOCKS: usize = 4096;
 struct RetainedContext {
     id: u64,
     last_used: u64,
+}
+
+/// The recent identities and the selection state, boxed off the
+/// dispatcher's hot fields (`Execution::recent`).
+#[derive(Default)]
+struct Recent {
+    slots: [Option<RecentContext>; RECENT_CONTEXTS],
+    // `LegacyContextStamp::quick` of `stamp` when it is a complete identity.
+    quick: u64,
+    // The selection serial (xj-to9.59): advances at every `sync_class`, at
+    // every Machine run entry and at every other write of a stamped field
+    // outside a block walk (`context_dirty`). A block walk reports its own
+    // such writes (`Outcome::context_changed`), which the dispatcher follows
+    // with `sync_class`. While it holds still, the live stamp holds still,
+    // so `paging::State` need not compare its stamp again.
+    selection: u64,
+    // The selection serial right after the last selection and its identity
+    // id, when that identity is the complete stamp of the live state (a
+    // class other than Direct or Flat32, not reduced): `paging::State` keys
+    // its identities by it while the serial holds still.
+    complete: Option<(u64, u64)>,
+}
+
+/// One of the last few retained identities (`Execution::recent`).
+#[derive(Clone, Copy)]
+struct RecentContext {
+    stamp: LegacyContextStamp,
+    id: u64,
+    // The context epoch of its last use: the least recent entry leaves first.
+    epoch: u64,
+    // `LegacyContextStamp::quick` of a complete identity; zero for a reduced one.
+    quick: u64,
+    // The context derived from a complete identity of a class that keeps the
+    // whole stamp (`Execution::reselect_recent`): a pure function of it.
+    context: Option<MachineContext>,
 }
 
 struct Block {
@@ -809,12 +889,13 @@ pub(super) struct Execution {
     // Compiled Machine units and their counters (`compiled.rs`, decision-29).
     machine_jit: Box<compiled::State>,
     event_owner: Option<crate::interp::legacy::tasks::Owner>,
-    // The last few retained identities, most recent first, with the epoch of
-    // their last use: segment reloads and far transfers alternate between
-    // them without hashing the stamp. Every entry names a live member of
+    // The last few retained identities, each with the epoch of its last use:
+    // segment reloads and far transfers alternate between them without
+    // hashing or building the stamp. Entries stay in their slots; the one
+    // with the oldest epoch leaves first. Every entry names a live member of
     // `contexts`; its epoch returns to the LRU when it leaves this list.
     // Boxed, off the dispatcher's hot fields.
-    recent: Box<[Option<(LegacyContextStamp, u64, u64)>; RECENT_CONTEXTS]>,
+    recent: Box<Recent>,
 }
 impl Execution {
     pub(super) fn device_event(&self) -> Option<crate::DeviceEvent> {
@@ -848,7 +929,7 @@ impl Execution {
             validated: None,
             validated_direct_bus: false,
             contexts: EngineMap::default(),
-            recent: Box::new([None; RECENT_CONTEXTS]),
+            recent: Box::default(),
             blocks: EngineMap::default(),
             instruction_retry: None,
             retry_slices: Box::default(),
@@ -905,6 +986,7 @@ impl Execution {
         self.retained20.clear();
         self.last_direct_fetch = None;
         self.stall_count = 0;
+        self.context_dirty();
         if let Some(paging) = &mut self.paging {
             paging.reset();
         }
@@ -955,13 +1037,14 @@ impl Execution {
         self.flat32 = flat32::State::default();
         self.contexts.clear();
         self.next_context_id = 0;
-        *self.recent = [None; RECENT_CONTEXTS];
+        self.recent.slots = [None; RECENT_CONTEXTS];
         self.stamp = None;
         self.validated = None;
     }
     #[cold]
     #[inline(never)]
     pub(super) fn invalidate_paging(&mut self) {
+        self.context_dirty();
         if let Some(paging) = &mut self.paging {
             paging.invalidate();
         }
@@ -970,6 +1053,24 @@ impl Execution {
     fn sync(&mut self, cpu: &CpuState, model: LegacyCpuModel, force: bool) {
         self.sync_class(cpu, model, force, crate::SegmentClass::Checked);
     }
+    /// A write of a stamped field outside a block walk, or a state the
+    /// engine did not watch (a run entry): advance the selection serial, so
+    /// the next paged resolve compares the paging identity again (xj-to9.59).
+    #[inline(always)]
+    pub(super) fn context_dirty(&mut self) {
+        self.recent.selection = self.recent.selection.wrapping_add(1);
+    }
+    /// The selection serial, and the identity id that names the complete
+    /// stamp of the live state while that serial holds still, if one does.
+    pub(super) fn paging_selection(&self) -> (u64, Option<u64>) {
+        (
+            self.recent.selection,
+            self.recent
+                .complete
+                .filter(|&(serial, _)| serial == self.recent.selection)
+                .map(|(_, id)| id),
+        )
+    }
     fn sync_class(
         &mut self,
         cpu: &CpuState,
@@ -977,122 +1078,227 @@ impl Execution {
         force: bool,
         class: crate::SegmentClass,
     ) {
-        // A reduced identity is compared with the recent ones before it is
-        // built (`is_reduced_identity`): a hit takes the recent path below
-        // without building the stamp. The last identity is first in
-        // `recent` unless the last context was Direct.
-        let stamp = if LegacyContextStamp::reduced(cpu, class) {
-            if let Some(slot) = self.recent.iter().position(|r| {
-                r.as_ref()
-                    .is_some_and(|(s, ..)| s.is_reduced_identity(cpu, model, class))
-            }) {
-                if self.resync_recent(slot, force) {
-                    return;
-                }
-            }
-            LegacyContextStamp::reduced_identity(cpu, model, class)
+        self.context_dirty();
+        if LegacyContextStamp::reduced(cpu, class) {
+            self.recent.complete = None;
+            self.select_reduced(cpu, model, force, class);
         } else {
-            let mut stamp = LegacyContextStamp::new(cpu, model);
-            if class == crate::SegmentClass::Flat32 {
-                stamp.drop_fs_gs();
+            self.select_complete(cpu, model, force, class);
+            let complete = !matches!(
+                class,
+                crate::SegmentClass::Direct | crate::SegmentClass::Flat32
+            );
+            self.recent.complete = complete.then_some((self.recent.selection, self.context_id));
+        }
+    }
+    #[inline(always)]
+    fn select_reduced(
+        &mut self,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        force: bool,
+        class: crate::SegmentClass,
+    ) {
+        // A reduced identity is compared with the recent ones before it
+        // is built (`is_reduced_identity`): a hit takes the recent path
+        // without building the stamp.
+        if let Some(slot) = self.recent.slots.iter().position(|r| {
+            r.as_ref()
+                .is_some_and(|r| r.stamp.is_reduced_identity(cpu, model, class))
+        }) {
+            if self.resync_recent(slot, force) {
+                return;
             }
-            stamp
-        };
+        }
+        let stamp = LegacyContextStamp::reduced_identity(cpu, model, class);
+        let same = self.stamp == Some(stamp);
         #[cfg(feature = "test-hooks")]
-        if self.stamp != Some(stamp) {
+        if !same {
             diag::note_context(diag::ContextNote::Switch);
         }
-        if force || self.stamp != Some(stamp) {
-            self.context_epoch = if let Some(next) = self.context_epoch.checked_add(1) {
-                next
-            } else {
-                self.invalidate_translations();
-                0
-            };
-            // Decision-18 §3 guard dimensions remain complete. Stable identities
-            // implement the accepted transition-cost contract: returning to an
-            // identical context reuses its IR instead of discarding other modes.
-            // Fetch still revalidates bytes, mappings and policy on every entry.
-            self.context_id = if class == crate::SegmentClass::Direct {
-                // Direct states do not consume decision-20's Checked LRU slots.
-                u64::MAX
-            } else if let Some(slot) = self
+        if force || !same {
+            self.advance_epoch();
+            self.context_id = if let Some(slot) = self
                 .recent
+                .slots
                 .iter()
-                .position(|r| r.as_ref().is_some_and(|(s, ..)| *s == stamp))
+                .position(|r| r.as_ref().is_some_and(|r| r.stamp == stamp))
             {
-                #[cfg(feature = "test-hooks")]
-                diag::note_context(diag::ContextNote::Recent);
-                self.recent[..=slot].rotate_right(1);
-                let entry = self.recent[0].as_mut().unwrap();
-                entry.2 = self.context_epoch;
-                entry.1
-            } else if let Some(context) = self.contexts.get_mut(&stamp) {
-                #[cfg(feature = "test-hooks")]
-                diag::note_context(diag::ContextNote::Retained);
-                context.last_used = self.context_epoch;
-                let id = context.id;
-                self.remember_recent(stamp, id);
-                id
+                self.use_recent(slot)
             } else {
-                if self.contexts.len() == MAX_RETAINED_CONTEXTS {
-                    // The LRU sees every recent use before choosing.
-                    for (stamp, _, epoch) in std::mem::take(&mut *self.recent).into_iter().flatten()
-                    {
-                        self.contexts.get_mut(&stamp).unwrap().last_used = epoch;
-                    }
-                    let oldest = *self
-                        .contexts
-                        .iter()
-                        .min_by_key(|(_, context)| context.last_used)
-                        .unwrap()
-                        .0;
-                    let evicted = self.contexts.remove(&oldest).unwrap();
-                    // Identities are never reused before a translation flush
-                    // (`next_context_id`), so no key or link can name the
-                    // evicted one again: its Flat32 and Segmented proofs are
-                    // never returned, and the proof map's bound sweeps them
-                    // first as unused (xj-to9.56) instead of a walk over every
-                    // proof per eviction. Every creation also advances the
-                    // epoch, whose rollover flushes first, so the counter
-                    // never reaches Direct's `u64::MAX`. The link flush is
-                    // redundant, kept so no link outlives the identity it
-                    // names; the Checked blocks have no other bound.
-                    self.links.clear();
-                    self.blocks.retain(|key, _| key.context_id != evicted.id);
-                    #[cfg(feature = "test-hooks")]
-                    diag::note_context(diag::ContextNote::Evicted {
-                        id: evicted.id,
-                        fields: oldest.diag_fields(),
-                    });
-                }
-                let id = self.next_context_id;
-                self.next_context_id += 1;
-                #[cfg(feature = "test-hooks")]
-                diag::note_context(diag::ContextNote::Created {
-                    id,
-                    previous: self.stamp.map(|s| s.diag_fields()),
-                    fields: stamp.diag_fields(),
-                });
-                self.contexts.insert(
-                    stamp,
-                    RetainedContext {
-                        id,
-                        last_used: self.context_epoch,
-                    },
-                );
-                self.remember_recent(stamp, id);
-                id
+                self.enter_context(stamp, 0)
             };
             self.stamp = Some(stamp);
+            self.recent.quick = 0;
         }
+    }
+    fn select_complete(
+        &mut self,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        force: bool,
+        class: crate::SegmentClass,
+    ) {
+        // A complete identity is compared with the live state where it is
+        // kept, its `quick` word first, and built only when no retained
+        // recent identity is it (xj-to9.59).
+        let flat32 = class == crate::SegmentClass::Flat32;
+        let quick = LegacyContextStamp::quick(cpu, flat32);
+        let same = self.recent.quick == quick
+            && self
+                .stamp
+                .as_ref()
+                .is_some_and(|s| s.is_identity_of(cpu, model, flat32));
+        #[cfg(feature = "test-hooks")]
+        if !same {
+            diag::note_context(diag::ContextNote::Switch);
+        }
+        if same && !force {
+            return;
+        }
+        // A rollover flushes every identity, the last one's too.
+        let flushed = self.advance_epoch();
+        let same = same && !flushed;
+        // Decision-18 §3 guard dimensions remain complete. Stable identities
+        // implement the accepted transition-cost contract: returning to an
+        // identical context reuses its IR instead of discarding other modes.
+        // Fetch still revalidates bytes, mappings and policy on every entry.
+        if class == crate::SegmentClass::Direct {
+            // Direct states do not consume decision-20's Checked LRU slots.
+            self.context_id = u64::MAX;
+            if same {
+                return;
+            }
+        } else {
+            // The last identity, unless Direct, is a recent one: found by
+            // its id. Any other is compared.
+            let current = self.context_id;
+            let slot = if same && current != u64::MAX {
+                self.recent
+                    .slots
+                    .iter()
+                    .position(|r| r.as_ref().is_some_and(|r| r.id == current))
+            } else {
+                self.recent.slots.iter().position(|r| {
+                    r.as_ref().is_some_and(|r| {
+                        r.quick == quick && r.stamp.is_identity_of(cpu, model, flat32)
+                    })
+                })
+            };
+            if let Some(slot) = slot {
+                self.context_id = self.use_recent(slot);
+                if !same {
+                    self.stamp = Some(self.recent.slots[slot].as_ref().unwrap().stamp);
+                    self.recent.quick = quick;
+                }
+                return;
+            }
+        }
+        // A last identity selected as Direct may be retained as well.
+        let stamp = match self.stamp {
+            Some(stamp) if same => stamp,
+            _ => {
+                let mut stamp = LegacyContextStamp::new(cpu, model);
+                if flat32 {
+                    stamp.drop_fs_gs();
+                }
+                stamp
+            }
+        };
+        if class != crate::SegmentClass::Direct {
+            self.context_id = self.enter_context(stamp, quick);
+        }
+        self.stamp = Some(stamp);
+        self.recent.quick = quick;
+    }
+    // Advances the context epoch; at its rollover, flushes every identity
+    // (`invalidate_translations`) and returns true.
+    fn advance_epoch(&mut self) -> bool {
+        if let Some(next) = self.context_epoch.checked_add(1) {
+            self.context_epoch = next;
+            false
+        } else {
+            self.invalidate_translations();
+            self.context_epoch = 0;
+            true
+        }
+    }
+    // A recent identity is selected again: its id, with its use now.
+    #[inline(always)]
+    fn use_recent(&mut self, slot: usize) -> u64 {
+        #[cfg(feature = "test-hooks")]
+        diag::note_context(diag::ContextNote::Recent);
+        let entry = self.recent.slots[slot].as_mut().unwrap();
+        entry.epoch = self.context_epoch;
+        entry.id
+    }
+    // The id of `stamp`, which no recent entry holds: retained, or created
+    // (evicting the least recently used identity at the bound).
+    fn enter_context(&mut self, stamp: LegacyContextStamp, quick: u64) -> u64 {
+        if let Some(context) = self.contexts.get_mut(&stamp) {
+            #[cfg(feature = "test-hooks")]
+            diag::note_context(diag::ContextNote::Retained);
+            context.last_used = self.context_epoch;
+            let id = context.id;
+            self.remember_recent(stamp, id, quick);
+            return id;
+        }
+        if self.contexts.len() == MAX_RETAINED_CONTEXTS {
+            // The LRU sees every recent use before choosing.
+            for recent in std::mem::take(&mut self.recent.slots).into_iter().flatten() {
+                self.contexts.get_mut(&recent.stamp).unwrap().last_used = recent.epoch;
+            }
+            let oldest = *self
+                .contexts
+                .iter()
+                .min_by_key(|(_, context)| context.last_used)
+                .unwrap()
+                .0;
+            let evicted = self.contexts.remove(&oldest).unwrap();
+            // Identities are never reused before a translation flush
+            // (`next_context_id`), so no key or link can name the
+            // evicted one again: its Flat32 and Segmented proofs are
+            // never returned, and the proof map's bound sweeps them
+            // first as unused (xj-to9.56) instead of a walk over every
+            // proof per eviction. Every creation also advances the
+            // epoch, whose rollover flushes first, so the counter
+            // never reaches Direct's `u64::MAX`. The link flush is
+            // redundant, kept so no link outlives the identity it
+            // names; the Checked blocks have no other bound.
+            self.links.clear();
+            self.blocks.retain(|key, _| key.context_id != evicted.id);
+            #[cfg(feature = "test-hooks")]
+            diag::note_context(diag::ContextNote::Evicted {
+                id: evicted.id,
+                fields: oldest.diag_fields(),
+            });
+        }
+        let id = self.next_context_id;
+        self.next_context_id += 1;
+        #[cfg(feature = "test-hooks")]
+        diag::note_context(diag::ContextNote::Created {
+            id,
+            previous: self.stamp.map(|s| s.diag_fields()),
+            fields: stamp.diag_fields(),
+        });
+        self.contexts.insert(
+            stamp,
+            RetainedContext {
+                id,
+                last_used: self.context_epoch,
+            },
+        );
+        self.remember_recent(stamp, id, quick);
+        id
     }
     // `sync_class` with a reduced identity found in `recent[slot]`: whether
     // it is done, as the full path would have done it. An epoch rollover
     // takes the full path, which flushes.
     #[inline(always)]
     fn resync_recent(&mut self, slot: usize, force: bool) -> bool {
-        let same = slot == 0 && self.context_id != u64::MAX;
+        // Ids name one stamp each: the last identity, unless Direct.
+        let same = self.context_id != u64::MAX
+            && self.recent.slots[slot].as_ref().unwrap().id == self.context_id;
         if same && !force {
             return true;
         }
@@ -1100,18 +1306,15 @@ impl Execution {
             return false;
         };
         #[cfg(feature = "test-hooks")]
-        {
-            if !same {
-                diag::note_context(diag::ContextNote::Switch);
-            }
-            diag::note_context(diag::ContextNote::Recent);
+        if !same {
+            diag::note_context(diag::ContextNote::Switch);
         }
         self.context_epoch = next;
-        self.recent[..=slot].rotate_right(1);
-        let entry = self.recent[0].as_mut().unwrap();
-        entry.2 = next;
-        self.context_id = entry.1;
-        self.stamp = Some(entry.0);
+        self.context_id = self.use_recent(slot);
+        if !same {
+            self.stamp = Some(self.recent.slots[slot].as_ref().unwrap().stamp);
+            self.recent.quick = 0;
+        }
         true
     }
     // A full Checked block map drops a quarter of its blocks in map order:
@@ -1130,12 +1333,84 @@ impl Execution {
             self.blocks.remove(&key);
         }
     }
-    fn remember_recent(&mut self, stamp: LegacyContextStamp, id: u64) {
-        if let Some((old, _, epoch)) = self.recent[RECENT_CONTEXTS - 1].take() {
-            self.contexts.get_mut(&old).unwrap().last_used = epoch;
+    // `stamp` becomes recent in a free slot, or in place of the least
+    // recently used entry, whose epoch returns to the LRU.
+    fn remember_recent(&mut self, stamp: LegacyContextStamp, id: u64, quick: u64) {
+        let slot = if let Some(free) = self.recent.slots.iter().position(Option::is_none) {
+            free
+        } else {
+            let oldest = (0..RECENT_CONTEXTS)
+                .min_by_key(|&i| self.recent.slots[i].as_ref().unwrap().epoch)
+                .unwrap();
+            let old = self.recent.slots[oldest].take().unwrap();
+            self.contexts.get_mut(&old.stamp).unwrap().last_used = old.epoch;
+            oldest
+        };
+        self.recent.slots[slot] = Some(RecentContext {
+            stamp,
+            id,
+            epoch: self.context_epoch,
+            quick,
+            context: None,
+        });
+    }
+    /// `sync_class(cpu, model, true, class)` when a recent identity whose
+    /// context is kept is the live state's complete stamp: that context, the
+    /// one `derive_legacy_context` returns for it, whose class is `class`
+    /// (xj-to9.59). `None` leaves everything as it was.
+    #[inline(always)]
+    fn reselect_recent(&mut self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
+        // A rollover takes `sync_class`, which flushes.
+        if self.context_epoch == u64::MAX {
+            return None;
         }
-        self.recent.rotate_right(1);
-        self.recent[0] = Some((stamp, id, self.context_epoch));
+        let quick = LegacyContextStamp::quick(cpu, false);
+        let slot = self.recent.slots.iter().position(|r| {
+            r.as_ref().is_some_and(|r| {
+                r.context.is_some() && r.quick == quick && r.stamp.is_identity_of(cpu, model, false)
+            })
+        })?;
+        self.context_dirty();
+        let current = self.context_id;
+        let entry = self.recent.slots[slot].as_ref().unwrap();
+        // Ids name one stamp each: the last identity, unless Direct.
+        let same = current != u64::MAX && entry.id == current;
+        let context = entry.context;
+        #[cfg(feature = "test-hooks")]
+        if !same {
+            diag::note_context(diag::ContextNote::Switch);
+        }
+        self.context_epoch += 1;
+        self.context_id = self.use_recent(slot);
+        if !same {
+            self.stamp = Some(self.recent.slots[slot].as_ref().unwrap().stamp);
+            self.recent.quick = quick;
+        }
+        self.recent.complete = Some((self.recent.selection, self.context_id));
+        context
+    }
+    /// Keeps `context`, derived from the live state, with the identity
+    /// `sync_class` just selected for it, when that identity is the complete
+    /// stamp: a class other than Direct or Flat32 that is not reduced.
+    fn keep_context(&mut self, cpu: &CpuState, context: MachineContext) {
+        let class = context.segment_class;
+        if matches!(
+            class,
+            crate::SegmentClass::Direct | crate::SegmentClass::Flat32
+        ) || LegacyContextStamp::reduced(cpu, class)
+        {
+            return;
+        }
+        let current = self.context_id;
+        if let Some(entry) = self
+            .recent
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|r| r.id == current)
+        {
+            entry.context = Some(context);
+        }
     }
     fn resolve<const KIND: u8>(
         &mut self,
@@ -2261,6 +2536,72 @@ impl Vcpu {
         Ok(context)
     }
 
+    /// `legacy_context_for_run`, then a forced `sync_class` of its class:
+    /// the dispatcher's reselection after a walk changed the context with
+    /// paging on. A recent complete identity that is the live state's keeps
+    /// the context derived for it, which is not derived again (xj-to9.59).
+    /// Unpaged identities are mostly reduced, which keep none.
+    #[inline(never)]
+    fn reselect_paged_context(&mut self) -> Result<MachineContext, Exit> {
+        let model = self.legacy_model.expect("legacy model");
+        let paged = !self.twenty_bit_model() && self.cpu.legacy.cr0 & (1 << 31) != 0;
+        let execution = self.legacy_execution.as_mut().unwrap();
+        // `legacy_context_for_run`'s other answers and refusals, in its order.
+        if paged
+            && execution.task_switch.context().is_none()
+            && self.cpu.task_debug_trap == 0
+            && self.cpu.rip <= u64::from(u32::MAX)
+            && matches!(model.generation, CpuGeneration::I286 | CpuGeneration::I386)
+            && !(model.generation == CpuGeneration::I386
+                && self.cpu.debug_test_registers[crate::legacy::DebugTestRegister::Dr7 as usize]
+                    & 0x20ff
+                    != 0)
+        {
+            if let Some(context) = execution.reselect_recent(&self.cpu, model) {
+                return Ok(context);
+            }
+        }
+        let context = self.legacy_context_for_run()?;
+        let execution = self.legacy_execution.as_mut().unwrap();
+        execution.sync_class(&self.cpu, model, true, context.segment_class);
+        if paged && context.paging_enabled && execution.task_switch.context().is_none() {
+            execution.keep_context(&self.cpu, context);
+        }
+        Ok(context)
+    }
+
+    /// After a handoff served inside the run: whether the selected identity
+    /// is still the live state's, and if not, the context derived again and
+    /// selected (unforced) as the dispatcher's reselection would. The paging
+    /// identity compares its stamp again in either case (xj-to9.59).
+    #[cold]
+    #[inline(never)]
+    fn reselect_after_handoff(&mut self, context: &mut MachineContext) -> Result<(), Exit> {
+        let model = self.legacy_model.expect("legacy model");
+        let execution = self.legacy_execution.as_mut().unwrap();
+        execution.context_dirty();
+        let class = context.segment_class;
+        if execution.task_switch.context().is_none()
+            && execution.stamp.as_ref().is_some_and(|stamp| {
+                if LegacyContextStamp::reduced(&self.cpu, class) {
+                    stamp.is_reduced_identity(&self.cpu, model, class)
+                } else {
+                    stamp.is_identity_of(&self.cpu, model, class == crate::SegmentClass::Flat32)
+                }
+            })
+        {
+            return Ok(());
+        }
+        *context = self.legacy_context_for_run()?;
+        self.legacy_execution.as_mut().unwrap().sync_class(
+            &self.cpu,
+            model,
+            false,
+            context.segment_class,
+        );
+        Ok(())
+    }
+
     #[inline(always)]
     pub(super) fn warm_machine_context(
         &mut self,
@@ -2580,7 +2921,7 @@ impl Vcpu {
             let result = if PAGED {
                 let execution = self.legacy_execution.as_mut().unwrap();
                 let state = execution.paging.get_or_insert_with(Default::default);
-                state.reconcile(vm, &self.cpu, self.legacy_model.unwrap());
+                state.reconcile(vm, &self.cpu, self.legacy_model.unwrap(), None);
                 if !self.cpu.mmio_retry_active {
                     state.event_transaction = None;
                 }
@@ -3351,6 +3692,20 @@ impl Vcpu {
                         };
                         match devices.access(self, vm, steps, &exit) {
                             Some(Ok(())) => {
+                                // The run goes on after a handoff that may
+                                // have left a walk which had reloaded a data
+                                // segment and so reported no context change
+                                // (`BlockPass::reloaded`): select again where
+                                // the selected identity is no longer the
+                                // live state's (xj-to9.59).
+                                if !direct20 {
+                                    if let Err(exit) = self.reselect_after_handoff(&mut context) {
+                                        return DispatchResult::Stepped(StepRun {
+                                            steps,
+                                            stop: StepStop::Exit(exit),
+                                        });
+                                    }
+                                }
                                 direct_bus = direct20 || raw_direct(&self.cpu);
                                 refresh_boundary = true;
                                 continue;
@@ -4075,19 +4430,28 @@ impl Vcpu {
                                 diag::note_context(diag::ContextNote::Invalidated);
                                 execution.invalidate_translations();
                             }
-                            context = match self.legacy_context_for_run() {
-                                Ok(context) => context,
-                                Err(exit) => {
-                                    machine_exit!(exit);
-                                }
-                            };
+                            if self.cpu.legacy.cr0 & (1 << 31) != 0 {
+                                context = match self.reselect_paged_context() {
+                                    Ok(context) => context,
+                                    Err(exit) => {
+                                        machine_exit!(exit);
+                                    }
+                                };
+                            } else {
+                                context = match self.legacy_context_for_run() {
+                                    Ok(context) => context,
+                                    Err(exit) => {
+                                        machine_exit!(exit);
+                                    }
+                                };
+                                self.legacy_execution.as_mut().unwrap().sync_class(
+                                    &self.cpu,
+                                    model,
+                                    true,
+                                    context.segment_class,
+                                );
+                            }
                             direct_bus = raw_direct(&self.cpu);
-                            self.legacy_execution.as_mut().unwrap().sync_class(
-                                &self.cpu,
-                                model,
-                                true,
-                                context.segment_class,
-                            );
                         }
                         // I286 PRM Appendix B MOV p. B-73, POP p. B-83;
                         // 80386 PRM §9.2.4 pp. 9-3–4, §17 MOV p. 17-109,

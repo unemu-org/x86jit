@@ -2768,3 +2768,136 @@ fn in_pass_follows_an_a20_change_queued_by_a_handoff() {
     assert_eq!(c2.reg(Reg::Rbx), 0x1111_1111);
     assert_eq!(architectural(&c2), architectural(&c3));
 }
+
+/// xj-to9.59: a handler's A20 effect changes a stamped field inside a run,
+/// at an OUT (applied at once) and at an MMIO read (queued while the read is
+/// in flight, applied when it completes). Both writers advance the selection
+/// serial: the paged resolve after either compares the paging identity
+/// again, and its assertion fails for a writer that does not.
+#[test]
+fn a_handlers_a20_effect_inside_a_paged_run_advances_the_selection() {
+    // out 92h,al; inc ebx; mov eax,[esi]; inc ebx; dec ecx; jnz top; hlt
+    let code = [0xe6, 0x92, 0x43, 0x8b, 0x06, 0x43, 0x49, 0x75, 0xf7, 0xf4];
+    for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+        let (vm, mut cpu) = setup(model, 2, &code);
+        cpu.disable_delivery_log();
+        cpu.set_reg(Reg::Rcx, 20);
+        cpu.set_reg(Reg::Rbx, 0);
+        let mut line = true;
+        let mut flips = 0;
+        let mut h = Callback(|_: &DeviceRequest, c: &mut DeviceContext<'_>| {
+            line = !line;
+            flips += 1;
+            c.set_a20_enabled(line);
+            DeviceResult::Handled(0)
+        });
+        let r = run(&mut cpu, &vm, 1000, &mut h);
+        assert!(
+            matches!(r.stop(), StepStop::Exit(Exit::Hlt)),
+            "{model:?}: {:?}",
+            r.stop()
+        );
+        assert_eq!(flips, 40);
+        assert_eq!(cpu.reg(Reg::Rbx), 40);
+        assert!(cpu.a20_enabled());
+        assert!(cpu.paging_skips_for_test() > 0, "{model:?}");
+    }
+}
+
+/// xj-to9.59: a walk that reloads a data segment and continues (the
+/// reloaded cache still proves its class) and then leaves for a handled
+/// transfer reports no context change. The run goes on after the handler:
+/// the next blocks must take the identity of the new DS, not the old one.
+/// Data segments 10h (base 0) and 18h (base 7000h), or the V86 paragraphs 0
+/// and 700h: after `mov ds,first; jmp $+2; mov ds,second; <transfer>`,
+/// the loop `L: mov [100h],bl; inc bl; mov ds,first; dec cx; jnz L` stores
+/// 40h at 7100h and then 41h, 42h at 100h. A Segmented lift bakes the DS
+/// cache, so a block filed under the old identity would store at 7100h
+/// again; V86 reads it live, where the paging assertion catches a stale
+/// identity. Each mode, unpaged and paged, protected and V86, with each
+/// transfer kind: MMIO read and write, port IN and OUT.
+#[test]
+fn a_walk_that_reloads_ds_then_leaves_for_a_handled_transfer_reselects() {
+    // (mode, V86): unpaged and paged protected USE32, unpaged and paged V86.
+    for (mode, v86) in [(1u8, false), (2, false), (5, true), (6, true)] {
+        // MMIO read, MMIO write, IN, OUT: the address is 3000h past base 7000h.
+        let transfers: [&[u8]; 4] = if v86 {
+            [
+                &[0xa0, 0x00, 0x30],
+                &[0xa2, 0x00, 0x30],
+                &[0xe4, 0x80],
+                &[0xe6, 0x80],
+            ]
+        } else {
+            [
+                &[0xa0, 0x00, 0x30, 0, 0],
+                &[0xa2, 0x00, 0x30, 0, 0],
+                &[0xe4, 0x80],
+                &[0xe6, 0x80],
+            ]
+        };
+        for transfer in transfers {
+            for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+                let (first, second) = if v86 { (0u16, 0x700u16) } else { (0x10, 0x18) };
+                let mov_ax = |v: u16| {
+                    let [lo, hi] = v.to_le_bytes();
+                    if v86 {
+                        vec![0xb8, lo, hi]
+                    } else {
+                        vec![0x66, 0xb8, lo, hi]
+                    }
+                };
+                let mut code = mov_ax(first);
+                code.extend([0x8e, 0xd8, 0xeb, 0x00]); // mov ds,ax; jmp $+2
+                code.extend(mov_ax(second));
+                code.extend([0x8e, 0xd8]);
+                code.extend(transfer);
+                let top = code.len();
+                if v86 {
+                    code.extend([0x88, 0x1e, 0x00, 0x01]); // mov [100h],bl
+                } else {
+                    code.extend([0x88, 0x1d, 0x00, 0x01, 0, 0]); // mov [100h],bl
+                }
+                code.extend([0xfe, 0xc3]); // inc bl
+                code.extend(mov_ax(first));
+                code.extend([0x8e, 0xd8, 0x49, 0x75]); // mov ds,ax; dec cx; jnz L
+                code.push((top as i64 - code.len() as i64 - 1) as u8);
+                code.push(0xf4);
+                let (vm, mut cpu) = setup(model, mode, &code);
+                cpu.disable_delivery_log();
+                if !v86 {
+                    let data = |base: u32| -> [u8; 8] {
+                        let [b0, b1, b2, _] = base.to_le_bytes();
+                        [0xff, 0xff, b0, b1, b2, 0x93, 0, 0]
+                    };
+                    vm.write_bytes(0x3010, &data(0)).unwrap();
+                    vm.write_bytes(0x3018, &data(0x7000)).unwrap();
+                    cpu.cpu.legacy.gdtr.base = 0x3000;
+                    cpu.cpu.legacy.gdtr.limit = 0x1f;
+                }
+                cpu.set_reg(Reg::Rcx, 3);
+                cpu.set_reg(Reg::Rbx, 0x40);
+                let mut h = Callback(|_: &DeviceRequest, _: &mut DeviceContext<'_>| {
+                    DeviceResult::Handled(0)
+                });
+                let r = run(&mut cpu, &vm, 1000, &mut h);
+                let what = format!("mode {mode} {transfer:02x?} {model:?}: {:?}", r.stop());
+                // HLT ends the protected loop; V86 HLT is #GP(0), outward.
+                assert!(
+                    matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::Hlt | Exit::Exception { vector: 13, .. })
+                    ),
+                    "{what}"
+                );
+                assert_eq!(cpu.reg(Reg::Rcx) & 0xffff, 0, "{what}");
+                let byte = |at| {
+                    let mut b = [0];
+                    vm.read_bytes(at, &mut b).unwrap();
+                    b[0]
+                };
+                assert_eq!((byte(0x100), byte(0x7100)), (0x42, 0x40), "{what}");
+            }
+        }
+    }
+}
