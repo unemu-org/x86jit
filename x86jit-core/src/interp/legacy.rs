@@ -1518,6 +1518,33 @@ fn load_system_segment<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+/// LAR's mask over a descriptor's second doubleword.
+///
+/// AMD64 APM Vol 3 (Rev. 3.36) LAR pp. 401–402: a 32- or 64-bit LAR masks
+/// the doubleword with 00FF_FF00H, so bits 19:16 return limit 19:16. The
+/// SDM (Vol 2A §3.3 LAR p. 3-533, "Bits 19:16 are undefined") and the
+/// 80386 PRM (§17 LAR p. 17-89, mask 00FxFF00H) leave those four bits
+/// undefined; the APM is the second witness that states them. A
+/// protected-mode operating system an embedder traced rebuilds descriptor
+/// byte 6 from this result, so it depends on the limit nibble. Bits 23:20
+/// are G, D/B, bit 21 and AVL; bit 21 is reserved on the 80386 and
+/// Intel486 and LAR returns it (80386 PRM §17 p. 17-89; Intel486 PRM §26
+/// p. 26-188). Bits 15:8 are the access byte.
+const LAR_RIGHTS_MASK: u32 = 0x00ff_ff00;
+
+/// The LAR result for a descriptor cache read by `descriptor_at`: its
+/// second doubleword masked with `LAR_RIGHTS_MASK`. The cache keeps the
+/// access byte and the flags nibble in `attributes` (bits 11:8 zero) and
+/// the limit scaled by G, so limit 19:16 comes back from the scaled limit.
+fn access_rights(cache: &legacy::SegmentCache) -> u32 {
+    let limit_19_16 = if cache.attributes & 0x8000 != 0 {
+        cache.limit >> 28
+    } else {
+        (cache.limit >> 16) & 0xf
+    };
+    ((u32::from(cache.attributes) << 8) | (limit_19_16 << 16)) & LAR_RIGHTS_MASK
+}
+
 fn query_descriptor<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -1554,11 +1581,10 @@ fn query_descriptor<const ROUTED: bool, const ORDER: u8>(
     if visible && valid_type {
         match query {
             DescriptorQuery::Rights { dst, size } => {
-                // 80386 PRM §17 p. 17-89; Intel486 PRM §26 p. 26-188:
-                // 00FxFF00H includes reserved bit 21. SDM Vol 2A §3.3
-                // LAR p. 3-533: undefined bits 19:16 use zero as
-                // deterministic engine policy. Access byte/flags retain their bits.
-                write_reg(cpu, dst, u64::from(attr) << 8, size);
+                // SDM Vol 2A §3.3 LAR p. 3-533: a 16-bit result writes
+                // bits 15:0 and leaves the upper destination bits; a 32- or
+                // 64-bit result clears them.
+                write_reg(cpu, dst, u64::from(access_rights(&cache)), size);
             }
             DescriptorQuery::Limit { dst, size } => {
                 write_reg(cpu, dst, u64::from(cache.limit), size)

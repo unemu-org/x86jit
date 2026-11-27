@@ -398,7 +398,9 @@ fn descriptor_query_memory_sources_are_words_and_operand_faults_escape() {
         steps(&mut cpu, &vm, 1);
         assert_eq!(
             cpu.cpu.gpr[0],
-            if opcode == 2 { 0xc09200 } else { 0x1234_5fff }
+            // LAR bits 19:16 are limit 19:16 (here 1): AMD64 APM Vol 3
+            // LAR pp. 401–402, mask 00FF_FF00H.
+            if opcode == 2 { 0xc19200 } else { 0x1234_5fff }
         );
     }
 }
@@ -748,5 +750,138 @@ fn reserved_bit21_cpl3_mov_es_bx() {
         steps(&mut cpu, &vm, 2);
         assert_eq!(cpu.cpu.es, 0x317);
         assert_eq!(cpu.cpu.gpr[0], 0x5678);
+    }
+}
+
+// LAR's 32-bit result is the descriptor's second doubleword masked with
+// 00FF_FF00H: bits 23:20 G, D/B, bit 21 and AVL, bits 19:16 limit 19:16,
+// bits 15:8 the access byte (AMD64 APM Vol 3 Rev. 3.36 LAR pp. 401–402).
+// The SDM (Vol 2A §3.3 LAR p. 3-533) and the 80386 PRM (§17 p. 17-89,
+// mask 00FxFF00H) leave bits 19:16 undefined; the APM states them.
+const I386_UP: [CpuModel; 3] = [
+    CpuModel::I80386,
+    CpuModel::I80486Dx,
+    CpuModel::I80486DxCpuid,
+];
+
+/// An eight-byte descriptor image at `address`, as the low and high
+/// doublewords of a little-endian quadword.
+fn raw_descriptor(vm: &x86jit_core::Vm, address: u64, raw: u64) {
+    vm.write_bytes(address, &raw.to_le_bytes()).unwrap();
+}
+
+#[test]
+fn lar_o32_returns_limit_19_16_at_cpl3_through_the_ldt() {
+    // An embedder's trace: LAR ECX,BX at CPL 3, BX=0C36h (LDT index 186h,
+    // RPL 2), descriptor 8001F320_BF401ADFh: base 8020BF40h, limit 11ADFh
+    // byte-granular, access F3h (present DPL 3 read/write data), byte 6 01h.
+    // SDM Vol 2A §3.3 LAR pp. 3-533–3-534: visible when CPL and RPL <= DPL,
+    // ZF=1, and a 32-bit result clears the destination's upper bits.
+    for model in I386_UP {
+        for (code, cs_attributes) in [
+            (&b"\x0f\x02\xcb"[..], 0x40fb),   // 32-bit code segment
+            (&b"\x66\x0f\x02\xcb"[..], 0xfb), // 16-bit code segment, o32
+        ] {
+            let (vm, mut cpu) = setup(model, code);
+            cpu.cpu.legacy.cpl = 3;
+            cpu.cpu.cs = 0x1b;
+            cpu.cpu.legacy.segments[SegmentId::Cs as usize].attributes = cs_attributes;
+            install_ldt(&mut cpu, 0x10000, 0xfff);
+            raw_descriptor(&vm, 0x10000 + 0x186 * 8, 0x8001_f320_bf40_1adf);
+            cpu.cpu.gpr[3] = 0x0c36;
+            cpu.cpu.gpr[1] = 0;
+            cpu.cpu.flags.zf = false;
+            steps(&mut cpu, &vm, 1);
+            assert!(cpu.cpu.flags.zf, "{model:?} {code:x?}");
+            assert_eq!(cpu.cpu.gpr[1], 0x0001_f300, "{model:?} {code:x?}");
+            // A query never sets the accessed bit (SDM Vol 2A §3.3 LAR).
+            assert_eq!(value(&vm, 0x10000 + 0x186 * 8 + 5, 1), 0xf3);
+        }
+    }
+}
+
+#[test]
+fn lar_o32_returns_the_masked_second_doubleword() {
+    // AMD64 APM Vol 3 LAR pp. 401–402: second doubleword & 00FF_FF00H,
+    // for code and data descriptors and for the system and gate types
+    // SDM Vol 2A §3.3 Table 3-55 p. 3-534 accepts.
+    for model in I386_UP {
+        for (limit, attr, expected) in [
+            (0x0_2345, 0x0092, 0x0000_9200),    // limit 19:16 = 0
+            (0xf_ffff, 0x5092, 0x005f_9200),    // D/B and AVL, limit 19:16 = F
+            (0xffff_ffff, 0xc09a, 0x00cf_9a00), // G and D code, raw limit FFFFFh
+            (0x7_ffff, 0x2092, 0x0027_9200),    // bit 21
+            (0x3_0fff, 0x0082, 0x0003_8200),    // LDT
+            (0x1_0067, 0x0089, 0x0001_8900),    // available 32-bit TSS
+        ] {
+            let (vm, mut cpu) = setup(model, b"\x66\x0f\x02\xc1");
+            descriptor(&vm, 0x2010, 0, limit, attr);
+            cpu.cpu.gpr[0] = u64::MAX;
+            cpu.cpu.gpr[1] = 0x10;
+            cpu.cpu.flags.zf = false;
+            steps(&mut cpu, &vm, 1);
+            assert!(cpu.cpu.flags.zf, "{model:?} {attr:x}");
+            assert_eq!(cpu.cpu.gpr[0], expected, "{model:?} {attr:x}");
+        }
+        // A 32-bit call gate, offset 00AB1234h, selector 8, DPL 3: bytes 6-7
+        // are offset 31:16 (SDM Vol 3A §6.8.3 Fig. 6-8 p. 6-13), returned as they are.
+        let (vm, mut cpu) = setup(model, b"\x66\x0f\x02\xc1");
+        raw_descriptor(&vm, 0x2010, 0x00ab_ec00_0008_1234);
+        cpu.cpu.gpr[0] = u64::MAX;
+        cpu.cpu.gpr[1] = 0x10;
+        steps(&mut cpu, &vm, 1);
+        assert!(cpu.cpu.flags.zf, "{model:?} call gate");
+        assert_eq!(cpu.cpu.gpr[0], 0x00ab_ec00, "{model:?} call gate");
+    }
+}
+
+#[test]
+fn lar_o16_writes_bits_15_8_and_preserves_the_upper_destination() {
+    // SDM Vol 2A §3.3 LAR p. 3-533: a 16-bit result carries only bits 15:0
+    // (access byte in 15:8, 7:0 zero) and leaves the upper bits unmodified;
+    // APM Vol 3 LAR p. 401: the low word is masked with FF00H.
+    for model in MODELS.into_iter().chain(I386_UP) {
+        let (vm, mut cpu) = setup(model, b"\x0f\x02\xc1");
+        raw_descriptor(&vm, 0x2010, 0x8001_f320_bf40_1adf);
+        cpu.cpu.gpr[0] = 0x1234_5678_9abc_def0;
+        cpu.cpu.gpr[1] = 0x10;
+        steps(&mut cpu, &vm, 1);
+        assert!(cpu.cpu.flags.zf, "{model:?}");
+        assert_eq!(cpu.cpu.gpr[0], 0x1234_5678_9abc_f300, "{model:?}");
+    }
+}
+
+#[test]
+fn lar_failure_clears_zf_and_leaves_the_destination() {
+    // SDM Vol 2A §3.3 LAR pp. 3-533–3-534: an invalid type (a 32-bit
+    // interrupt gate, Table 3-55) or a descriptor not visible at
+    // max(CPL, RPL) clears ZF and loads nothing.
+    for model in I386_UP {
+        for (selector, attr) in [(0x10, 0x008e), (0x13, 0x0092)] {
+            let (vm, mut cpu) = setup(model, b"\x66\x0f\x02\xc1");
+            descriptor(&vm, 0x2010, 0, 0xf_ffff, attr);
+            cpu.cpu.gpr[0] = 0x1234_5678_9abc_def0;
+            cpu.cpu.gpr[1] = selector;
+            cpu.cpu.flags.zf = true;
+            steps(&mut cpu, &vm, 1);
+            assert!(!cpu.cpu.flags.zf, "{model:?} {selector:x} {attr:x}");
+            assert_eq!(cpu.cpu.gpr[0], 0x1234_5678_9abc_def0);
+        }
+    }
+}
+
+#[test]
+fn lsl_o32_returns_a_byte_granular_20_bit_limit() {
+    // 80386 PRM §6.3.6 p. 6-18; SDM Vol 2A §3.3 LSL p. 3-573: LSL loads the
+    // byte-granular limit assembled from the limit fields and G.
+    // The descriptor of the LAR trace above: limit 11ADFh, G clear.
+    for model in I386_UP {
+        let (vm, mut cpu) = setup(model, b"\x66\x0f\x03\xc1");
+        raw_descriptor(&vm, 0x2010, 0x8001_f320_bf40_1adf);
+        cpu.cpu.gpr[0] = u64::MAX;
+        cpu.cpu.gpr[1] = 0x10;
+        steps(&mut cpu, &vm, 1);
+        assert!(cpu.cpu.flags.zf, "{model:?}");
+        assert_eq!(cpu.cpu.gpr[0], 0x0001_1adf, "{model:?}");
     }
 }
