@@ -11,6 +11,8 @@
 # arm64 under background QoS (2026-11-17) and CI run 44382060281 on both Linux
 # lanes (2026-11-18, e29dc1ae).
 
+x86jit-core vm::legacy::link_witness::a_reused_context_identity_is_never_followed
+x86jit-core vm::legacy::live::tests::live_fields_match_relifting_on_every_patched_form
 x86jit-core vm::legacy::tests::a_blocked_nmi_handler_that_never_irets_keeps_ordinary_dispatch
 x86jit-cranelift batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc
 x86jit-cranelift codegen::trap_tests::guest_trap_sites_lifter_capped_blocks_never_overflow

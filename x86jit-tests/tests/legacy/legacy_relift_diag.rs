@@ -1,6 +1,6 @@
 //! The relift diagnostics (`Vm::relift_diagnostics`, xj-to9.53) name why a
 //! Flat32 proof relifted: a patched live-capable immediate relifts until it
-//! is promoted and then is absorbed; a patched shift count, which no live
+//! is promoted and then is absorbed; a patched PUSH immediate, which no live
 //! read covers, is refused as an ineligible form and relifts on every patch
 //! with its instruction in the ring; an opcode store is an opcode store; a
 //! loop of more blocks than the unpaged proof map retains clears at its
@@ -39,22 +39,22 @@ fn run(vm: &Vm, cpu: &mut Vcpu) {
     assert!(matches!(cpu.run(vm, None), Exit::Hlt));
 }
 
-/// A: MOV EAX, imm32; ADD EBX, EAX; JMP $+2. B: MOV EDX, EBX; SHR EDX, 3;
-/// JMP $+2. C: ADD [A+1], 1; XOR [B+4], 1; DEC EDI; JNZ A; HLT. Returns
-/// the code and the bus addresses of the immediate and the count.
+/// A: MOV EAX, imm32; ADD EBX, EAX; JMP $+2. B: MOV EDX, EBX; PUSH 3;
+/// POP EDX; JMP $+2. C: ADD [A+1], 1; XOR [B+3], 1; DEC EDI; JNZ A; HLT.
+/// Returns the code and the bus addresses of the two immediates.
 fn patching_loop() -> (Vec<u8>, u64, u64) {
     let imm = CODE + 1;
     let mut c = vec![0xb8, 0, 0, 0, 0, 0x01, 0xc3, 0xeb, 0x00];
-    // B at A+9: MOV EDX, EBX (89 DA); SHR EDX, 3 (C1 EA 03); JMP $+2.
-    c.extend([0x89, 0xda, 0xc1, 0xea, 0x03, 0xeb, 0x00]);
-    let shift = CODE + 9 + 4;
-    assert_eq!(c[(shift - CODE) as usize], 0x03);
-    // C: ADD DWORD [imm], 1 (83 05 disp32 01); XOR BYTE [shift], 1 (80 35 disp32 01).
+    // B at A+9: MOV EDX, EBX (89 DA); PUSH 3 (6A 03); POP EDX; JMP $+2.
+    c.extend([0x89, 0xda, 0x6a, 0x03, 0x5a, 0xeb, 0x00]);
+    let push = CODE + 9 + 3;
+    assert_eq!(c[(push - CODE) as usize], 0x03);
+    // C: ADD DWORD [imm], 1 (83 05 disp32 01); XOR BYTE [push], 1 (80 35 disp32 01).
     c.extend([0x83, 0x05]);
     c.extend((imm as u32).to_le_bytes());
     c.push(1);
     c.extend([0x80, 0x35]);
-    c.extend((shift as u32).to_le_bytes());
+    c.extend((push as u32).to_le_bytes());
     c.push(1);
     // DEC EDI; JNZ A (rel32); HLT.
     c.push(0x4f);
@@ -62,12 +62,12 @@ fn patching_loop() -> (Vec<u8>, u64, u64) {
     c.extend([0x0f, 0x85]);
     c.extend((rel as i32).to_le_bytes());
     c.push(0xf4);
-    (c, imm, shift)
+    (c, imm, push)
 }
 
 #[test]
-fn a_patched_immediate_is_absorbed_and_a_patched_shift_count_is_named() {
-    let (code, imm, shift) = patching_loop();
+fn a_patched_immediate_is_absorbed_and_a_patched_push_immediate_is_named() {
+    let (code, imm, push) = patching_loop();
     let (vm, mut cpu) = setup(&code);
     vm.relift_diagnostics(true);
     run(&vm, &mut cpu);
@@ -79,7 +79,7 @@ fn a_patched_immediate_is_absorbed_and_a_patched_shift_count_is_named() {
     assert!((1..=3).contains(&live), "{text}");
     assert_eq!(d.live.promotions, 1, "{text}");
     assert!(d.live.absorbed >= N - 4, "{text}");
-    // Every patch of the count relifts B.
+    // Every patch of the PUSH immediate relifts B.
     let other = d.lifts(flat, ReliftCause::Store(StoreClass::OtherField));
     assert!(other >= N - 2, "{text}");
     assert!(
@@ -92,17 +92,17 @@ fn a_patched_immediate_is_absorbed_and_a_patched_shift_count_is_named() {
     let refusal = d
         .refused
         .iter()
-        .find(|r| r.patched == (shift, 1))
+        .find(|r| r.patched == (push, 1))
         .unwrap_or_else(|| panic!("{text}"));
-    assert_eq!(refusal.instruction.0, shift - 2, "{text}");
-    assert_eq!(refusal.instruction.1[..2], [0xc1, 0xea], "{text}");
-    assert_eq!(refusal.instruction.1.len(), 3, "{text}");
-    assert!(refusal.instruction.2.starts_with("shr"), "{text}");
+    assert_eq!(refusal.instruction.0, push - 1, "{text}");
+    assert_eq!(refusal.instruction.1[..1], [0x6a], "{text}");
+    assert_eq!(refusal.instruction.1.len(), 2, "{text}");
+    assert!(refusal.instruction.2.starts_with("push"), "{text}");
     let record = d
         .recent
         .iter()
         .rev()
-        .find(|r| r.write == Some((shift, 1)))
+        .find(|r| r.write == Some((push, 1)))
         .unwrap_or_else(|| panic!("{text}"));
     assert_eq!(
         record.cause,
@@ -110,8 +110,8 @@ fn a_patched_immediate_is_absorbed_and_a_patched_shift_count_is_named() {
         "{text}"
     );
     let (at, bytes, insn) = record.instruction.as_ref().unwrap();
-    assert_eq!((*at, &bytes[..2]), (shift - 2, &[0xc1, 0xea][..]), "{text}");
-    assert!(insn.starts_with("shr edx"), "{text}");
+    assert_eq!((*at, &bytes[..1]), (push - 1, &[0x6a][..]), "{text}");
+    assert!(insn.starts_with("push"), "{text}");
     assert!(d.recent.iter().all(|r| r.write != Some((imm, 4))
         || r.cause == ReliftCause::Store(StoreClass::LiveField)
         || r.cause == ReliftCause::Retry(x86jit_core::RetryKind::Promotion)

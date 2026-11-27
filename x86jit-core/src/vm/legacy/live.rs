@@ -36,8 +36,9 @@
 //!   as before.
 //!
 //! A live field is read once per execution of its instruction, before that
-//! instruction's own stores (the eligible MOV, LEA and ALU forms read their
-//! operands first), so it sees the bytes a relift after every earlier store
+//! instruction's own stores (the eligible MOV, LEA, ALU, shift, rotate,
+//! IMUL, MOVZX and MOVSX forms read their operands first, and a near JMP
+//! stores nothing), so it sees the bytes a relift after every earlier store
 //! would decode. A store by an earlier instruction of the same block still
 //! ends an unpaged walk (SDM Vol 3A §14.6 p. 14-18; `RunningMemory::overlap`);
 //! a paged walk ends at the notice of a queued store, and goes on after one
@@ -833,6 +834,11 @@ mod tests {
         0x0001_0000,
     ];
 
+    /// Shift and rotate counts: 0 and 1, the 8- and 16-bit widths and past
+    /// them, counts that the 5-bit mask keeps but RCL/RCR's modulo 9 (9, 18,
+    /// 27) or 17 reduces to 0, and counts the mask reduces (32, 41, 49, 255).
+    const COUNTS: [u32; 16] = [0, 1, 7, 8, 9, 15, 16, 17, 18, 26, 27, 31, 32, 41, 49, 255];
+
     fn forms() -> Vec<Form> {
         let any = |i| IMM[i as usize % IMM.len()];
         vec![
@@ -952,6 +958,174 @@ mod tests {
                 offset: 3,
                 width: 1,
                 values: any,
+            },
+            // Shift and rotate counts (C1 /n ib, C0 /n ib): the values give
+            // counts 0, 1 and 31 after the 5-bit mask, and RCL/RCR's
+            // modulo 9 and 17.
+            Form {
+                name: "shl imm8",
+                insn: b"\xc1\xe0\x05",
+                offset: 2,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "shr imm8",
+                insn: b"\xc1\xe8\x05",
+                offset: 2,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "sar imm8",
+                insn: b"\xc1\xf8\x05",
+                offset: 2,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "rol imm8",
+                insn: b"\xc1\xc0\x05",
+                offset: 2,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "ror r16 imm8",
+                insn: b"\x66\xc1\xc8\x05",
+                offset: 3,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "rcl r8 imm8",
+                insn: b"\xc0\xd0\x05",
+                offset: 2,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "rcr r16 imm8",
+                insn: b"\x66\xc1\xd8\x05",
+                offset: 3,
+                width: 1,
+                values: any,
+            },
+            // SHR DWORD [EBP+disp8], imm8: the count of a memory shift.
+            Form {
+                name: "shr mem imm8",
+                insn: b"\xc1\x6d\x10\x05",
+                offset: 3,
+                width: 1,
+                values: any,
+            },
+            // IMUL EAX, EBX, imm32 (69 /r id); IMUL EAX, EBX, simm8 (6B /r ib);
+            // IMUL AX, BX, simm8.
+            Form {
+                name: "imul imm32",
+                insn: b"\x69\xc3\x11\x11\x11\x11",
+                offset: 2,
+                width: 4,
+                values: any,
+            },
+            Form {
+                name: "imul imm8sx",
+                insn: b"\x6b\xc3\x05",
+                offset: 2,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "imul r16 imm8sx",
+                insn: b"\x66\x6b\xc3\x05",
+                offset: 3,
+                width: 1,
+                values: any,
+            },
+            // MOVZX EAX, BYTE [disp32]; MOVSX EAX, WORD [EBP+disp8].
+            Form {
+                name: "movzx disp32",
+                insn: b"\x0f\xb6\x05\x00\xa0\x00\x00",
+                offset: 3,
+                width: 4,
+                values: |i| DATA + (IMM[i as usize % IMM.len()] & 0xfff),
+            },
+            Form {
+                name: "movsx disp8",
+                insn: b"\x0f\xbf\x45\x10",
+                offset: 3,
+                width: 1,
+                values: any,
+            },
+            // Counts at and past the operand width, and RCL/RCR counts that
+            // are 0 after their modulus (SDM Vol 2B RCL/RCR/ROL/ROR,
+            // Operation p. 4-535).
+            Form {
+                name: "rcl r8 mod 9",
+                insn: b"\xc0\xd0\x05",
+                offset: 2,
+                width: 1,
+                values: |i| COUNTS[i as usize % COUNTS.len()],
+            },
+            Form {
+                name: "rcr r16 mod 17",
+                insn: b"\x66\xc1\xd8\x05",
+                offset: 3,
+                width: 1,
+                values: |i| COUNTS[i as usize % COUNTS.len()],
+            },
+            Form {
+                name: "shl r8 wide",
+                insn: b"\xc0\xe0\x05",
+                offset: 2,
+                width: 1,
+                values: |i| COUNTS[i as usize % COUNTS.len()],
+            },
+            Form {
+                name: "shr r16 wide",
+                insn: b"\x66\xc1\xe8\x05",
+                offset: 3,
+                width: 1,
+                values: |i| COUNTS[i as usize % COUNTS.len()],
+            },
+            Form {
+                name: "sar r8 wide",
+                insn: b"\xc0\xf8\x05",
+                offset: 2,
+                width: 1,
+                values: |i| COUNTS[i as usize % COUNTS.len()],
+            },
+            // MOVZX EAX, BYTE [BP+disp8] and MOVSX EAX, WORD [BP+disp16] with
+            // 16-bit addressing (67h): the address wraps at 64 KiB.
+            Form {
+                name: "movzx disp8 a16",
+                insn: b"\x67\x0f\xb6\x46\x10",
+                offset: 4,
+                width: 1,
+                values: any,
+            },
+            Form {
+                name: "movsx disp16 a16",
+                insn: b"\x67\x0f\xbf\x86\x00\x01",
+                offset: 4,
+                width: 2,
+                values: any,
+            },
+            // JMP rel8 and JMP rel32 over up to four INC EAX: the patched
+            // displacement chooses the entry, a computed exit.
+            Form {
+                name: "jmp rel8",
+                insn: b"\xeb\x00\x40\x40\x40\x40",
+                offset: 1,
+                width: 1,
+                values: |i| (i * 3) % 5,
+            },
+            Form {
+                name: "jmp rel32",
+                insn: b"\xe9\x00\x00\x00\x00\x40\x40\x40\x40",
+                offset: 1,
+                width: 4,
+                values: |i| (i * 3) % 5,
             },
         ]
     }
@@ -1094,6 +1268,300 @@ mod tests {
         }
     }
 
+    /// Run both machines in the same slices until a stop other than an
+    /// exhausted budget, or until `limit` instructions retired, comparing
+    /// each stop, the complete state and at the end memory. Returns the
+    /// last run.
+    fn lockstep_any(
+        a: (&Vm, &mut Vcpu),
+        b: (&Vm, &mut Vcpu),
+        slice: Option<u64>,
+        limit: u64,
+        what: &str,
+    ) -> crate::StepRun {
+        let (avm, a) = a;
+        let (bvm, b) = b;
+        for round in 0.. {
+            assert!(round < 100_000, "{what}: no stop");
+            let budget = slice.map_or(limit, |k| 1 + (round % k));
+            let ar = a.run_steps(avm, budget, StepOptions::default()).unwrap();
+            let br = b.run_steps(bvm, budget, StepOptions::default()).unwrap();
+            assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{what} round {round}");
+            assert_eq!(
+                format!("{:?}", a.cpu),
+                format!("{:?}", b.cpu),
+                "{what} round {round}"
+            );
+            assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
+            if !matches!(ar.stop(), StepStop::Exit(Exit::BudgetExhausted))
+                || a.retired_instructions() >= limit
+            {
+                assert!(memory(avm) == memory(bvm), "{what}: memory");
+                return ar;
+            }
+        }
+        unreachable!()
+    }
+
+    /// The census of `form` (`before`: the store precedes it) live and with
+    /// live fields disabled, after `setup` writes into both machines.
+    /// Returns the live machine and the lifts of both runs.
+    fn census_pair(
+        class: Class,
+        form: &Form,
+        before: bool,
+        slice: Option<u64>,
+        setup: &dyn Fn(&Vm),
+        what: &str,
+    ) -> (Vm, u64, u64) {
+        let (vm, mut cpu) = machine(CpuModel::I80486Dx, class, true, MEMORY);
+        let (rvm, mut reference) = machine(CpuModel::I80486Dx, class, false, MEMORY);
+        for (vm, cpu) in [(&vm, &mut cpu), (&rvm, &mut reference)] {
+            load_census(vm, cpu, form, before, 32);
+            setup(vm);
+        }
+        let end = CODE + census(form, before).0.len() as u64 - 1;
+        lockstep((&vm, &mut cpu), (&rvm, &mut reference), slice, end, what);
+        let lifts = (lifts(&cpu), lifts(&reference));
+        (vm, lifts.0, lifts.1)
+    }
+
+    /// A live JMP rel8 with negative displacements to a stub before its
+    /// block, and (`own`) one of -1, whose target is its own displacement
+    /// byte: the block there decodes FF 40 40 (INC DWORD [EAX+40h]) over
+    /// the live field, which demotes it.
+    #[test]
+    fn a_jump_before_its_block_or_into_its_own_displacement_matches_relifting() {
+        // JMP +4; INC ESI; INC ESI; JMP +11 (past the INCs); MOV EAX, DATA;
+        // JMP rel8 (the field at 12); INC EAX x4.
+        const STUB: &[u8] = b"\xeb\x04\x46\x46\xeb\x0b\xb8\x00\xa0\x00\x00\xeb\x00\x40\x40\x40\x40";
+        let forms = [
+            Form {
+                name: "jmp rel8 back",
+                insn: STUB,
+                offset: 12,
+                width: 1,
+                // Targets 13, 2 and 3 (the stub), 14 .. 17.
+                values: |i| [0, 0xf5, 1, 0xf6, 2, 3, 4][i as usize % 7],
+            },
+            Form {
+                name: "jmp rel8 own",
+                insn: STUB,
+                offset: 12,
+                width: 1,
+                values: |i| [0, 0xf5, 1, 0xff, 0xf6, 2, 0xff, 3, 4][i as usize % 9],
+            },
+        ];
+        for class in [Class::Flat32, Class::Segmented, Class::Paged] {
+            for (k, form) in forms.iter().enumerate() {
+                for before in [false, true] {
+                    for slice in [None, Some(5)] {
+                        let what = format!("{class:?} {} before={before} {slice:?}", form.name);
+                        let (vm, live, relift) =
+                            census_pair(class, form, before, slice, &|_| {}, &what);
+                        assert!(live < relift, "{what}: {live} vs {relift}");
+                        if k == 0 {
+                            assert_eq!(vm.live_fields.live_for_test(), 1, "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `66 E9 rel16` in 32-bit code: the live target is truncated to 16
+    /// bits, as the decoder's is (SDM Vol 2A JMP, Operation p. 3-506), and
+    /// lands on one of two pads below 64 KiB that jump back to the census.
+    #[test]
+    fn an_operand_size_16_jump_truncates_its_live_target() {
+        let form = Form {
+            name: "jmp rel16 o16",
+            insn: b"\x66\xe9\xfc\x6f",
+            offset: 2,
+            width: 2,
+            // CODE + 4 + rel, truncated: 7000h and 7010h.
+            values: |i| [0x6ffc, 0x700c][i as usize % 2],
+        };
+        let back = |at: u64| ((CODE + 4) as i64 - (at as i64 + 5)) as i32;
+        let pads = |vm: &Vm| {
+            let mut pad = b"\x40\xe9".to_vec();
+            pad.extend_from_slice(&back(0x7001).to_le_bytes());
+            vm.write_bytes(0x7000, &pad).unwrap();
+            let mut pad = b"\x46\x46\xe9".to_vec();
+            pad.extend_from_slice(&back(0x7012).to_le_bytes());
+            vm.write_bytes(0x7010, &pad).unwrap();
+        };
+        for class in [Class::Flat32, Class::Segmented, Class::Paged] {
+            for slice in [None, Some(5)] {
+                let what = format!("{class:?} {slice:?}");
+                let (vm, live, relift) = census_pair(class, &form, false, slice, &pads, &what);
+                assert_eq!(vm.live_fields.live_for_test(), 1, "{what}");
+                assert!(live < relift, "{what}: {live} vs {relift}");
+            }
+        }
+    }
+
+    /// A patched JMP rel32 whose target passes the Segmented CS limit
+    /// (FFFFFh) raises #GP(0) at the JMP, before EIP changes (SDM Vol 2A
+    /// JMP, Protected Mode Exceptions p. 3-509), live as relifted.
+    #[test]
+    fn a_live_jump_past_the_cs_limit_faults_as_relifting_does() {
+        let form = Form {
+            name: "jmp rel32 limit",
+            insn: b"\xe9\x00\x00\x00\x00\x40\x40\x40\x40",
+            offset: 1,
+            width: 4,
+            // CODE + 5 + EFFFBh = 100000h, one past the limit.
+            values: |i| if i < 6 { (i * 3) % 5 } else { 0xe_fffb },
+        };
+        for slice in [None, Some(5)] {
+            let what = format!("{slice:?}");
+            let (vm, mut cpu) = machine(CpuModel::I80486Dx, Class::Segmented, true, MEMORY);
+            let (rvm, mut reference) = machine(CpuModel::I80486Dx, Class::Segmented, false, MEMORY);
+            for (vm, cpu) in [(&vm, &mut cpu), (&rvm, &mut reference)] {
+                load_census(vm, cpu, &form, false, 32);
+            }
+            let run = lockstep_any(
+                (&vm, &mut cpu),
+                (&rvm, &mut reference),
+                slice,
+                u64::MAX,
+                &what,
+            );
+            assert!(
+                matches!(
+                    run.stop(),
+                    StepStop::Exit(Exit::Exception { vector: 13, .. })
+                ),
+                "{what}: {run:?}"
+            );
+            assert_eq!(cpu.cpu.rip, CODE, "{what}");
+            assert_eq!(vm.live_fields.live_for_test(), 1, "{what}");
+        }
+    }
+
+    /// A live JMP rel16 in a 16-bit code segment at IP FFF0h whose targets
+    /// wrap past FFFFh to 20h and 21h, or stay at FFF3h and FFF4h.
+    #[test]
+    fn a_16_bit_code_segment_jump_wraps_ip_live() {
+        let pieces: [(u64, &[u8]); 5] = [
+            // MOV DX, [DI]; MOV [FFF1h], DX; ADD DI, 2; JMP FFF0h.
+            (0, b"\x8b\x15\x89\x16\xf1\xff\x83\xc7\x02\xe9\xe4\xff"),
+            // INC SI; INC SI; JMP 40h.
+            (0x20, b"\x46\x46\xeb\x1c"),
+            // INC BX; DEC CX; JNZ 0; HLT.
+            (0x40, b"\x43\x49\x75\xbc\xf4"),
+            // The live JMP rel16.
+            (0xfff0, b"\xe9\x00\x00"),
+            // INC AX; INC AX; JMP 40h (wrapping).
+            (0xfff3, b"\x40\x40\xe9\x48\x00"),
+        ];
+        for model in [CpuModel::I80386, CpuModel::I80486Dx] {
+            for class in [Class::Segmented, Class::Paged] {
+                for slice in [None, Some(5)] {
+                    let what = format!("{model:?} {class:?} {slice:?}");
+                    let setup = |live| {
+                        let (vm, mut cpu) = machine(model, class, live, MEMORY);
+                        for (ip, bytes) in pieces {
+                            vm.write_bytes(CODE + ip, bytes).unwrap();
+                        }
+                        for i in 0..32u64 {
+                            let rel = [0u16, 1, 0x2d, 0x2e][(i * 3 % 4) as usize];
+                            vm.write_bytes(CODE + 0x8000 + 2 * i, &rel.to_le_bytes())
+                                .unwrap();
+                        }
+                        for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+                            segment.base = CODE as u32;
+                            segment.limit = 0xffff;
+                            segment.attributes = if i == 0 { 0x9b } else { 0x93 };
+                        }
+                        cpu.cpu.rip = 0;
+                        cpu.cpu.gpr[1] = 32;
+                        cpu.cpu.gpr[7] = 0x8000;
+                        (vm, cpu)
+                    };
+                    let (vm, mut cpu) = setup(true);
+                    let (rvm, mut reference) = setup(false);
+                    let run = lockstep_any(
+                        (&vm, &mut cpu),
+                        (&rvm, &mut reference),
+                        slice,
+                        u64::MAX,
+                        &what,
+                    );
+                    assert!(
+                        matches!(run.stop(), StepStop::Exit(Exit::Hlt)),
+                        "{what}: {run:?}"
+                    );
+                    assert_ne!(cpu.cpu.gpr[6] & 0xffff, 0, "{what}: no wrapped target");
+                    assert_ne!(cpu.cpu.gpr[0] & 0xffff, 0, "{what}: no FFF3h target");
+                    assert_eq!(vm.live_fields.live_for_test(), 1, "{what}");
+                    assert!(lifts(&cpu) < lifts(&reference), "{what}");
+                }
+            }
+        }
+    }
+
+    /// 80286 protected 16-bit code: shift and rotate counts (C0, C1) and
+    /// IMUL immediates (6B, 69) read live. Each loop runs MOV AX, 1234h;
+    /// the patched instruction; ADD BX, AX; PUSHF; POP DX; ADD BX, DX;
+    /// INC CX; a store of CL or CX into the field; DEC DI; JNZ.
+    #[test]
+    fn an_80286_reads_shift_counts_and_imul_immediates_live() {
+        let forms: [(&str, &[u8], usize); 6] = [
+            ("shl ax", b"\xc1\xe0\x05", 1),
+            ("sar ax", b"\xc1\xf8\x05", 1),
+            ("rcl al", b"\xc0\xd0\x05", 1),
+            ("ror al", b"\xc0\xc8\x05", 1),
+            ("imul imm8", b"\x6b\xc3\x05", 1),
+            ("imul imm16", b"\x69\xc3\x05\x00", 2),
+        ];
+        for (name, insn, width) in forms {
+            let mut code = b"\xb8\x34\x12".to_vec();
+            code.extend_from_slice(insn);
+            code.extend_from_slice(b"\x01\xc3\x9c\x5a\x01\xd3\x41");
+            code.extend_from_slice(if width == 1 { b"\x88\x0e" } else { b"\x89\x0e" });
+            code.extend_from_slice(&(3 + insn.len() as u16 - width as u16).to_le_bytes());
+            code.push(0x4f);
+            code.push(0x75);
+            code.push((-(code.len() as i32 + 1)) as u8);
+            code.extend_from_slice(b"\xeb\xfe");
+            for slice in [None, Some(5)] {
+                let what = format!("{name} {slice:?}");
+                let setup = |live| {
+                    let (vm, mut cpu) = machine(CpuModel::I80286, Class::Segmented, live, MEMORY);
+                    for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+                        *segment = crate::SegmentCache {
+                            base: CODE as u32,
+                            limit: 0xffff,
+                            attributes: if i == 0 { 0x9b } else { 0x93 },
+                            ..Default::default()
+                        };
+                    }
+                    cpu.cpu.legacy.cr0 = 1;
+                    cpu.cpu.gpr[4] = 0x8000;
+                    cpu.cpu.gpr[3] = 0x0102;
+                    cpu.cpu.gpr[7] = 100;
+                    cpu.cpu.rip = 0;
+                    vm.write_bytes(CODE, &code).unwrap();
+                    (vm, cpu)
+                };
+                let (vm, mut cpu) = setup(true);
+                let (rvm, mut reference) = setup(false);
+                let run = lockstep_any((&vm, &mut cpu), (&rvm, &mut reference), slice, 1500, &what);
+                assert!(
+                    matches!(run.stop(), StepStop::Exit(Exit::BudgetExhausted)),
+                    "{what}: {run:?}"
+                );
+                assert_eq!(cpu.cpu.gpr[7] & 0xffff, 0, "{what}: loop not finished");
+                assert_eq!(vm.live_fields.live_for_test(), 1, "{what}");
+                // Budget cuts lift suffix blocks under both.
+                let factor = if slice.is_some() { 1 } else { 3 };
+                assert!(factor * lifts(&cpu) < lifts(&reference), "{what}");
+            }
+        }
+    }
+
     /// The proof lifts of `cpu`'s unpaged and paged maps.
     fn lifts(cpu: &Vcpu) -> u64 {
         let execution = cpu.legacy_execution.as_ref().unwrap();
@@ -1197,6 +1665,51 @@ mod tests {
                     }
                 }
                 assert_eq!(vm.live_fields.live_for_test(), 1);
+            }
+        }
+    }
+
+    /// Every patched form, its field patched by another vCPU's guest store
+    /// between runs of the instruction, against the same runs with live
+    /// fields disabled.
+    #[test]
+    fn another_vcpus_patch_of_every_form_matches_relifting() {
+        for class in [Class::Flat32, Class::Segmented, Class::Paged] {
+            for form in forms() {
+                let what = format!("{class:?} {}", form.name);
+                let field = CODE + form.offset as u64;
+                let mut store = match form.width {
+                    4 => b"\x89\x0d".to_vec(),
+                    2 => b"\x66\x89\x0d".to_vec(),
+                    _ => b"\x88\x0d".to_vec(),
+                };
+                store.extend_from_slice(&(field as u32).to_le_bytes());
+                store.push(0xf4);
+                let mut code = form.insn.to_vec();
+                code.push(0xf4);
+                let mut runs = Vec::new();
+                for live in [true, false] {
+                    let (vm, mut a) = machine(CpuModel::I80486Dx, class, live, MEMORY);
+                    vm.write_bytes(CODE, &code).unwrap();
+                    vm.write_bytes(CODE + 0x100, &store).unwrap();
+                    a.cpu.gpr[3] = 0x1357_9bdf;
+                    a.cpu.gpr[5] = u64::from(DATA);
+                    let mut b = vm.new_vcpu();
+                    b.cpu = a.cpu.clone();
+                    let mut states = Vec::new();
+                    for i in 0..16 {
+                        patch(&vm, &mut b, CODE + 0x100, (form.values)(i));
+                        a.cpu.gpr[0] = u64::from(IMM[i as usize]);
+                        run(&vm, &mut a, CODE);
+                        states.push(format!("{:?}", a.cpu));
+                    }
+                    if live {
+                        assert_eq!(vm.live_fields.live_for_test(), 1, "{what}");
+                    }
+                    runs.push((states, memory(&vm)));
+                }
+                assert_eq!(runs[0].0, runs[1].0, "{what}");
+                assert!(runs[0].1 == runs[1].1, "{what}: memory");
             }
         }
     }

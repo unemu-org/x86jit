@@ -36,12 +36,13 @@ impl ProofClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StoreClass {
     /// Wholly inside the immediate or displacement of a form the live-field
-    /// path reads live (MOV, LEA, ALU, CMP, TEST): such a store is absorbed
+    /// path reads live (MOV, LEA, ALU, CMP, TEST, shifts and rotates, IMUL,
+    /// MOVZX, MOVSX, a near relative JMP): such a store is absorbed
     /// once its field is promoted, so this counts the patches before it
     /// (two per field) and those to a field that was refused or demoted.
     LiveField,
     /// Wholly inside an immediate, displacement or branch displacement of
-    /// another form (shift counts, IMUL, Jcc/JMP/CALL, PUSH, MOVZX, ...).
+    /// another form (Jcc/CALL/LOOP, PUSH, ENTER, RET, ...).
     OtherField,
     /// Touching a prefix, opcode, ModRM or SIB byte, or crossing a field.
     Opcode,
@@ -143,8 +144,9 @@ const CAUSES: usize = 21;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LiveRefusal {
     /// The instruction is not a live-capable form (`lift::legacy::live_fields`:
-    /// not MOV, LEA, ALU, CMP or TEST, a segment or control register operand,
-    /// or a second immediate).
+    /// not MOV, LEA, ALU, CMP, TEST, a shift or rotate, IMUL, MOVZX, MOVSX or
+    /// a near relative JMP, a segment or control register operand, or a
+    /// second immediate).
     IneligibleForm,
     /// The instruction's bytes are not one bus range (it straddles pages
     /// mapped apart).

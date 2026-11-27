@@ -77,9 +77,21 @@ pub(crate) struct LiveFields {
 /// The live-capable fields of the instruction at the start of `code`. Only
 /// the scalar forms whose immediate and displacement reach the IR through
 /// the central operand lowering (`lower_read`, `effective_address_no_segment`)
-/// qualify; `live_instruction` still proves that no other op depends on the
-/// bytes. Branch displacements, ENTER/RET counts, ports, vectors and shift
-/// counts stay baked.
+/// qualify, and the near relative JMP, whose displacement `live_jump_target`
+/// adds to the next IP; `live_instruction` still proves that no other op
+/// depends on the bytes. A shift or rotate count reaches its op as a
+/// temporary, as CL does, so the op masks it and applies the count-0 and
+/// count-1 flag rules when it executes (SDM Vol 2B SAL/SAR/SHL/SHR p. 4-604
+/// and Flags Affected p. 4-606; RCL/RCR/ROL/ROR pp. 4-534–4-535). ENTER/RET
+/// counts, ports and vectors stay baked, and so do these displacements:
+/// * Jcc, LOOP and JCXZ: they check their target against the CS limit only
+///   when they take it (SDM Vol 2A Jcc, Operation p. 3-502), and their ops
+///   (`Branch`, `LoopCx`, `LegacyOp::Loop`) carry constant targets; a
+///   computed target reaches only `Jump`, which checks it unconditionally.
+/// * CALL: refused conservatively. Its target could be computed as JMP's is,
+///   but its block then ends in a computed transfer after a push, a shape
+///   the near-return link classification (`ends_near_return`) and the
+///   return witnesses have not been shown against.
 #[cold]
 #[inline(never)]
 pub(crate) fn live_fields(code: &[u8], ip: u32, context: MachineContext) -> Option<LiveFields> {
@@ -94,8 +106,31 @@ pub(crate) fn live_fields(code: &[u8], ip: u32, context: MachineContext) -> Opti
     if insn.is_invalid()
         || !matches!(
             insn.mnemonic(),
-            Mov | Lea | Add | Adc | Sub | Sbb | And | Or | Xor | Cmp | Test
+            Mov | Lea
+                | Add
+                | Adc
+                | Sub
+                | Sbb
+                | And
+                | Or
+                | Xor
+                | Cmp
+                | Test
+                | Shl
+                | Sal
+                | Shr
+                | Sar
+                | Rol
+                | Ror
+                | Rcl
+                | Rcr
+                | Imul
+                | Movzx
+                | Movsx
+                | Jmp
         )
+        || (insn.mnemonic() == Jmp
+            && !matches!(insn.op0_kind(), OpKind::NearBranch16 | OpKind::NearBranch32))
         || (0..insn.op_count()).any(|i| {
             let register = insn.op_register(i);
             register.is_segment_register()
@@ -140,6 +175,13 @@ fn decoded_field(code: &[u8], ip: u32, context: MachineContext, kind: LiveFieldK
     )
     .decode();
     match kind {
+        // A near branch's displacement, modulo its operand size.
+        LiveFieldKind::Immediate if insn.op0_kind() == OpKind::NearBranch16 => {
+            insn.near_branch_target().wrapping_sub(insn.next_ip()) & 0xffff
+        }
+        LiveFieldKind::Immediate if insn.op0_kind() == OpKind::NearBranch32 => {
+            insn.near_branch_target().wrapping_sub(insn.next_ip()) & 0xffff_ffff
+        }
         LiveFieldKind::Immediate => (0..insn.op_count())
             .find(|&i| is_immediate(insn.op_kind(i)))
             .map_or(0, |i| insn.immediate(i)),
@@ -324,6 +366,66 @@ mod live_tests {
             let ir = live_instruction(code, 0x1000, context, profile, true, fields, requested).ok();
             BAKE.with(|b| b.set(0));
             assert_eq!(ir.is_some(), live, "bake {bake}");
+        }
+    }
+
+    /// A live near JMP displacement makes the block's exit a computed target,
+    /// which no successor link follows; Jcc, CALL and LOOP displacements are
+    /// not live-capable.
+    #[test]
+    fn a_live_jump_is_an_indirect_exit() {
+        let context =
+            crate::legacy::derive_legacy_context(crate::CpuModel::I80486Dx.legacy_model(), &{
+                let mut cpu = crate::CpuState::default();
+                cpu.legacy.cr0 = 1;
+                for (i, cache) in cpu.legacy.segments.iter_mut().enumerate() {
+                    cache.limit = u32::MAX;
+                    cache.attributes = if i == 0 { 0x409b } else { 0x4093 };
+                }
+                cpu
+            })
+            .unwrap();
+        let profile = crate::model::profile_for_generation(context.generation);
+        for code in [
+            &b"\xeb\x03"[..],
+            b"\xe9\x03\x00\x00\x00",
+            b"\x66\xe9\x03\x00",
+        ] {
+            let fields = live_fields(code, 0x1000, context).unwrap();
+            let (offset, _) = fields.fields[LiveFieldKind::Immediate as usize].unwrap();
+            let requested = [Some(0x1000 + u64::from(offset)), None];
+            let ir =
+                live_instruction(code, 0x1000, context, profile, true, fields, requested).unwrap();
+            assert!(
+                matches!(
+                    ir.ops.last(),
+                    Some(IrOp::Jump {
+                        target: Val::Temp(_)
+                    })
+                ),
+                "{code:x?}: {:?}",
+                ir.ops
+            );
+            assert!(!ir.ends_direct(), "{code:x?}");
+            // Nor a near return, the other linked exit: it writes no SP.
+            assert!(
+                !ir.ops
+                    .iter()
+                    .any(|op| matches!(op, IrOp::WriteReg { reg: Reg::Rsp, .. })),
+                "{code:x?}"
+            );
+            // The baked lift is a direct exit.
+            let baked = instruction_for_profile(code, 0x1000, context, profile, true).unwrap();
+            assert!(baked.ends_direct(), "{code:x?}");
+        }
+        for code in [
+            &b"\x74\x03"[..],
+            b"\x0f\x84\x03\x00\x00\x00",
+            b"\xe8\x03\x00\x00\x00",
+            b"\xe2\x03",
+            b"\xff\xe0",
+        ] {
+            assert_eq!(live_fields(code, 0x1000, context), None, "{code:x?}");
         }
     }
 }
@@ -1406,6 +1508,37 @@ fn check_target(
     value
 }
 
+/// A near relative branch's target computed from its live displacement
+/// (`live_fields`), or `None` to bake it: the next IP plus the displacement,
+/// truncated to the operand size, as the decoder's target is (SDM Vol 2A
+/// JMP, Operation p. 3-506). The jump to a temporary is an indirect exit:
+/// `IrBlock::ends_direct` is false, so no successor link follows it.
+fn live_jump_target(
+    insn: &Instruction,
+    ops: &mut impl LiftBuffer,
+    tg: &mut TempGen,
+) -> Option<Val> {
+    let displacement = ops.live_field(LiveFieldKind::Immediate, tg)?;
+    let next = alu_none(ops, tg, |dst| IrOp::Add {
+        dst,
+        a: Val::Imm(insn.next_ip()),
+        b: displacement,
+        size: 8,
+        set_flags: FlagMask::NONE,
+    });
+    Some(alu_none(ops, tg, |dst| IrOp::And {
+        dst,
+        a: next,
+        b: Val::Imm(if insn.op0_kind() == OpKind::NearBranch16 {
+            0xffff
+        } else {
+            0xffff_ffff
+        }),
+        size: 8,
+        set_flags: FlagMask::NONE,
+    }))
+}
+
 pub(super) fn far_target(
     insn: &Instruction,
     ops: &mut impl LiftBuffer,
@@ -1924,7 +2057,8 @@ pub(super) fn lower(
                     None,
                     match insn.op_kind(0) {
                         OpKind::NearBranch16 | OpKind::NearBranch32 => {
-                            Val::Imm(insn.near_branch_target())
+                            live_jump_target(insn, ops, tg)
+                                .unwrap_or(Val::Imm(insn.near_branch_target()))
                         }
                         _ => {
                             let value = lower_read(insn, 0, ops, tg)?;
