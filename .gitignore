@@ -56,3 +56,7 @@ x86jit-tests/vendor/80286/v1_real_mode/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Python bytecode caches (the scripts tests create them)
+__pycache__/
+*.pyc
