@@ -2708,6 +2708,68 @@ pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
     })
 }
 
+/// An op an instruction's MMIO handoff and re-execution repeat with the same
+/// result when it precedes the transfer (`BlockPass::device`): it writes only
+/// registers, flags or temporaries, which the re-execution recomputes from the
+/// inputs the attempt left or rolled back, or checks an address, or is a Load,
+/// which repeats only when the ledger answers it (`ledger_holds_reads`).
+/// Writes to memory or ports, a live field's read of code bytes, and the
+/// helpers of every other legacy op are effects a re-execution would make
+/// again or observe anew.
+fn repeats_exactly(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::ReadReg { .. }
+            | IrOp::WriteReg { .. }
+            | IrOp::Add { .. }
+            | IrOp::Sub { .. }
+            | IrOp::Adc { .. }
+            | IrOp::Sbb { .. }
+            | IrOp::And { .. }
+            | IrOp::Or { .. }
+            | IrOp::Xor { .. }
+            | IrOp::Shl { .. }
+            | IrOp::Shr { .. }
+            | IrOp::Sar { .. }
+            | IrOp::Rol { .. }
+            | IrOp::Ror { .. }
+            | IrOp::Rcl { .. }
+            | IrOp::Rcr { .. }
+            | IrOp::Sext { .. }
+            | IrOp::Bswap { .. }
+            | IrOp::Mul { .. }
+            | IrOp::GetCond { .. }
+            | IrOp::Fence { .. }
+            | IrOp::Load { .. }
+            | IrOp::SegLimitCheck { .. }
+            | IrOp::Legacy(
+                L::Address { .. }
+                    | L::Flat32Address { .. }
+                    | L::SegmentedAddress { .. }
+                    | L::ReadSelector { .. }
+                    | L::Checkpoint
+                    | L::I486Gate
+            )
+    )
+}
+
+/// Whether the retry ledger answers each of the current instruction's first
+/// `reads` reads (cursor indices `0..reads`, `LegacyAccess::read_key`), so
+/// that its re-execution reads none of them from RAM again.
+fn ledger_holds_reads(cpu: &CpuState, reads: u16) -> bool {
+    if reads == 0 {
+        return true;
+    }
+    let parts = &cpu.mmio_parts[..usize::from(cpu.mmio_parts_len)];
+    cpu.mmio_retry_active
+        && cpu.owns_mmio_retry(cpu.rip)
+        && (0..reads).all(|index| {
+            parts
+                .iter()
+                .any(|&(key, _)| key >> 48 == 0 && (key >> 32) as u16 == index)
+        })
+}
+
 /// A DS, ES, FS or GS load (MOV, POP, LDS, LES, LFS, LGS). It performs the
 /// complete architectural load with its own faults and may continue an
 /// ordinary block: no event shadow (SDM Vol 3A §7.8.3 p. 7-8 names only SS), and
@@ -3195,6 +3257,150 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         }
     }
 
+    /// An op of the walk that returned `exit`. Only an unpaged pass completes
+    /// a transfer in place: the paged Fast lane's operands are RAM windows
+    /// (`paging::fast_window`), so a paged MMIO handoff comes from a lane that
+    /// runs on its own. A run with no handler published reaches no device
+    /// code. Out of line, as every exit of the walk is.
+    #[cold]
+    #[inline(never)]
+    fn failed(
+        &mut self,
+        op: &IrOp,
+        exit: Exit,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+    ) -> Option<WalkResult> {
+        if !LANES
+            && matches!(exit, Exit::MmioRead { .. } | Exit::MmioWrite { .. })
+            && crate::vm::device::published()
+        {
+            return self.device(op, exit, cpu, temps);
+        }
+        Some(WalkResult::exit(exit))
+    }
+
+    /// An unpaged Load or Store `op` of the current instruction that issued
+    /// the MMIO handoff `exit` (decision-28 stage 3). When the transfer is the
+    /// whole operand, every earlier op of the instruction is one whose effects
+    /// the handoff's re-execution repeats exactly (registers, flags and
+    /// temporaries, address checks, reads), and the armed handler completes it
+    /// with no effect (`vm::device::in_pass_access`), the pass does what the
+    /// completion and the re-execution would: it records the answer or the
+    /// acknowledgement as `Vcpu::complete_mmio_read` / `complete_mmio_write`
+    /// do and runs `op` again, which takes it from the retry ledger under the
+    /// key the re-execution would use. The instruction goes on in place; its
+    /// boundary clears the ledger as the re-execution's would. Any other case,
+    /// or a declined result kept for it, issues the handoff.
+    #[cold]
+    #[inline(never)]
+    fn device(
+        &mut self,
+        op: &IrOp,
+        exit: Exit,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+    ) -> Option<WalkResult> {
+        // A piece of a bus-split operand keeps the handoff: performing the op
+        // again from its start would read its pieces under other ledger keys
+        // than the re-execution gives them.
+        let (write, address, size, value) = match (op, &exit) {
+            (IrOp::Load { size: whole, .. }, &Exit::MmioRead { addr, size, .. })
+                if size == *whole =>
+            {
+                (false, addr, size, 0)
+            }
+            (
+                IrOp::Store { size: whole, .. },
+                &Exit::MmioWrite {
+                    addr, size, value, ..
+                },
+            ) if size == *whole => (true, addr, size, value),
+            _ => return Some(WalkResult::exit(exit)),
+        };
+        let ops = self.view.ops;
+        let Some(at) = ops.iter().position(|o| std::ptr::eq(o, op)) else {
+            return Some(WalkResult::exit(exit));
+        };
+        if !ops[1..at].iter().all(repeats_exactly) {
+            return Some(WalkResult::exit(exit));
+        }
+        // Every earlier read of the instruction must come from the ledger,
+        // where the re-execution takes it: a RAM read is performed again
+        // after the callback, and RAM can change during one beyond the
+        // context's fenced writes (another vCPU's store, a write through the
+        // handler's own `&Vm`), which the pass would not see. The cursor has
+        // counted this op's failed read too.
+        let earlier = self.registers.read_index.get() - u16::from(!write);
+        if !ledger_holds_reads(cpu, earlier) {
+            return Some(WalkResult::exit(exit));
+        }
+        // The pass entered the instruction at its marker, which sets RIP
+        // (`BlockPass::boundary`), and no op `repeats_exactly` admits before
+        // the transfer writes it, so the ledger the completion begins is the
+        // instruction's; any other RIP takes the handoff.
+        debug_assert_eq!(cpu.rip, self.view.guest_start);
+        if cpu.rip != self.view.guest_start {
+            return Some(WalkResult::exit(exit));
+        }
+        // The performed op must take the completion. Its read key is the
+        // failed read's own (the cursor's last), its write key the bus
+        // address's; the ledger holds neither (the access would have been
+        // answered from it rather than trapping, and no earlier op of the
+        // instruction wrote), else the handoff is taken before any callback.
+        let key = if write {
+            address | (1 << 63)
+        } else {
+            address | (u64::from(self.registers.read_index.get().wrapping_sub(1)) << 32)
+        };
+        debug_assert!(cpu.mmio_part(cpu.rip, key).is_none());
+        if cpu.mmio_part(cpu.rip, key).is_some() {
+            return Some(WalkResult::exit(exit));
+        }
+        let Some(answer) = crate::vm::device::in_pass_access(
+            self.ir,
+            self.view.guest_start,
+            self.steps,
+            self.retired,
+            write,
+            address,
+            size,
+            value,
+        ) else {
+            return Some(WalkResult::exit(exit));
+        };
+        if !cpu.mmio_retry_active {
+            cpu.begin_mmio_retry(cpu.rip);
+        }
+        if write {
+            cpu.pending_mmio_write = true;
+        } else {
+            cpu.pending_mmio = Some(answer);
+            // The re-execution's read cursor restarts with the instruction
+            // and reaches this read at the index it had.
+            let index = &self.registers.read_index;
+            index.set(index.get() - 1);
+        }
+        let result = execute_op::<ROUTED, ORDER, false, V86>(
+            op,
+            &self.view,
+            cpu,
+            &self.registers,
+            temps,
+            self.context,
+            self.task_switch,
+            &mut self.outcome,
+        );
+        // Taken, as checked above. Were it not, the state would be the
+        // handoff path's, whose re-execution leaves the completion the same way.
+        debug_assert!(cpu.pending_mmio.is_none() && !cpu.pending_mmio_write);
+        match result {
+            Ok(false) => None,
+            Ok(true) => Some(WalkResult::Continue),
+            Err(exit) => Some(WalkResult::exit(exit)),
+        }
+    }
+
     /// `execute_instruction`'s exit for an instruction that failed in the walk.
     #[cold]
     #[inline(never)]
@@ -3420,7 +3626,7 @@ impl<const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool>
         match result {
             Ok(false) => None,
             Ok(true) => Some(WalkResult::Continue),
-            Err(exit) => Some(WalkResult::exit(exit)),
+            Err(exit) => self.failed(op, exit, cpu, temps),
         }
     }
     fn boundaries(&self) -> bool {
@@ -6316,5 +6522,76 @@ mod walk_verdict {
         assert!(refused(&progress));
         assert_eq!((progress.steps, progress.retired), (0, 0));
         assert_eq!((cpu.rip, cpu.gpr), (0x1000, start.gpr));
+    }
+}
+
+#[cfg(test)]
+mod in_pass_tests {
+    use super::*;
+
+    /// The block pass completes an MMIO transfer in place only after ops whose
+    /// re-execution repeats them exactly (`BlockPass::device`). No ordinary
+    /// Flat32 or Segmented lift puts a memory write before another transfer of
+    /// its instruction today (the census in `vm/device/tests.rs` meets none;
+    /// its `prefix-op` form witnesses the list on BTS and SHLD), so the
+    /// classification is also pinned here: every op that writes memory or a
+    /// port, reads a live field or runs a legacy helper ends the in-place path.
+    #[test]
+    fn writes_and_helpers_before_a_transfer_keep_the_handoff() {
+        let fault = crate::ir::MemoryAccess::new(4, false, false);
+        let effects = [
+            IrOp::Store {
+                fault,
+                addr: Val::Temp(0),
+                src: Val::Temp(1),
+                size: 4,
+                order: crate::ir::MemOrder::None,
+            },
+            IrOp::AtomicRmw {
+                fault,
+                old: 2,
+                addr: Val::Temp(0),
+                src: Val::Temp(1),
+                size: 4,
+                op: crate::ir::RmwOp::Add,
+            },
+            IrOp::PortIo {
+                port: Val::Imm(0x80),
+                value: Val::Temp(1),
+                size: 1,
+                dir_out: true,
+            },
+            IrOp::Legacy(L::CheckTaskReturn),
+            IrOp::Legacy(L::SharedWalk),
+            IrOp::Legacy(L::LiveField {
+                dst: 3,
+                bus: 0x10000,
+                bytes: 4,
+                extend: 4,
+            }),
+        ];
+        for op in &effects {
+            assert!(!repeats_exactly(op), "{op:?}");
+        }
+        let repeated = [
+            IrOp::ReadReg {
+                dst: 0,
+                reg: crate::Reg::Rsi,
+            },
+            IrOp::Load {
+                fault,
+                dst: 1,
+                addr: Val::Temp(0),
+                size: 4,
+            },
+            IrOp::WriteReg {
+                reg: crate::Reg::Rax,
+                src: Val::Temp(1),
+                size: 4,
+            },
+        ];
+        for op in &repeated {
+            assert!(repeats_exactly(op), "{op:?}");
+        }
     }
 }

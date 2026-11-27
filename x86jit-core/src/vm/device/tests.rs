@@ -8,9 +8,12 @@ use crate::{
 const CODE: u64 = 0x10000;
 const MMIO: u64 = 0xa000;
 fn setup(model: CpuModel, mode: u8, code: &[u8]) -> (Vm, Vcpu) {
+    setup_with(model, mode, code, ExceptionDelivery::Outward)
+}
+fn setup_with(model: CpuModel, mode: u8, code: &[u8], delivery: ExceptionDelivery) -> (Vm, Vcpu) {
     let mut vm = Vm::new(VmConfig::flat(0x20000));
     vm.set_cpu_model(model);
-    vm.set_exception_delivery(ExceptionDelivery::Outward);
+    vm.set_exception_delivery(delivery);
     vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
         .unwrap();
     vm.map(MMIO, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
@@ -147,7 +150,7 @@ impl DeviceIo for Device {
 fn finish(vm: &Vm, cpu: &mut Vcpu, handler: bool, budget: u64) -> (Device, u64, String) {
     let mut device = Device::default();
     let mut count = 0;
-    for _ in 0..200 {
+    for _ in 0..2000 {
         let before = device.effects.len();
         let zero = cpu
             .run_steps_with_devices(
@@ -178,7 +181,7 @@ fn finish(vm: &Vm, cpu: &mut Vcpu, handler: bool, budget: u64) -> (Device, u64, 
             stop => panic!("{stop:?}"),
         }
     }
-    panic!("did not finish")
+    panic!("did not finish: {count} steps, rip {:#x}", cpu.cpu.rip)
 }
 fn architectural(cpu: &Vcpu) -> String {
     format!(
@@ -1622,12 +1625,19 @@ fn in_block_equals_exit_and_stage_two() {
 /// code at the Exit, and to stage 2.
 #[test]
 fn in_block_handler_code_write_matches_exit() {
-    // mov [si],al; inc bx (rewritten to dec bx); mov [si],al; inc bx; hlt
-    let code = [0x88, 0x04, 0x43, 0x88, 0x04, 0x43, 0xf4];
-    for model in [CpuModel::I80286, CpuModel::I80386] {
+    // mov [si],al; inc bx (rewritten to dec bx); mov [si],al; inc bx; hlt;
+    // and the same in Flat32 and sixteen-bit protected code.
+    for (model, mode) in [
+        (CpuModel::I80286, 0),
+        (CpuModel::I80386, 0),
+        (CpuModel::I80386, 1),
+        (CpuModel::I80286, 3),
+    ] {
+        let operand = if mode == 1 { 0x06 } else { 0x04 };
+        let code = [0x88, operand, 0x43, 0x88, operand, 0x43, 0xf4];
         for budget in [1, 2, 100] {
-            let tag = format!("{model:?}/{budget}");
-            let (v1, mut c1) = setup(model, 0, &code);
+            let tag = format!("{model:?}/{mode}/{budget}");
+            let (v1, mut c1) = setup(model, mode, &code);
             let mut writes = 0;
             loop {
                 let run = c1.run_steps(&v1, budget, StepOptions::default()).unwrap();
@@ -1645,7 +1655,7 @@ fn in_block_handler_code_write_matches_exit() {
                 }
             }
             let handler = |two: bool| {
-                let (vm, mut cpu) = setup(model, 0, &code);
+                let (vm, mut cpu) = setup(model, mode, &code);
                 let mut calls = Vec::new();
                 let mut h = Callback(|r: &DeviceRequest, c: &mut DeviceContext<'_>| {
                     if calls.is_empty() {
@@ -1674,9 +1684,14 @@ fn in_block_handler_code_write_matches_exit() {
             let (v3, c3, calls3) = handler(false);
             let after = in_block_counts();
             // The writing callback is made inside its block and settles at
-            // the handoff. A page with written code then runs the checked
-            // walk, which takes the stage-2 handoff.
-            assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "{tag}");
+            // the handoff. A real-mode page with written code then runs the
+            // checked walk, which takes the stage-2 handoff; a protected
+            // block is lifted again and completes the second store in place.
+            let (calls, completed) = (after.0 - before.0, after.1 - before.1);
+            assert_eq!(calls - completed, 1, "{tag}");
+            if mode == 0 {
+                assert_eq!((calls, completed), (1, 0), "{tag}");
+            }
             assert_eq!(writes, 2, "{tag}");
             assert_eq!(calls2, calls3, "{tag}");
             assert_eq!(calls3.len(), 2, "{tag}");
@@ -1919,8 +1934,15 @@ fn effect_run(
                 return (stops, steps, requests);
             }
             StepStop::Exit(
-                stop @ (Exit::Interrupted | Exit::Device(crate::DeviceStop::Deadline { .. })),
+                stop @ (Exit::Interrupted
+                | Exit::Device(crate::DeviceStop::Deadline { .. })
+                | Exit::Exception { vector: 1, .. }),
             ) => stops.push(format!("{stop:?}")),
+            // Protected modes without an IDT return their exceptions.
+            StepStop::Exit(stop @ Exit::Exception { .. }) => {
+                stops.push(format!("{stop:?}"));
+                return (stops, steps, requests);
+            }
             stop => panic!("{stop:?}"),
         }
     }
@@ -1990,4 +2012,759 @@ fn in_block_effects_and_single_step_take_the_handoff_and_equal_exit() {
             }
         }
     }
+}
+
+/// For the in-guest exception delivery of the protected modes of
+/// [`setup_with`] (1 to 4): a GDT with the code and data descriptors the segment caches hold
+/// (selectors 08h and 10h), and an IDT whose #DB and NMI gates run
+/// `INC (E)DX; IRET(D)` and whose other exception gates halt, so a single-step
+/// trap returns to the program and a fault ends it at a HLT.
+fn guest_idt(vm: &Vm, cpu: &mut Vcpu, mode: u8) {
+    let (limit, flags, code_base) = match mode {
+        3 => (0xffffu32, 0u8, CODE as u32),
+        4 => (0x1ffff, 0x4, 0),
+        _ => (0xfffff, 0xc, 0),
+    };
+    let descriptor = |base: u32, access: u8| {
+        [
+            limit as u8,
+            (limit >> 8) as u8,
+            base as u8,
+            (base >> 8) as u8,
+            (base >> 16) as u8,
+            access,
+            (flags << 4) | ((limit >> 16) as u8 & 0xf),
+            (base >> 24) as u8,
+        ]
+    };
+    vm.write_bytes(0x6008, &descriptor(code_base, 0x9b))
+        .unwrap();
+    vm.write_bytes(0x6010, &descriptor(0, 0x93)).unwrap();
+    cpu.cpu.legacy.gdtr.base = 0x6000;
+    cpu.cpu.legacy.gdtr.limit = 0x17;
+    let handlers = CODE + 0x800;
+    let offset = handlers - u64::from(code_base);
+    // INC (E)DX; IRET(D) at +0, HLT at +2.
+    vm.write_bytes(handlers, &[0x42, 0xcf, 0xf4]).unwrap();
+    let gate = if mode == 3 { 0x86 } else { 0x8e };
+    for vector in 0..32u64 {
+        let target = offset + if matches!(vector, 1 | 2) { 0 } else { 2 };
+        let entry = [
+            target as u8,
+            (target >> 8) as u8,
+            8,
+            0,
+            0,
+            gate,
+            (target >> 16) as u8,
+            (target >> 24) as u8,
+        ];
+        vm.write_bytes(0x7000 + vector * 8, &entry).unwrap();
+    }
+    cpu.cpu.legacy.idtr.base = 0x7000;
+    cpu.cpu.legacy.idtr.limit = 0xff;
+    cpu.cpu.cs = 8;
+    cpu.cpu.ds = 0x10;
+    cpu.cpu.es = 0x10;
+    cpu.cpu.fs = 0x10;
+    cpu.cpu.gs = 0x10;
+    cpu.cpu.ss = 0x10;
+}
+
+/// One instruction form of the unpaged block-pass census: its bytes for
+/// 32-bit code and for 16-bit code, and whether the block pass completes
+/// at least one of its transfers in place.
+struct Form {
+    name: &'static str,
+    code32: &'static [u8],
+    code16: &'static [u8],
+    in_pass: bool,
+    /// The transfers the pass completes in unpaged protected code, where the
+    /// form pins them.
+    exact: Option<u64>,
+}
+const fn form(
+    name: &'static str,
+    code32: &'static [u8],
+    code16: &'static [u8],
+    in_pass: bool,
+) -> Form {
+    Form {
+        name,
+        code32,
+        code16,
+        in_pass,
+        exact: None,
+    }
+}
+const fn exactly(form: Form, transfers: u64) -> Form {
+    Form {
+        exact: Some(transfers),
+        ..form
+    }
+}
+/// The census: scalar loads and stores of every width and addressing form,
+/// read-modify-writes (two transfers), loads whose instruction faults after
+/// the device answer, transfers beside a later fault, an access that faults
+/// before the device is called, transfers across the end of the registered
+/// range, LOCK forms, strings and stack forms. A leading INC and a trailing
+/// INC keep each form inside a block of several instructions.
+const CENSUS: &[Form] = &[
+    form(
+        "scalar",
+        // mov [esi],al; mov bl,[esi]; mov [esi+2],ax; mov ecx,[esi+4];
+        // mov [esi+8],eax; mov [0xa020],al; mov eax,[0xa024];
+        // movzx ebx,byte [esi]; movsx ecx,word [esi+2]; cmp [esi],al;
+        // test [esi+4],eax; mov byte [esi+12],0x77; mov dword [esi+12],imm
+        &[
+            0x88, 0x06, 0x8a, 0x1e, 0x66, 0x89, 0x46, 0x02, 0x8b, 0x4e, 0x04, 0x89, 0x46, 0x08,
+            0xa2, 0x20, 0xa0, 0x00, 0x00, 0xa1, 0x24, 0xa0, 0x00, 0x00, 0x0f, 0xb6, 0x1e, 0x0f,
+            0xbf, 0x4e, 0x02, 0x38, 0x06, 0x85, 0x46, 0x04, 0xc6, 0x46, 0x0c, 0x77, 0xc7, 0x46,
+            0x0c, 0x11, 0x22, 0x33, 0x44,
+        ],
+        // mov [si],al; mov bl,[si]; mov [si+2],ax; mov cx,[si+4];
+        // mov [si+8],ax; mov [0xa020],al; mov ax,[0xa024]; cmp [si],al;
+        // test [si+4],ax; mov byte [si+12],0x77; mov word [si+12],imm
+        &[
+            0x88, 0x04, 0x8a, 0x1c, 0x89, 0x44, 0x02, 0x8b, 0x4c, 0x04, 0x89, 0x44, 0x08, 0xa2,
+            0x20, 0xa0, 0xa1, 0x24, 0xa0, 0x38, 0x04, 0x85, 0x44, 0x04, 0xc6, 0x44, 0x0c, 0x77,
+            0xc7, 0x44, 0x0c, 0x11, 0x22,
+        ],
+        true,
+    ),
+    form(
+        "read-modify-write",
+        // add [esi],al; adc [esi+4],eax; inc byte [esi]; not dword [esi+4];
+        // shl dword [esi+4],1; sub word [esi+2],ax
+        &[
+            0x00, 0x06, 0x11, 0x46, 0x04, 0xfe, 0x06, 0xf7, 0x56, 0x04, 0xd1, 0x66, 0x04, 0x66,
+            0x29, 0x46, 0x02,
+        ],
+        // add [si],al; adc [si+4],ax; inc byte [si]; not word [si+4];
+        // shl word [si+4],1; sub [si+2],ax
+        &[
+            0x00, 0x04, 0x11, 0x44, 0x04, 0xfe, 0x04, 0xf7, 0x54, 0x04, 0xd1, 0x64, 0x04, 0x29,
+            0x44, 0x02,
+        ],
+        true,
+    ),
+    form(
+        "fault-after-answer",
+        // mov edx,-1; div dword [esi] (#DE on the device answer)
+        &[0xba, 0xff, 0xff, 0xff, 0xff, 0xf7, 0x36],
+        // mov dx,-1; div word [si]
+        &[0xba, 0xff, 0xff, 0xf7, 0x34],
+        true,
+    ),
+    form(
+        "bound",
+        // bound eax,[esi]: two device reads, then #BR or none
+        &[0x62, 0x06, 0x62, 0x46, 0x08],
+        &[0x62, 0x04, 0x62, 0x44, 0x08],
+        false,
+    ),
+    form(
+        "later-fault",
+        // mov [esi],al; mov bl,[esi]; mov ebx,[0x1fffe] (#GP past a 0x1ffff
+        // limit; RAM elsewhere); mov [esi],al
+        &[
+            0x88, 0x06, 0x8a, 0x1e, 0x8b, 0x1d, 0xfe, 0xff, 0x01, 0x00, 0x88, 0x06,
+        ],
+        // mov [si],al; mov bl,[si]; mov bx,[0xffff] (#GP); mov [si],al
+        &[0x88, 0x04, 0x8a, 0x1c, 0x8b, 0x1e, 0xff, 0xff, 0x88, 0x04],
+        true,
+    ),
+    form(
+        "fault-before-call",
+        // mov [esi],al; mov [esi+0x20000],al (#GP past a 0x1ffff limit, or
+        // an unmapped store)
+        &[0x88, 0x06, 0x88, 0x86, 0x00, 0x00, 0x02, 0x00],
+        // mov [si],al; mov [si+0x6000],al (past 0xffff from si=0xa000)
+        &[0x88, 0x04, 0x88, 0x84, 0x00, 0x60],
+        true,
+    ),
+    // Transfers across the ends of the registered range (RAM|MMIO and
+    // MMIO|RAM), each its instruction's only access.
+    form(
+        "across-start-load",
+        // mov eax,[esi-2]
+        &[0x8b, 0x46, 0xfe],
+        // mov ax,[si-1]
+        &[0x8b, 0x44, 0xff],
+        false,
+    ),
+    form(
+        "across-end-load",
+        // mov eax,[esi+0xffe]
+        &[0x8b, 0x86, 0xfe, 0x0f, 0x00, 0x00],
+        // mov ax,[si+0xfff]
+        &[0x8b, 0x84, 0xff, 0x0f],
+        false,
+    ),
+    form(
+        "across-start-store",
+        // mov [esi-1],ax
+        &[0x66, 0x89, 0x46, 0xff],
+        // mov [si-1],ax
+        &[0x89, 0x44, 0xff],
+        false,
+    ),
+    form(
+        "across-end-store",
+        // mov [esi+0xfff],ax
+        &[0x66, 0x89, 0x86, 0xff, 0x0f, 0x00, 0x00],
+        // mov [si+0xfff],ax
+        &[0x89, 0x84, 0xff, 0x0f],
+        false,
+    ),
+    form(
+        "locked",
+        // lock add [esi],eax; xchg [esi],eax; cmpxchg [esi],ebx
+        &[0xf0, 0x01, 0x06, 0x87, 0x06, 0x0f, 0xb1, 0x1e],
+        &[0xf0, 0x01, 0x04, 0x87, 0x04, 0x0f, 0xb1, 0x1c],
+        false,
+    ),
+    form(
+        "strings",
+        // movsb; rep movsd (ECX=3); stosb; lodsd
+        &[0xa4, 0xf3, 0xa5, 0xaa, 0xad],
+        // movsb; rep movsw; stosb; lodsw
+        &[0xa4, 0xf3, 0xa5, 0xaa, 0xad],
+        false,
+    ),
+    // PUSH reads its device operand first; POP's device store follows its
+    // stack read from RAM, which only the ledger may answer: it keeps the
+    // handoff.
+    exactly(
+        form(
+            "stack",
+            // push dword [esi]; pop dword [edi]
+            &[0xff, 0x36, 0x8f, 0x07],
+            &[0xff, 0x34, 0x8f, 0x05],
+            true,
+        ),
+        1,
+    ),
+    // A store whose instruction runs an op outside `repeats_exactly` before
+    // it (SHLD's double shift) keeps the handoff; its device read, BTS's read
+    // and BTS's store (lowered to repeatable ops) complete in the pass.
+    exactly(
+        form(
+            "prefix-op",
+            // bts dword [esi],3; shld dword [esi],eax,4
+            &[0x0f, 0xba, 0x2e, 0x03, 0x0f, 0xa4, 0x06, 0x04],
+            // bts word [si],3; shld word [si],ax,4
+            &[0x0f, 0xba, 0x2c, 0x03, 0x0f, 0xa4, 0x04, 0x04],
+            true,
+        ),
+        3,
+    ),
+];
+
+/// Decision-28 stage 3 in the unpaged block pass (Flat32, Segmented and
+/// sixteen-bit protected blocks): every form of the census, under budgets 1,
+/// 2, 7 and 64 and with TF set, equals the Exit/completion protocol and the
+/// stage-2 handoff (in-block path disabled): stops, steps, state, RAM,
+/// device-effect order, the delivery log, and stage 2's exact requests
+/// (positions, unit start, IP). Scalar, read-modify-write and stack-operand
+/// forms complete in the pass; BOUND, locked, string and split forms keep the
+/// handoff, as paged and V86 code do. Real-mode code runs the shared walk and,
+/// for its Direct blocks, the pass.
+#[test]
+fn in_pass_census_equals_exit_and_stage_two() {
+    for (model, mode) in [
+        (CpuModel::I80386, 1),
+        (CpuModel::I80486Dx, 1),
+        (CpuModel::I80386, 4),
+        (CpuModel::I80486Dx, 4),
+        (CpuModel::I80286, 3),
+        (CpuModel::I80386, 3),
+        // Real mode: the shared walk and, for its Direct blocks (BOUND, the
+        // locked forms), the block pass.
+        (CpuModel::I80286, 0),
+        (CpuModel::I80386, 0),
+        // Paged and V86 code keep the handoff.
+        (CpuModel::I80386, 2),
+        (CpuModel::I80486Dx, 2),
+        (CpuModel::I80386, 5),
+    ] {
+        let unpaged = matches!(mode, 1 | 3 | 4);
+        let mut real_passes = 0;
+        for form in CENSUS {
+            // The 80286 has no BT or double-shift forms (two-byte opcodes).
+            if model == CpuModel::I80286 && form.code16.starts_with(&[0x0f]) {
+                continue;
+            }
+            let mut code = vec![0x43];
+            code.extend_from_slice(if matches!(mode, 0 | 3 | 5) {
+                form.code16
+            } else {
+                form.code32
+            });
+            // inc (e)bx; pushf(d); pop (e)ax; and ah,0xfe; push (e)ax; popf(d)
+            // (TF=0, so HLT stops); hlt
+            code.extend([0x43, 0x9c, 0x58, 0x80, 0xe4, 0xfe, 0x50, 0x9d, 0xf4]);
+            // V86 without a monitor runs without single steps.
+            for tf in [false, mode != 5] {
+                for budget in [1, 2, 7, 64] {
+                    let tag = format!("{model:?}/{mode}/{}/tf={tf}/{budget}", form.name);
+                    let machine = || {
+                        let delivery = if matches!(mode, 0 | 5) {
+                            ExceptionDelivery::Outward
+                        } else {
+                            ExceptionDelivery::InGuest
+                        };
+                        let (vm, mut cpu) = setup_with(model, mode, &code, delivery);
+                        if mode == 0 {
+                            // #DB at 0000:0600, delivered through the IVT:
+                            // INC DX; IRET.
+                            vm.write_bytes(4, &[0x00, 0x06, 0x00, 0x00]).unwrap();
+                            vm.write_bytes(0x600, &[0x42, 0xcf]).unwrap();
+                        } else if mode != 5 {
+                            guest_idt(&vm, &mut cpu, mode);
+                        }
+                        if tf {
+                            cpu.cpu.rflags_system |= 0x100;
+                        }
+                        (vm, cpu)
+                    };
+                    let (v1, mut c1) = machine();
+                    let (v2, mut c2) = machine();
+                    let (v3, mut c3) = machine();
+                    let r1 = finish(&v1, &mut c1, false, budget);
+                    let r2 = stage_two(|| finish(&v2, &mut c2, true, budget));
+                    let before = in_block_completions();
+                    let passes = IN_PASS_TEST.with(|t| t.get());
+                    let r3 = finish(&v3, &mut c3, true, budget);
+                    let completed = in_block_completions() - before;
+                    let passed = IN_PASS_TEST.with(|t| t.get()) - passes;
+                    assert_eq!((r1.1, &r1.2), (r3.1, &r3.2), "{tag}");
+                    assert_eq!((r2.1, &r2.2), (r3.1, &r3.2), "{tag}");
+                    assert_eq!(r1.0.effects, r3.0.effects, "{tag}");
+                    assert_eq!(r2.0.effects, r3.0.effects, "{tag}");
+                    assert_eq!(r2.0.requests, r3.0.requests, "{tag}");
+                    assert_same_machine(&tag, (&v1, &c1), (&v3, &c3));
+                    assert_same_machine(&tag, (&v2, &c2), (&v3, &c3));
+                    assert_eq!(c2.cpu.mmio_parts, c3.cpu.mmio_parts, "{tag}");
+                    if mode == 0 {
+                        real_passes += passed;
+                        continue;
+                    }
+                    assert_eq!(passed, if unpaged { completed } else { 0 }, "{tag}");
+                    assert_eq!(
+                        completed != 0,
+                        form.in_pass && unpaged,
+                        "{tag}: {completed}"
+                    );
+                    if let (Some(exact), true) = (form.exact, unpaged) {
+                        assert_eq!(passed, exact, "{tag}");
+                    }
+                }
+            }
+        }
+        // Real-mode Direct blocks complete their transfers in the pass too.
+        assert!(mode != 0 || real_passes != 0, "{model:?}");
+    }
+}
+
+/// The unpaged block pass under the effects of the real-mode witness above:
+/// a handled result with a context effect is made in the pass and settled at
+/// the ordinary handoff, one with none completes in the pass; both equal the
+/// stage-2 handoff and, for the effects an embedder can apply, the Exit path,
+/// with and without single-step traps, delivered in the guest.
+#[test]
+fn in_pass_effects_and_single_step_take_the_handoff_and_equal_exit() {
+    // inc ebx; mov [esi],al; inc ebx; mov [esi],al; inc ebx; inc ebx; jmp $+2;
+    // pushfd; pop eax; and ah,0xfe; push eax; popfd; hlt
+    let code32 = [
+        0x43, 0x88, 0x06, 0x43, 0x88, 0x06, 0x43, 0x43, 0xeb, 0x00, 0x9c, 0x58, 0x80, 0xe4, 0xfe,
+        0x50, 0x9d, 0xf4,
+    ];
+    let code16 = [
+        0x43, 0x88, 0x04, 0x43, 0x88, 0x04, 0x43, 0x43, 0xeb, 0x00, 0x9c, 0x58, 0x80, 0xe4, 0xfe,
+        0x50, 0x9d, 0xf4,
+    ];
+    let effects = [
+        Effect::None,
+        Effect::Intr,
+        Effect::Deadline,
+        Effect::A20,
+        Effect::HostStop,
+        Effect::Nmi,
+    ];
+    for (model, mode) in [
+        (CpuModel::I80386, 1),
+        (CpuModel::I80486Dx, 4),
+        (CpuModel::I80286, 3),
+    ] {
+        let code: &[u8] = if mode == 3 { &code16 } else { &code32 };
+        for tf in [false, true] {
+            for effect in effects {
+                for budget in [1, 2, 7, 64] {
+                    let tag = format!("{model:?}/{mode}/tf={tf}/{effect:?}/{budget}");
+                    let machine = || {
+                        let (vm, mut cpu) =
+                            setup_with(model, mode, code, ExceptionDelivery::InGuest);
+                        guest_idt(&vm, &mut cpu, mode);
+                        cpu.cpu.flags.if_ = true;
+                        if tf {
+                            cpu.cpu.rflags_system |= 0x100;
+                        }
+                        (vm, cpu)
+                    };
+                    let (v2, mut c2) = machine();
+                    let r2 = stage_two(|| effect_run(&v2, &mut c2, budget, effect, true));
+                    let (v3, mut c3) = machine();
+                    let before = in_block_counts();
+                    let r3 = effect_run(&v3, &mut c3, budget, effect, true);
+                    let after = in_block_counts();
+                    let (calls, completed) = (after.0 - before.0, after.1 - before.1);
+                    assert_eq!(r2, r3, "{tag}");
+                    assert_same_machine(&tag, (&v2, &c2), (&v3, &c3));
+                    assert!(calls >= 1, "{tag}");
+                    let declined = u64::from(effect != Effect::None);
+                    assert_eq!(calls - completed, declined, "{tag}");
+                    if effect != Effect::Deadline {
+                        let (v1, mut c1) = machine();
+                        let r1 = effect_run(&v1, &mut c1, budget, effect, false);
+                        assert_eq!((&r1.0, r1.1), (&r3.0, r3.1), "{tag}");
+                        assert_same_machine(&tag, (&v1, &c1), (&v3, &c3));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The unpaged block pass's declined results (Fallback, DeviceFault, a
+/// panic) call the handler once and keep stage 2's results, and a handler
+/// that runs another vCPU of its VM is not re-entered; Flat32, Segmented and
+/// sixteen-bit protected code.
+#[test]
+fn in_pass_declined_results_and_nested_runs_equal_exit() {
+    for (model, mode, store) in [
+        (CpuModel::I80386, 1, [0x88, 0x06]),
+        (CpuModel::I80486Dx, 4, [0x88, 0x06]),
+        (CpuModel::I80286, 3, [0x88, 0x04]),
+    ] {
+        let start = if mode == 3 { 0 } else { CODE };
+        for result in 0..3 {
+            let code = [0x43, store[0], store[1], 0x43, 0xf4];
+            let (vm, mut cpu) = setup(model, mode, &code);
+            let mut calls = 0;
+            let mut h = Callback(|_: &DeviceRequest, _: &mut DeviceContext<'_>| {
+                calls += 1;
+                match result {
+                    0 => DeviceResult::Fallback,
+                    1 => DeviceResult::DeviceFault(DeviceError::new(5)),
+                    _ => panic!("device failed"),
+                }
+            });
+            let before = in_block_counts();
+            let r = run(&mut cpu, &vm, 100, &mut h);
+            assert_eq!(in_block_counts().0 - before.0, 1, "{mode}/{result}");
+            assert_eq!(in_block_counts().1, before.1, "{mode}/{result}");
+            assert_eq!(r.steps(), 1);
+            match result {
+                0 => assert!(matches!(r.stop(), StepStop::Exit(Exit::MmioWrite { .. }))),
+                1 => {
+                    let request = r.request().unwrap();
+                    assert_eq!(request.instruction_ip, start + 1);
+                    assert_eq!(request.position.retired_instructions, 1);
+                    assert_eq!(request.position.steps, 1);
+                }
+                _ => {
+                    assert!(matches!(
+                        r.stop(),
+                        StepStop::Exit(Exit::Device(crate::DeviceStop::HandlerFailed))
+                    ));
+                    assert!(vm.device_poisoned());
+                }
+            }
+            assert_eq!(calls, 1);
+            assert_eq!(cpu.cpu.rip, start + 1);
+        }
+        // mov [esi],al; inc ebx; mov [esi],al; inc ebx; hlt
+        let code = [store[0], store[1], 0x43, store[0], store[1], 0x43, 0xf4];
+        let (v1, mut c1) = setup(model, mode, &code);
+        let exit = finish(&v1, &mut c1, false, 100);
+        let (vm, mut cpu) = setup(model, mode, &code);
+        let mut nested = vm.new_vcpu();
+        nested.cpu = cpu.cpu.clone();
+        let depth = std::cell::Cell::new(0);
+        let mut deepest = 0;
+        let mut calls = Vec::new();
+        let mut nested_exits = Vec::new();
+        let mut h = Callback(|r: &DeviceRequest, _: &mut DeviceContext<'_>| {
+            depth.set(depth.get() + 1);
+            deepest = deepest.max(depth.get());
+            calls.push((r.vcpu_id, r.position.retired_instructions));
+            if depth.get() == 1 && calls.len() == 1 {
+                loop {
+                    let r = nested.run_steps(&vm, 100, StepOptions::default()).unwrap();
+                    match r.into_stop() {
+                        StepStop::Exit(Exit::BudgetExhausted) => {}
+                        StepStop::Exit(Exit::MmioWrite { addr, .. }) => {
+                            nested_exits.push(addr);
+                            nested.complete_mmio_write();
+                        }
+                        StepStop::Exit(Exit::Hlt) => break,
+                        stop => panic!("{mode}: {stop:?}"),
+                    }
+                }
+            }
+            depth.set(depth.get() - 1);
+            DeviceResult::Handled(0)
+        });
+        let before = in_block_counts();
+        let r = run(&mut cpu, &vm, 100, &mut h);
+        let after = in_block_counts();
+        assert!(matches!(r.stop(), StepStop::Exit(Exit::Hlt)), "{r:?}");
+        let id = cpu.device_cpu().id;
+        assert_eq!(deepest, 1, "{mode}");
+        assert_eq!(calls, [(id, 0), (id, 2)], "{mode}");
+        assert_eq!(nested_exits, [MMIO, MMIO], "{mode}");
+        assert_eq!((after.0 - before.0, after.1 - before.1), (2, 2), "{mode}");
+        assert_eq!(exit.1, 5, "{mode}");
+        assert_same_machine(&format!("{mode}"), (&v1, &c1), (&vm, &cpu));
+        assert_eq!(architectural(&nested), architectural(&c1), "{mode}");
+    }
+}
+
+/// A Load or Store whose operand the bus splits keeps the handoff in the
+/// block pass: with A20 off, a dword at linear FFFFEh is a RAM piece at
+/// FFFFEh and a device piece at 0 (SDM Vol 3A §3.4: each linear part is
+/// wrapped, then gated). A read-modify-write of it whose store is declined
+/// (an INTR change) re-executes from the ledger, which must hold the device
+/// read under the key the re-execution gives it: equal to stage 2, with no
+/// second read of the device.
+#[test]
+fn in_pass_keeps_bus_split_operands_on_the_handoff() {
+    // mov [0x10],al; add [0xffffe],eax; inc ebx; hlt
+    let code = [
+        0x88, 0x05, 0x10, 0x00, 0x00, 0x00, 0x01, 0x05, 0xfe, 0xff, 0x0f, 0x00, 0x43, 0xf4,
+    ];
+    let machine = || {
+        let mut vm = Vm::new(VmConfig::flat(0x100000));
+        vm.set_cpu_model(CpuModel::I80386);
+        vm.set_exception_delivery(ExceptionDelivery::Outward);
+        vm.map(0, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+        vm.map(0x1000, 0x1f000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0xff000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+        vm.register_device_range(DeviceRange::Mmio(0..0x1000))
+            .unwrap();
+        vm.write_bytes(CODE, &code).unwrap();
+        vm.write_bytes(0xffffe, &[0x11, 0x22]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.cr0 = 1;
+        for (i, s) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+            s.base = 0;
+            s.limit = u32::MAX;
+            s.attributes = if i == 0 { 0x409b } else { 0x4093 };
+            s.unusable = 0;
+        }
+        cpu.cpu.legacy.a20_enabled = 0;
+        cpu.cpu.rip = CODE;
+        cpu.set_reg(Reg::Rsp, 0x8000);
+        cpu.set_reg(Reg::Rax, 0x5a);
+        (vm, cpu)
+    };
+    let drive = |vm: &Vm, cpu: &mut Vcpu| {
+        let mut requests = Vec::new();
+        let mut h = Callback(|r: &DeviceRequest, c: &mut DeviceContext<'_>| {
+            requests.push(r.clone());
+            if r.direction == DeviceDirection::Write && r.size == 2 {
+                c.set_intr(true);
+            }
+            DeviceResult::Handled(0x8765_4321 + requests.len() as u64)
+        });
+        loop {
+            match run(cpu, vm, 100, &mut h).into_stop() {
+                StepStop::Exit(Exit::BudgetExhausted) => {}
+                StepStop::Exit(Exit::Hlt) => break,
+                stop => panic!("{stop:?}"),
+            }
+        }
+        requests
+    };
+    let (v2, mut c2) = machine();
+    let r2 = stage_two(|| drive(&v2, &mut c2));
+    let (v3, mut c3) = machine();
+    let before = in_block_counts();
+    let r3 = drive(&v3, &mut c3);
+    let after = in_block_counts();
+    assert_eq!(r2.len(), 3, "{r2:?}");
+    assert_eq!(r2, r3);
+    assert_eq!(architectural(&c2), architectural(&c3));
+    let (mut a, mut b) = ([0; 2], [0; 2]);
+    v2.read_bytes(0xffffe, &mut a).unwrap();
+    v3.read_bytes(0xffffe, &mut b).unwrap();
+    assert_eq!(a, b);
+    // The scalar store completes in the pass; the split pieces do not.
+    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+}
+
+/// Transfers the block pass completed in place during `f`.
+fn in_pass_completions<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let before = IN_PASS_TEST.with(|t| t.get());
+    let result = f();
+    (result, IN_PASS_TEST.with(|t| t.get()) - before)
+}
+
+/// A device transfer that follows a RAM read of its instruction keeps the
+/// handoff: the re-execution reads that RAM again after the callback, and the
+/// callback can change it beyond its context's fenced writes, through the
+/// handler's own `&Vm` or another vCPU's guest store. POP to a device operand
+/// reads its stack slot from RAM first, PUSH of a RAM operand to a device stack
+/// reads the operand first; both equal stage 2 (the handoff) while the handler
+/// rewrites the RAM read, and a store with no earlier read completes in the
+/// pass. Flat32 and sixteen-bit protected code.
+#[test]
+fn in_pass_keeps_transfers_after_ram_reads_on_the_handoff() {
+    const SLOT: u64 = 0xb100;
+    for (model, mode) in [(CpuModel::I80386, 1), (CpuModel::I80286, 3)] {
+        let short = mode == 3;
+        // (code, ESP, ESI, EDI, transfers completed in the pass)
+        let scenarios: [(&[u8], u64, u64, u64, u64); 3] = if short {
+            [
+                // inc bx; pop word [di]; inc bx; hlt (stack slot in RAM)
+                (&[0x43, 0x8f, 0x05, 0x43, 0xf4], SLOT, 0, MMIO, 0),
+                // inc bx; push word [si]; inc bx; hlt (device stack)
+                (&[0x43, 0xff, 0x34, 0x43, 0xf4], MMIO + 0x100, SLOT, 0, 0),
+                // inc bx; mov [di],ax; inc bx; hlt
+                (&[0x43, 0x89, 0x05, 0x43, 0xf4], SLOT, 0, MMIO, 1),
+            ]
+        } else {
+            [
+                (&[0x43, 0x8f, 0x07, 0x43, 0xf4], SLOT, 0, MMIO, 0),
+                (&[0x43, 0xff, 0x36, 0x43, 0xf4], MMIO + 0x100, SLOT, 0, 0),
+                (&[0x43, 0x89, 0x07, 0x43, 0xf4], SLOT, 0, MMIO, 1),
+            ]
+        };
+        for (route, nested_store) in [(0, false), (1, true)] {
+            for (index, &(code, esp, esi, edi, expected)) in scenarios.iter().enumerate() {
+                let tag = format!("{model:?}/{mode}/route {route}/{index}");
+                let drive = |two: bool| {
+                    let (vm, mut cpu) = setup(model, mode, code);
+                    vm.write_bytes(SLOT, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+                    cpu.set_reg(Reg::Rsp, esp);
+                    cpu.set_reg(Reg::Rsi, esi);
+                    cpu.set_reg(Reg::Rdi, edi);
+                    // Another vCPU's guest store over the slot: mov dword
+                    // [SLOT],imm32 (mov word [SLOT],imm16); hlt.
+                    let mut other = vm.new_vcpu();
+                    other.cpu = cpu.cpu.clone();
+                    let store: &[u8] = if short {
+                        &[0xc7, 0x06, 0x00, 0xb1, 0x88, 0x77, 0xf4]
+                    } else {
+                        &[
+                            0xc7, 0x05, 0x00, 0xb1, 0x00, 0x00, 0x88, 0x77, 0x66, 0x55, 0xf4,
+                        ]
+                    };
+                    vm.write_bytes(CODE + 0x400, store).unwrap();
+                    other.cpu.rip = if short { 0x400 } else { CODE + 0x400 };
+                    let mut requests = Vec::new();
+                    let mut h = Callback(|r: &DeviceRequest, _: &mut DeviceContext<'_>| {
+                        requests.push(r.clone());
+                        if nested_store {
+                            let run = other.run_steps(&vm, 100, StepOptions::default()).unwrap();
+                            assert!(matches!(run.into_stop(), StepStop::Exit(Exit::Hlt)));
+                        } else {
+                            vm.write_bytes(SLOT, &[0x88, 0x77, 0x66, 0x55]).unwrap();
+                        }
+                        DeviceResult::Handled(0x5a5a_5a5a)
+                    });
+                    let mut go = || loop {
+                        match run(&mut cpu, &vm, 100, &mut h).into_stop() {
+                            StepStop::Exit(Exit::BudgetExhausted) => {}
+                            StepStop::Exit(Exit::Hlt) => break,
+                            stop => panic!("{tag}: {stop:?}"),
+                        }
+                    };
+                    let ((), passed) = in_pass_completions(|| {
+                        if two {
+                            stage_two(go);
+                        } else {
+                            go();
+                        }
+                    });
+                    (vm, cpu, requests, passed)
+                };
+                let (v2, c2, r2, _) = drive(true);
+                let (v3, c3, r3, passed) = drive(false);
+                assert_eq!(r2, r3, "{tag}");
+                assert_eq!(r3.len(), 1, "{tag}");
+                assert_same_machine(&tag, (&v2, &c2), (&v3, &c3));
+                assert_eq!(passed, expected, "{tag}");
+            }
+        }
+    }
+}
+
+/// A handler's A20 request at a read-modify-write's store is queued while
+/// the instruction's retry is open (`Vcpu::set_a20_enabled`) and applied when
+/// its re-execution completes, before the next walk is armed (`InBlock::arm`
+/// asserts that none is queued); a later read above 1 MiB then wraps (SDM
+/// Vol 3A §3.4: each linear part is gated), in the pass as after the stage-2
+/// handoff.
+#[test]
+fn in_pass_follows_an_a20_change_queued_by_a_handoff() {
+    // or [esi],al; jmp $+2; mov [esi],al; mov ebx,[0x100010]; hlt
+    let code = [
+        0x08, 0x06, 0xeb, 0x00, 0x88, 0x06, 0x8b, 0x1d, 0x10, 0x00, 0x10, 0x00, 0xf4,
+    ];
+    let drive = |two: bool| {
+        let mut vm = Vm::new(VmConfig::flat(0x101000));
+        vm.set_cpu_model(CpuModel::I80386);
+        vm.set_exception_delivery(ExceptionDelivery::Outward);
+        vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        vm.map(MMIO, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
+        vm.map(0xb000, 0x15000, Prot::RWX, RegionKind::Ram).unwrap();
+        vm.map(0x100000, 0x1000, Prot::RW, RegionKind::Ram).unwrap();
+        vm.register_device_range(DeviceRange::Mmio(MMIO..MMIO + 0x1000))
+            .unwrap();
+        vm.write_bytes(CODE, &code).unwrap();
+        vm.write_bytes(0x10, &[0x11, 0x11, 0x11, 0x11]).unwrap();
+        vm.write_bytes(0x100010, &[0x22, 0x22, 0x22, 0x22]).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.cr0 = 1;
+        for (i, s) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+            s.base = 0;
+            s.limit = u32::MAX;
+            s.attributes = if i == 0 { 0x409b } else { 0x4093 };
+            s.unusable = 0;
+        }
+        cpu.cpu.rip = CODE;
+        cpu.set_reg(Reg::Rsp, 0x8000);
+        cpu.set_reg(Reg::Rsi, MMIO);
+        let mut requests = Vec::new();
+        let mut h = Callback(|r: &DeviceRequest, c: &mut DeviceContext<'_>| {
+            requests.push(r.clone());
+            if requests.len() == 2 {
+                c.set_a20_enabled(false);
+            }
+            DeviceResult::Handled(0)
+        });
+        let mut go = || loop {
+            match run(&mut cpu, &vm, 100, &mut h).into_stop() {
+                StepStop::Exit(Exit::BudgetExhausted) => {}
+                StepStop::Exit(Exit::Hlt) => break,
+                stop => panic!("{stop:?}"),
+            }
+        };
+        if two {
+            stage_two(go);
+        } else {
+            go();
+        }
+        (cpu, requests)
+    };
+    let (c2, r2) = drive(true);
+    let (c3, r3) = drive(false);
+    assert_eq!(r2.len(), 3);
+    assert_eq!(r2, r3);
+    assert_eq!(c2.cpu.legacy.a20_enabled, 0);
+    assert_eq!(c2.reg(Reg::Rbx), 0x1111_1111);
+    assert_eq!(architectural(&c2), architectural(&c3));
 }

@@ -770,8 +770,9 @@ pub(super) struct Execution {
     contexts: EngineMap<LegacyContextStamp, RetainedContext>,
     blocks: EngineMap<LegacyBlockKey, Block>,
     instruction_retry: Option<InstructionRetry>,
-    // Immutable slice of the last exiting source block; never a fetch proof.
-    retry_slice: Option<(Arc<IrBlock>, Arc<IrBlock>)>,
+    // Immutable one-instruction slices of recently exiting source blocks,
+    // keyed by the source block and the instruction; never fetch proofs.
+    retry_slices: Box<RetrySlices>,
     rep_flags: Option<Box<RepFlags>>,
     rep_restart20: Option<(u16, u16, u16)>,
     rep_inputs20: RepInputs20,
@@ -850,7 +851,7 @@ impl Execution {
             recent: Box::new([None; RECENT_CONTEXTS]),
             blocks: EngineMap::default(),
             instruction_retry: None,
-            retry_slice: None,
+            retry_slices: Box::default(),
             rep_flags: None,
             rep_restart20: None,
             rep_inputs20: RepInputs20::default(),
@@ -897,7 +898,7 @@ impl Execution {
         self.handoff_service &= !HANDOFF_DEBUG;
         self.shutdown = false;
         self.instruction_retry = None;
-        self.retry_slice = None;
+        self.retry_slices.clear();
         self.direct_proofs.clear();
         self.links.clear();
         self.smc_pages.clear();
@@ -909,14 +910,7 @@ impl Execution {
         }
     }
     fn retry_slice(&mut self, ir: &Arc<IrBlock>, ip: u64) -> Arc<IrBlock> {
-        if let Some((source, slice)) = &self.retry_slice {
-            if Arc::ptr_eq(source, ir) && slice.guest_start == ip {
-                return slice.clone();
-            }
-        }
-        let slice = retry_instruction(ir, ip);
-        self.retry_slice = Some((ir.clone(), slice.clone()));
-        slice
+        self.retry_slices.get(ir, ip)
     }
     #[inline(always)]
     fn validated_context(&self, cpu: &CpuState, model: LegacyCpuModel) -> Option<MachineContext> {
@@ -954,6 +948,7 @@ impl Execution {
     fn invalidate_translations(&mut self) {
         // Context identities restart: no link may name one.
         self.links.clear();
+        self.retry_slices.clear();
         self.invalidate_paging();
         self.direct_proofs.clear();
         self.blocks.clear();
@@ -1482,6 +1477,40 @@ impl Vcpu {
             }
             SplitRetry::Exit(exit) => Err(exit),
         }
+    }
+}
+
+/// Retained retry slices (`retry_instruction`): an instruction that hands off
+/// a transfer again after its first completion (a read-modify-write's store,
+/// a split operand's second piece, a declined in-block result) re-executes
+/// from a one-instruction slice of its block. Building one per transfer
+/// allocated and freed an `IrBlock` per handled store of such an instruction
+/// (a PC-class embedder's game: 1.3 % of host time in the allocator's clock
+/// read and 0.8 % in its free and allocate paths); a few sites alternate in
+/// a frame loop, so a handful are kept, each with the source block it was cut
+/// from, which keeps the source's address from being reused while it is a key.
+/// The bound is `RETRY_SLICES` source blocks and their slices, held past their
+/// proofs at most until replaced, a translation flush or an execution reset.
+#[derive(Default)]
+pub(super) struct RetrySlices {
+    entries: [Option<(Arc<IrBlock>, Arc<IrBlock>)>; RETRY_SLICES],
+    next: usize,
+}
+const RETRY_SLICES: usize = 8;
+impl RetrySlices {
+    fn get(&mut self, ir: &Arc<IrBlock>, ip: u64) -> Arc<IrBlock> {
+        for (source, slice) in self.entries.iter().flatten() {
+            if Arc::ptr_eq(source, ir) && slice.guest_start == ip {
+                return slice.clone();
+            }
+        }
+        let slice = retry_instruction(ir, ip);
+        self.entries[self.next] = Some((ir.clone(), slice.clone()));
+        self.next = (self.next + 1) % RETRY_SLICES;
+        slice
+    }
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -3808,15 +3837,25 @@ impl Vcpu {
                             )
                     }
                 } else {
-                    if DEVICES && matches!(walk, BlockWalk::Shared) {
+                    // The shared walk's memory provider and the unpaged block
+                    // pass (`BlockWalk::Direct`) complete a handled transfer
+                    // in place, unpaged (the handoff names no linear address).
+                    // Neither is armed with an event continuation open (here)
+                    // or an A20 change queued (`InBlock::arm`), each also
+                    // asserted never to be met.
+                    // An owned continuation is delivered at the boundary
+                    // before any walk. A queued A20 change exists only while
+                    // memory is in flight (`Vcpu::set_a20_enabled`) and is
+                    // applied where the walk that finishes it completes; the
+                    // retry state the hook refuses (`InBlock::arm`) is what
+                    // keeps it queued there. Were one queued here, a handoff
+                    // with no retry open would apply it before re-executing,
+                    // which a walk going on would not.
+                    if DEVICES && matches!(walk, BlockWalk::Shared | BlockWalk::Direct) {
                         if let Some(hook) = hook {
-                            if self
-                                .legacy_execution
-                                .as_ref()
-                                .unwrap()
-                                .event_retry
-                                .is_none()
-                            {
+                            let execution = self.legacy_execution.as_ref().unwrap();
+                            debug_assert!(execution.event_retry.is_none());
+                            if execution.event_retry.is_none() && !context.paging_enabled {
                                 hook.arm(devices, self, &ir, steps);
                             }
                         }

@@ -933,23 +933,31 @@ impl Run<'_> {
     }
 }
 
-/// Decision-28 stage 3 inside a block: the shared real-mode walk meets a
+/// Decision-28 stage 3 inside a block: the shared real-mode walk, or an
+/// unpaged block pass (Flat32, Segmented and real-mode Direct blocks), meets a
 /// registered MMIO transfer and calls the handler where it stands, instead of
 /// abandoning the instruction for a handoff, a completion and a re-execution.
 /// The dispatcher arms this for one walk that starts with no handoff state
-/// open (no MMIO retry, pending answer or port input); only the walk's memory
-/// provider reads it, at a Trap-region miss, so RAM accesses and unarmed
-/// walks pay nothing.
+/// open (no MMIO retry, pending answer or port input, event continuation or
+/// queued A20 change); only the shared walk's memory provider at a Trap-region
+/// miss and the block pass at an issued MMIO handoff read it, so RAM accesses
+/// and unarmed walks pay nothing.
 ///
 /// The walk continues past the transfer only when that is the re-execution's
-/// result exactly: a scalar transfer inside one registration that is its
-/// instruction's only memory access, preceded by operations that fault before
-/// it or not at all and followed by register operations that cannot fault (no
-/// later stop of the instruction re-executes it), and a Handled callback with
-/// no effects (`Effects::none`). Any other result is kept in `Run::decided` and
-/// the walk issues the ordinary handoff, which settles it as if the handler
-/// were called there: the handler is never called twice for one transfer, and
-/// Fallback, DeviceFault, a panic and every effect keep the stage-2 behavior.
+/// result exactly, and a Handled callback has no effects (`Effects::none`).
+/// The shared walk requires a scalar transfer inside one registration that is
+/// its instruction's only memory access, preceded by operations that fault
+/// before it or not at all and followed by register operations that cannot
+/// fault (no later stop of the instruction re-executes it). The block pass
+/// requires a whole Load or Store operand preceded in its instruction only by
+/// operations the re-execution repeats exactly, and then completes the
+/// transfer through the retry ledger as the completion and the re-execution
+/// would (`interp::legacy::BlockPass::device`), so a later fault or transfer
+/// of the instruction meets the state the handoff path leaves. Any other
+/// result is kept in `Run::decided` and the walk issues the ordinary handoff,
+/// which settles it as if the handler were called there: the handler is never
+/// called twice for one transfer, and Fallback, DeviceFault, a panic and every
+/// effect keep the stage-2 behavior.
 /// An IR block, an instruction IP in it and its `sole_access` result.
 type Verdict = (Arc<crate::ir::IrBlock>, u64, Option<u64>);
 pub(super) struct InBlock {
@@ -974,12 +982,22 @@ thread_local! {
 /// transfer (`machine_exits`, real16 store and planar, two Trap misses each);
 /// the counter changes once per handler run, not per access.
 static PUBLISHED: AtomicU64 = AtomicU64::new(0);
+/// Whether any thread has an in-block hook published: the block pass's MMIO
+/// handoff consults the hook only then, so the Exit path of a run without a
+/// handler pays one load (`interp::legacy::BlockPass::device`).
+#[inline(always)]
+pub(crate) fn published() -> bool {
+    PUBLISHED.load(Ordering::Relaxed) != 0
+}
 #[cfg(test)]
 thread_local! {
     /// Tests only: whether the in-block path is disabled, how many callbacks
     /// it made, and how many transfers it completed inside their block.
     pub(super) static IN_BLOCK_TEST: std::cell::Cell<(bool, u64, u64)> =
         const { std::cell::Cell::new((false, 0, 0)) };
+    /// Tests only: the transfers a block pass completed in place
+    /// (`in_pass_access`), a part of `IN_BLOCK_TEST`'s completions.
+    pub(super) static IN_PASS_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// A dispatch call's `InBlock`. A run without devices (`DEVICES` false) holds
 /// an empty slot whose drop compiles to nothing, so its dispatch loop carries
@@ -1051,6 +1069,16 @@ impl InBlock {
             || state.pending_port_in.is_some()
             || state.port_string_in.is_some()
         {
+            return;
+        }
+        // A queued A20 change is applied before a walk with no retry state
+        // open (`Vcpu::apply_pending_a20`); one queued anyway keeps the walk
+        // unarmed, so its handoff applies it before the re-execution.
+        debug_assert!(
+            cpu.pending_a20_enabled().is_none(),
+            "an A20 change queued at an armed walk"
+        );
+        if cpu.pending_a20_enabled().is_some() {
             return;
         }
         debug_assert!(run.decided.is_none());
@@ -1153,19 +1181,21 @@ impl Drop for Disarmed<'_> {
         self.0.run.set(self.1);
     }
 }
-/// Called by the walk's memory provider at a Trap-region miss. Returns the
-/// read value (zero for a write) when the walk continues; None issues the
-/// ordinary handoff.
-#[cold]
-#[inline(never)]
-pub(crate) fn in_block_access(
+/// The armed hook of the walk of `ir`, its Run and its VM, when this walk may
+/// call its handler for a registered MMIO transfer of `size` bytes at
+/// physical `address`: armed for this very block, with a handler, no result
+/// already kept for the handoff, and a VM not poisoned.
+#[inline(always)]
+fn armed<'h>(
     ir: &crate::ir::IrBlock,
-    ip: u64,
-    write: bool,
     address: u64,
     size: u8,
-    value: u64,
-) -> Option<u64> {
+) -> Option<(
+    &'h InBlock,
+    &'h mut Run<'static>,
+    &'h Vm,
+    &'h Arc<crate::ir::IrBlock>,
+)> {
     if PUBLISHED.load(Ordering::Relaxed) == 0 {
         return None;
     }
@@ -1200,6 +1230,22 @@ pub(crate) fn in_block_access(
     {
         return None;
     }
+    Some((hook, run, vm, block))
+}
+/// Called by the walk's memory provider at a Trap-region miss. Returns the
+/// read value (zero for a write) when the walk continues; None issues the
+/// ordinary handoff.
+#[cold]
+#[inline(never)]
+pub(crate) fn in_block_access(
+    ir: &crate::ir::IrBlock,
+    ip: u64,
+    write: bool,
+    address: u64,
+    size: u8,
+    value: u64,
+) -> Option<u64> {
+    let (hook, run, vm, block) = armed(ir, address, size)?;
     let completed = {
         let mut verdict = hook.verdict.borrow_mut();
         match &*verdict {
@@ -1211,11 +1257,61 @@ pub(crate) fn in_block_access(
             }
         }
     }?;
-    let mask = u64::MAX >> (64 - u32::from(size) * 8);
     let position = DevicePosition {
         retired_instructions: hook.retired.get() + completed,
         steps: hook.steps.get() + completed,
     };
+    serve(hook, run, vm, ip, position, write, address, size, value)
+}
+/// Called by an unpaged block pass (`interp::legacy::BlockPass`) at the MMIO
+/// handoff of a whole Load or Store operand of the instruction at `ip`,
+/// which the pass has `steps` steps and `retired` retired instructions into
+/// the walk: the handoff's own counts, as the pass's are exact. Returns the
+/// read value (zero for a write) when the pass completes the transfer as the
+/// handoff's completion would; None issues the handoff. The caller decides
+/// whether the instruction's re-execution would reach this transfer in the
+/// state the pass holds.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn in_pass_access(
+    ir: &crate::ir::IrBlock,
+    ip: u64,
+    steps: u64,
+    retired: u64,
+    write: bool,
+    address: u64,
+    size: u8,
+    value: u64,
+) -> Option<u64> {
+    let (hook, run, vm, _) = armed(ir, address, size)?;
+    let position = DevicePosition {
+        retired_instructions: hook.retired.get() + retired,
+        steps: hook.steps.get() + steps,
+    };
+    let answer = serve(hook, run, vm, ip, position, write, address, size, value);
+    #[cfg(test)]
+    if answer.is_some() {
+        IN_PASS_TEST.with(|t| t.set(t.get() + 1));
+    }
+    answer
+}
+/// Call the handler for an in-block transfer at `position`: Some answer when
+/// the walk continues past it, else None with the result kept for the
+/// handoff the walk issues next (`Run::decided`).
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    hook: &InBlock,
+    run: &mut Run<'static>,
+    vm: &Vm,
+    ip: u64,
+    position: DevicePosition,
+    write: bool,
+    address: u64,
+    size: u8,
+    value: u64,
+) -> Option<u64> {
+    let mask = u64::MAX >> (64 - u32::from(size) * 8);
     let request = DeviceRequest {
         space: DeviceSpace::Mmio,
         address,
@@ -1228,7 +1324,8 @@ pub(crate) fn in_block_access(
         value: if write { value & mask } else { 0 },
         total_size: u16::from(size),
         part: 0,
-        // An armed walk runs an unpaged real-mode block.
+        // An armed walk runs an unpaged block: the handoff names no
+        // linear address (`Vcpu::pending_mmio_linear_address`).
         linear_address: None,
         instruction_ip: ip,
         code_segment: hook.code_segment.get(),

@@ -73,7 +73,7 @@ fn trace(model: CpuModel, mode: u8, scenario: u8, cold: bool) -> Vec<String> {
         if cold {
             let execution = cpu.legacy_execution.as_mut().unwrap();
             execution.validated = None;
-            execution.retry_slice = None;
+            execution.retry_slices.clear();
         }
         let run = cpu
             .run_steps(&vm, [0, 1, 2, 7, 100][turn % 5], StepOptions::default())

@@ -9,16 +9,41 @@
 //! EXIT_PATH=exit|handler|exit-noreg runs only that path (for host profiling).
 //! Timings include guest execution: ns/exit is amortized round-trip cost.
 //! Workloads: out/in/store/load at N=10/25/100; `planar`, a handled byte
-//! MMIO store every N=3/4/5 instructions; `unserved-out`/`unserved-in`, port
+//! MMIO store every N=3/4/5 instructions; `rmw`, a byte read-modify-write
+//! (OR [SI],AL: a device read and write) every N=4/10 instructions, and
+//! `rmw2`, two such sites (OR [SI],AL; OR [SI+1],AL) per N instructions;
+//! `unserved-out`/`unserved-in`, port
 //! accesses outside the one registered port range, so every one takes the Exit.
 //! Unserved cells add an `exit-noreg` path, the same loop on a VM with no
 //! registered range, to compare the registry's cost against none.
+//! `allocs_exit` counts heap allocations per device transfer.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use x86jit_core::{
     CpuModel, CpuState, DeviceContext, DeviceIo, DeviceRange, DeviceRequest, DeviceResult,
     ExceptionDelivery, Exit, PortDir, Prot, Reg, RegionKind, StepOptions, StepStop, Vcpu, Vm,
     VmConfig,
 };
+
+/// Counts every allocation, for `allocs_exit`.
+struct Counting;
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+// SAFETY: forwards every call to the system allocator unchanged.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+}
+#[global_allocator]
+static GLOBAL: Counting = Counting;
 
 #[cfg(target_os = "macos")]
 fn host_instructions() -> u64 {
@@ -44,12 +69,14 @@ fn host_instructions() -> u64 {
 const CODE: u64 = 0x10000;
 const DEVICE: u64 = 0xa000;
 const MODES: [&str; 4] = ["real16", "flat32", "paged32", "seg16"];
-const WORKS: [&str; 7] = [
+const WORKS: [&str; 9] = [
     "out",
     "in",
     "store",
     "load",
     "planar",
+    "rmw",
+    "rmw2",
     "unserved-out",
     "unserved-in",
 ];
@@ -96,6 +123,13 @@ fn setup(mode: &str, work: &str, interval: usize, register: bool) -> (Vm, Vcpu) 
         "out" | "delivery" | "unserved-out" => code.extend([0xe6, 0x80]),
         "in" | "unserved-in" => code.extend([0xe4, 0x80]),
         "store" | "planar" => code.extend([0x88, if short { 0x04 } else { 0x06 }]),
+        "rmw" => code.extend([0x08, if short { 0x04 } else { 0x06 }]),
+        // A second site replaces the last filler.
+        "rmw2" => {
+            code.pop();
+            code.extend([0x08, if short { 0x04 } else { 0x06 }]);
+            code.extend([0x08, if short { 0x44 } else { 0x46 }, 0x01]);
+        }
         "load" => code.extend([0x8a, if short { 0x04 } else { 0x06 }]),
         _ => unreachable!(),
     }
@@ -165,6 +199,7 @@ fn execute(
     vm: &Vm,
     cpu: &mut Vcpu,
     mode: &str,
+    work: &str,
     iterations: u64,
     splits: bool,
     trace: bool,
@@ -241,7 +276,7 @@ fn execute(
         }
     }
     counts.exits += device.transfers;
-    assert_eq!(counts.exits, iterations);
+    assert_eq!(counts.exits, iterations * transfers(work));
     counts
 }
 
@@ -258,7 +293,7 @@ fn main() {
         census();
         return;
     }
-    println!("path,mode,work,n,round,retired,exits,calls,completion_calls,mips,ns_exit,run_ns_exit,completion_ns_exit,host_instructions_exit");
+    println!("path,mode,work,n,round,retired,exits,calls,completion_calls,mips,ns_exit,run_ns_exit,completion_ns_exit,host_instructions_exit,allocs_exit");
     let i286 = std::env::var("EXIT_MODEL").as_deref() == Ok("286");
     for round in 0..rounds {
         for mode in MODES {
@@ -272,6 +307,8 @@ fn main() {
                 let unserved = work.starts_with("unserved");
                 let intervals: &[usize] = if work == "planar" {
                     &[3, 4, 5]
+                } else if work.starts_with("rmw") {
+                    &[4, 10]
                 } else {
                     &[10, 25, 100]
                 };
@@ -298,6 +335,7 @@ fn main() {
                             &vm,
                             &mut cpu,
                             mode,
+                            work,
                             100,
                             false,
                             false,
@@ -306,11 +344,13 @@ fn main() {
                         );
                         let retired = cpu.retired_instructions();
                         let host = host_instructions();
+                        let allocations = ALLOCATIONS.load(Ordering::Relaxed);
                         let start = Instant::now();
                         let counts = execute(
                             &vm,
                             &mut cpu,
                             mode,
+                            work,
                             iterations,
                             splits,
                             trace,
@@ -319,11 +359,12 @@ fn main() {
                         );
                         let seconds = start.elapsed().as_secs_f64();
                         let host = host_instructions() - host;
+                        let allocations = ALLOCATIONS.load(Ordering::Relaxed) - allocations;
                         let retired = cpu.retired_instructions() - retired;
                         assert_eq!(retired, iterations * n as u64 + iterations.div_ceil(60000));
                         let exits = counts.exits as f64;
                         println!(
-                        "{path},{mode},{work},{n},{round},{retired},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                        "{path},{mode},{work},{n},{round},{retired},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
                         counts.exits,
                         counts.calls,
                         counts.completion_calls,
@@ -331,12 +372,24 @@ fn main() {
                         seconds * 1e9 / exits,
                         counts.run_time.as_nanos() as f64 / exits,
                         counts.completion_time.as_nanos() as f64 / exits,
-                        host as f64 / exits
+                        host as f64 / exits,
+                        allocations as f64 / exits
                     );
                     }
                 }
             }
         }
+    }
+}
+
+/// Device transfers per loop iteration.
+fn transfers(work: &str) -> u64 {
+    if work == "rmw" {
+        2
+    } else if work == "rmw2" {
+        4
+    } else {
+        1
     }
 }
 

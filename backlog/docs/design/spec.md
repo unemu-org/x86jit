@@ -882,7 +882,18 @@ cannot fault; the walk began with no completion, retry or port input open; and
 the callback returned Handled with no context effect (no RAM write, INTR level
 change, NMI, host stop, A20 or paging request, or deadline change). Any other
 result is settled at the ordinary handoff that the walk then issues, with the
-same request and without calling the handler again. Registered ranges are an
+same request and without calling the handler again. An unpaged block pass
+(Flat32, Segmented, sixteen-bit protected and real-mode Direct blocks) does the
+same at the handoff of a whole Load or Store operand that is not split by the
+bus, when every earlier operation of its instruction is one the re-execution
+repeats exactly (register, flag and temporary writes, address checks, and
+reads the retry ledger answers; a RAM read could change during the callback
+through another vCPU or the handler's own `&Vm`): it records the answer or acknowledgement in the retry ledger as the completion
+would and performs the operand again from it, so later transfers and faults of
+the instruction meet the state the handoff leaves; its request carries the
+pass's own exact counts. No walk is armed with an event continuation or a
+queued A20 change open (both are settled at the boundary before it); paged,
+V86, locked, string and split transfers keep the handoff. Registered ranges are an
 immutable table read without synchronization, since registration takes `&mut Vm`.
 An unwinding callback panic is caught and returns
 `Exit::Device(DeviceStop::HandlerFailed)`; the VM is terminally poisoned and

@@ -4843,3 +4843,67 @@ marks a derived estimate.
   through MMIO, then items 4, 6 and 5; the paged items do not apply to unpaged Flat32.
 - **Real mode** is already the cheapest regime; its remaining items are 5 (links, `call-ret`)
   and 7.
+
+## In-pass handled MMIO in unpaged protected blocks (xj-to9.61) — MEASURED 2026-11-27
+
+Item 3 of the second ceiling study, unpaged half. A handled MMIO load or store of an unpaged
+block pass (Flat32, Segmented, sixteen-bit protected and real-mode Direct blocks) left the walk
+at the handoff (`BlockPass::fail`), was served by the dispatcher (`Run::access`) and retried
+through the retry slice or a suffix block. The pass now completes it where it stands
+(`BlockPass::device`, `vm::device::in_pass_access`) when the transfer is the whole Load or Store
+operand (not split by the bus), every earlier op of its instruction is one the re-execution
+repeats exactly (an earlier read only when the retry ledger answers it, as RAM can change during
+the callback through another vCPU or the handler's own `&Vm`), the walk was armed with no
+handoff state, and the handler returns Handled with no context effect. It records the answer or
+acknowledgement in the retry ledger as `complete_mmio_read` / `complete_mmio_write` would and
+performs the op again from it, so read-modify-writes (two device calls in order), later
+transfers and faults of the instruction meet the state the handoff path leaves. The request
+carries the pass's own steps and retired count. Anything else keeps the handoff: paged and V86
+code, BOUND in protected code, locked, string and split operands, a device store after a RAM
+read (POP to a device operand), and every declined or effectful result (settled once through
+`Run::decided`).
+
+The retry path also keeps eight retry slices (source block and instruction) instead of one: an
+instruction that hands off again after its first completion (a read-modify-write's store, a split
+operand's second piece) re-executed from a slice built and dropped per transfer whenever two such
+sites alternated, the allocator traffic a PC-class embedder's game profile showed under
+`Execution::retry_slice` (1.3 % of host time in the allocator's clock read, 0.8 % in its free
+and allocate paths). The eight slices hold their source blocks until replaced, a translation
+flush or an execution reset.
+
+`machine_exits` (new workloads `rmw`, OR [SI],AL every N instructions, and `rmw2`, two such
+sites; new column `allocs_exit`, heap allocations per device transfer from a counting global
+allocator), I80386, 20,000 iterations, three rounds, median; host instructions per device
+transfer, release / `perf` profile, base `c94004bf`:
+
+| Mode | Workload | Path | Release | `perf` | Allocations |
+|---|---|---|---:|---:|---:|
+| flat32 | planar N=3 | handler | 5789 → 2876 (−50 %) | 5603 → 2806 | 0 → 0 |
+| flat32 | store N=10 | handler | 7712 → 4794 (−38 %) | 7529 → 4720 | 0 → 0 |
+| flat32 | load N=10 | handler | 7640 → 4754 (−38 %) | 7538 → 4744 | 0 → 0 |
+| flat32 | rmw N=4 | handler | 4742 → 2167 (−54 %) | 4645 → 2163 | 0 → 0 |
+| flat32 | rmw2 N=4 | handler | 4897 → 1695 (−65 %) | 4822 → 1708 | 1.0 → 0 |
+| flat32 | store N=10 | exit (no handler) | 9653 → 9697 (+0.5 %) | 9587 → 9589 | 0 → 0 |
+| seg16 | planar N=3 | handler | 5781 → 2856 (−51 %) | 5574 → 2783 | 0 → 0 |
+| seg16 | rmw2 N=4 | handler | 4884 → 1689 (−65 %) | 4800 → 1700 | 1.0 → 0 |
+| real16 | rmw2 N=4 | handler | 4664 → 3539 (−24 %) | 4628 → 3495 | 1.5 → 0 |
+| real16 | rmw2 N=10 | exit (no handler) | 6152 → 4956 (−19 %) | 6202 → 4989 | 1.5 → 0 |
+| paged32 | planar N=3 | handler | 22019 → 21994 | 21595 → 21517 | 12 → 12 |
+| paged32 | rmw2 N=4 | handler | 17745 → 17074 (−4 %) | 17448 → 16856 | 10.5 → 9.5 |
+
+Subtracting the register instructions at their slope (≈ 275 per INC), a handled Flat32 or
+Segmented store costs about 2,300 host instructions, from 4,950: the block now continues, but
+the trap path (exit construction, operand classification), the request and the op's second
+execution remain, about 750 of it (`sample`). Real mode is unchanged (its shared walk already
+completed scalar transfers); the paged transaction lane is unchanged and still allocates 10–12
+times per transfer (the operand transaction's vectors and its `CpuState` image).
+
+`machine32_loops 100000 3` (all paths) and `real16_loops 8 3`, two processes per profile, host
+instructions per step against the same base: no cell is over +0.3 % in both profiles. Every
+`perf` cell is within +0.05 % (machine32_loops −0.58..+0.03 %, real16_loops −0.36..+0.05 %), and
+every release machine32_loops cell within +0.19 %; in the release profile some real16_loops
+cells drift (call-ret +1.0..+1.8 %, store and alu +0.6..+1.0 %, smc-next-64 +1.2 %), whose
+`perf` cells stay within +0.05 %. A first candidate that matched the MMIO handoff in the walk's
+inlined op executor cost the unpaged protected cells +4..+10 per step in both profiles (+0.4 %
+to +1.0 %); the match now lives in the out-of-line exit path (`BlockPass::failed`), behind one
+load of the published-hook count.
