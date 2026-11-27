@@ -1065,7 +1065,12 @@ impl Execution {
         // Context identities restart: no link may name one.
         self.links.clear();
         self.retry_slices.clear();
-        self.invalidate_paging();
+        // The paged proofs keep their own identities and revalidate their
+        // code pages after the flush (xj-to9.70).
+        self.context_dirty();
+        if let Some(paging) = &mut self.paging {
+            paging.load_cr3();
+        }
         self.direct_proofs.clear();
         self.blocks.clear();
         self.flat32 = flat32::State::default();

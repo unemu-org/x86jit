@@ -359,10 +359,11 @@ fn a_reflection_path_through_many_contexts_keeps_identities() {
 /// A paged ring-0 loop that turns the TLB over (xj-to9.70,
 /// `x86jit_tests::paged_churn`): every iteration reads 20 pages of a 4 MiB
 /// sweep, so fills replace the entries its code was fetched through, runs
-/// INVLPG on a data page, sets CR0.TS before a V86 round trip through a #GP
-/// monitor and clears it with CLTS, and loads a second data selector. Each
-/// eviction advances the TLB generation, and the proofs translate their code
-/// pages again instead of relifting: the loop lifts each block entry once.
+/// INVLPG on a data page, reloads CR3 with its own value, sets CR0.TS before
+/// a V86 round trip through a #GP monitor and clears it with CLTS, and loads
+/// a second data selector. Each eviction and each flush advances the TLB
+/// generation, and the proofs translate their code pages again instead of
+/// relifting: the loop lifts each block entry once.
 #[test]
 fn a_paged_loop_that_turns_the_tlb_over_lifts_each_block_once() {
     use x86jit_tests::paged_churn;
@@ -397,6 +398,14 @@ fn a_paged_loop_that_turns_the_tlb_over_lifts_each_block_once() {
             .advances
             .iter()
             .any(|&(why, n)| why == x86jit_core::TlbAdvance::Replaced && n > 0),
+        "{d}"
+    );
+    // The CR3 reload flushed the TLB every iteration; no proof dropped.
+    assert!(
+        d.tlb
+            .advances
+            .iter()
+            .any(|&(why, n)| why == x86jit_core::TlbAdvance::Cr3Load && n >= u64::from(ITERATIONS)),
         "{d}"
     );
     assert!(d.tlb.revalidated > 0, "{d}");

@@ -403,14 +403,12 @@ const _: () = assert!(TLB_ENTRIES.is_power_of_two());
 /// translated at an older generation translates them again before it is
 /// used (`vm/legacy/paging.rs`, xj-to9.70). A data or stack entry backs no
 /// proof: fetch translates through its own entries, and a page whose fetch
-/// entry was replaced walks again. Only a flush (`flushed`) expires every
-/// proof.
+/// entry was replaced walks again. A flush advances the generation too: a
+/// CR3 load, equal values included, or a change of another walk input
+/// empties the TLB, and every proof walks its code pages again.
 pub(crate) struct Tlb {
     entries: [Option<Entry>; TLB_ENTRIES],
     pub(crate) generation: u64,
-    /// The generation the last flush issued: it names the translation
-    /// context (CR3 and every other walk input) the entries belong to.
-    pub(crate) flushed: u64,
     context: Option<(u32, u32, u8, u32)>,
     /// The pages of the running `tlb_lane`, reset when one starts.
     lane: LaneWindows,
@@ -424,7 +422,6 @@ impl Default for Tlb {
         Self {
             entries: [None; TLB_ENTRIES],
             generation: 0,
-            flushed: 0,
             context: None,
             lane: LaneWindows::default(),
             #[cfg(feature = "test-hooks")]
@@ -443,6 +440,9 @@ pub(crate) enum Advance {
     Rewalked,
     DirtyFailed,
     InvalidatePage,
+    Cr3Load,
+    // Counted only: a replayed lane restores its saved generation.
+    #[cfg(feature = "test-hooks")]
     LaneUndone,
 }
 impl Tlb {
@@ -451,8 +451,10 @@ impl Tlb {
         let page = linear >> 12;
         // Fold the whole 20-bit page number over 8 bits: descriptor tables
         // and data separated by 1 MiB must not repeatedly expire each other's
-        // instruction proofs.
-        ((page ^ (page >> 8) ^ (page >> 16)) as usize) & (TLB_ENTRIES - 1)
+        // instruction proofs. The fold leaves bit 0 alone, so adjacent pages
+        // never share a slot: a block straddling two pages keeps both
+        // entries (xj-to9.70).
+        ((page ^ (((page >> 8) ^ (page >> 16)) << 1)) as usize) & (TLB_ENTRIES - 1)
     }
 
     /// Advance the generation, counting why.
@@ -465,16 +467,21 @@ impl Tlb {
         }
     }
 
-    /// Flush every entry: a CR3 load, a reset or an explicit invalidation.
+    /// Flush every entry: a reset or an explicit invalidation.
     pub(crate) fn invalidate(&mut self) {
         self.flush(Advance::ExplicitFlush);
+    }
+
+    /// Flush every entry for a guest CR3 load, equal values included
+    /// (80386 PRM §5.2.5 p. 5-11; Intel486 PRM §5.3.5 p. 5-22).
+    pub(crate) fn load_cr3(&mut self) {
+        self.flush(Advance::Cr3Load);
     }
 
     fn flush(&mut self, why: Advance) {
         self.entries.fill(None);
         self.context = None;
         self.advance(why);
-        self.flushed = self.generation;
     }
 
     /// INVLPG: remove the entry of `linear`'s page (paging design §3.2;
@@ -644,14 +651,14 @@ fn count_fast_lane() {
 }
 
 /// The lanes of `without_fast_lanes_for_test` completed on this thread.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(feature = "test-hooks")]
 pub fn fast_lane_hits_for_test() -> u64 {
     FAST_LANE_HITS.with(Cell::get)
 }
 
 /// Run `run` on this thread with every delivery, IRET, refused instruction
 /// and read-modify-write on the transaction path, for parity witnesses.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(feature = "test-hooks")]
 pub fn without_fast_lanes_for_test<R>(run: impl FnOnce() -> R) -> R {
     struct Reset(bool);
     impl Drop for Reset {
@@ -1587,7 +1594,7 @@ pub(super) fn check_write_permission<const ROUTED: bool, const ORDER: u8>(
 // Fetch performs the same read-permission walk but retains execute metadata.
 // 80386 PRM §9.8.14 Fig. 9-8 pp. 9-17–18; Intel486 PRM §9.9.14
 // Fig. 9-7 pp. 9-21–22: no I/D bit exists on these models.
-pub(crate) fn fetch_bus_for_test(
+pub(crate) fn translate_fetch(
     cpu: &mut CpuState,
     memory: &Memory,
     linear: u32,
@@ -2602,7 +2609,7 @@ pub(super) fn task_cr3_loaded<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
 ) {
     if let Some(tlb) = mem.tlb() {
-        tlb.borrow_mut().invalidate();
+        tlb.borrow_mut().load_cr3();
     }
     // Even an equal CR3 load starts fresh translations. Outgoing TSS saves
     // can alias the page tables used by incoming descriptor loads (§3.7).
@@ -4295,11 +4302,23 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_pages_never_share_a_tlb_slot() {
+        // A block straddling two pages keeps both fetch entries (xj-to9.70).
+        for page in 0..0xf_ffffu32 {
+            assert_ne!(
+                Tlb::index(page << 12),
+                Tlb::index((page + 1) << 12),
+                "{page:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn only_fetched_entries_expire_source_proofs_on_replacement() {
         // Paging design §3.2: replacing a data or stack translation leaves
         // every fetch translation, and so every retained source proof, intact.
-        // Pages 6 and 107h share a set (`Tlb::index`); 107h maps frame 47h.
-        assert_eq!(Tlb::index(0x6000), Tlb::index(0x107000));
+        // Pages 6 and 104h share a set (`Tlb::index`); 104h maps frame 47h.
+        assert_eq!(Tlb::index(0x6000), Tlb::index(0x104000));
         let mut vm = crate::Vm::new(crate::VmConfig::flat(0x50000));
         vm.set_cpu_model(crate::CpuModel::I80386);
         vm.map(0, 0x50000, crate::Prot::RWX, crate::RegionKind::Ram)
@@ -4312,7 +4331,7 @@ mod tests {
             )
             .unwrap();
         }
-        vm.write_bytes(0x2000 + 0x107 * 4, &0x47007u32.to_le_bytes())
+        vm.write_bytes(0x2000 + 0x104 * 4, &0x47007u32.to_le_bytes())
             .unwrap();
         let mut cpu = vm.new_vcpu().cpu;
         cpu.legacy.cr0 = 0x80000001;
@@ -4335,22 +4354,22 @@ mod tests {
         translate(0x6000, AccessKind::Write);
         let token = tlb.borrow().generation;
         for _ in 0..3 {
-            translate(0x107000, AccessKind::Read);
+            translate(0x104000, AccessKind::Read);
             translate(0x6000, AccessKind::Write);
         }
         assert_eq!(tlb.borrow().generation, token);
         // A fetch through the set makes its replacement expire the token,
         // also when the fetch only hit an entry a data access filled.
         for fill in [AccessKind::Execute, AccessKind::Read] {
-            let phys = translate(0x107000, fill).physical;
+            let phys = translate(0x104000, fill).physical;
             if fill == AccessKind::Read {
-                assert_eq!(translate(0x107000, AccessKind::Execute).physical, phys);
+                assert_eq!(translate(0x104000, AccessKind::Execute).physical, phys);
             }
             let token = tlb.borrow().generation;
             translate(0x6000, AccessKind::Read);
             assert_ne!(tlb.borrow().generation, token);
             let token = tlb.borrow().generation;
-            translate(0x107000, AccessKind::Read);
+            translate(0x104000, AccessKind::Read);
             assert_eq!(tlb.borrow().generation, token);
         }
     }
@@ -4361,8 +4380,8 @@ mod tests {
         // Linear pages 100h-1FFh fold to the 256 distinct sets, all mapping
         // frame 3; the PTEs then move to frame 4 without a flush, so a hit
         // still returns frame 3 and only a walk sees frame 4. Page 200h
-        // shares page 103h's set.
-        assert_eq!(Tlb::index(0x200000), Tlb::index(0x103000));
+        // shares page 106h's set.
+        assert_eq!(Tlb::index(0x200000), Tlb::index(0x106000));
         let mut vm = crate::Vm::new(crate::VmConfig::flat(0x5000));
         vm.set_cpu_model(crate::CpuModel::I80386);
         vm.map(0, 0x5000, crate::Prot::RWX, crate::RegionKind::Ram)
@@ -4407,7 +4426,7 @@ mod tests {
         assert_eq!(frame(0x200), 4);
         assert_eq!(resident(&tlb.borrow()), TLB_ENTRIES);
         for page in 0x100..0x200 {
-            assert_eq!(frame(page), if page == 0x103 { 4 } else { 3 });
+            assert_eq!(frame(page), if page == 0x106 { 4 } else { 3 });
         }
     }
 

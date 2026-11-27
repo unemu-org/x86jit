@@ -259,7 +259,7 @@ pub(crate) fn note_taken() {
 /// Witness switch: the headers this thread's walks ran in place of their
 /// sequences since the last call, so a test can tell a walk that steps over
 /// the sequence from one that ignores the header.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub fn take_fused_headers_for_test() -> u64 {
     TAKEN.with(|taken| taken.replace(0))

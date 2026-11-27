@@ -101,9 +101,9 @@ pub enum ReliftCause {
     ContextEvicted,
     /// A mapping change dropped every proof.
     Mapping,
-    /// Paged only: a TLB flush (a CR3 load, a change of CR0's paging bits,
-    /// A20 or the model, an explicit invalidation), a full context table or
-    /// a reset dropped every proof.
+    /// Paged only: an explicit invalidation (the embedder's, a mapping
+    /// change), a full context table or a reset dropped every proof. TLB
+    /// flushes (CR3 loads, CR0 paging bits, A20) only revalidate them.
     Paging,
     /// Paged only: after a TLB generation advance (an eviction or INVLPG of
     /// a page a fetch used), a code page of the proof no longer translated
@@ -152,14 +152,15 @@ const CAUSES: usize = 22;
 /// Why a paged vCPU's TLB generation advanced (xj-to9.70). A generation
 /// names the TLB's fetched entries: it advances when one of them leaves or is
 /// replaced, and with every flush. Paged proofs revalidate their code pages
-/// against the TLB once per generation (`paging.rs`); only a flush drops them.
+/// against the TLB once per generation (`paging.rs`); only an explicit
+/// invalidation drops them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TlbAdvance {
     /// The translation context changed: CR3, CR0.PG/CD/NW/WP/PE, A20 or the
     /// model's flags mask (`Tlb::reconcile`).
     ContextFlush,
-    /// An explicit flush: a CR3 load (equal values too), a task switch's CR3,
-    /// a reset, a mapping change or the embedder's paging invalidation.
+    /// An explicit flush: a reset, a mapping change or the embedder's paging
+    /// invalidation. It also drops every paged proof.
     ExplicitFlush,
     /// A fill replaced a fetched entry of another page (eviction).
     Replaced,
@@ -172,6 +173,8 @@ pub enum TlbAdvance {
     DirtyFailed,
     /// INVLPG of a page.
     InvalidatePage,
+    /// A guest CR3 load (equal values too), or a task switch's.
+    Cr3Load,
     /// A replayed lane restored its slots and their generation.
     LaneUndone,
 }
@@ -185,10 +188,11 @@ impl TlbAdvance {
         Self::Rewalked,
         Self::DirtyFailed,
         Self::InvalidatePage,
+        Self::Cr3Load,
         Self::LaneUndone,
     ];
 }
-pub(crate) const TLB_ADVANCES: usize = 8;
+pub(crate) const TLB_ADVANCES: usize = 9;
 
 /// Paged-proof translation checks (xj-to9.70): the TLB generation advances by
 /// site, and the proof hits that revalidated their code pages after one.

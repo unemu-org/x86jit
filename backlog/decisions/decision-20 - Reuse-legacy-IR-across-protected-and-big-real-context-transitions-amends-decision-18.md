@@ -172,8 +172,18 @@ identity changes as follows; everything else in this record stands.
   page it covers. On a hit after a generation advance it translates them again as a fetch
   would; the same bus address keeps the proof, another frame or a fault relifts it
   (`ReliftCause::Translation`). The byte proof against the source is unchanged.
-- Only a flush drops every paged proof: a CR3 load (decision-32 Q8 stands), a change of the
-  paging bits of CR0, A20, the model, or an explicit `Vcpu::invalidate_paging`. INVLPG
-  removes only its page's TLB entry, and advances the generation only when a fetch had used
-  that entry.
+- A TLB flush no longer drops paged proofs (decision-32 Q8, accepted the same day). A guest
+  CR3 load, equal values included, a task switch's CR3 load, and a change of A20, CR0.WP,
+  CR0.PG or the model still empty the TLB, and they advance the generation, so every proof
+  walks its code pages again on its next hit. The proof keys keep naming CR3 through the
+  stamp, so each address space keeps its own proofs, and a linear page that another
+  directory maps to another frame misses. Only a reset, a mapping change and
+  `Vcpu::invalidate_paging` drop every paged proof. The relift diagnostics count guest and
+  task CR3 flushes as `TlbAdvance::Cr3Load`, apart from `ExplicitFlush`.
+- INVLPG removes only its page's TLB entry, and advances the generation only when a fetch
+  had used that entry.
+- `Tlb::index` folds the upper page-number bits in shifted left by one, so bit 0 of the
+  page number stays unchanged and adjacent pages never share a slot. A block that straddles
+  two pages keeps both fetch entries; under the old fold, pages such as 7FFFh and 8000h
+  shared a slot, so each hit on such a block walked again.
 - The paged proof map is bounded at 4096 blocks or 16 MiB of IR, up from 256 blocks.

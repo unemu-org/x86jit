@@ -4,7 +4,8 @@
 //! protected-mode operating system's paged kernel phases: about two dozen
 //! block entries per iteration that read 20 data pages of a 4 MiB sweep, more
 //! pages than the 256-entry TLB holds, so fills keep replacing the entries the
-//! loop's own code was fetched through; an INVLPG of a data page; CR0.TS set
+//! loop's own code was fetched through; an INVLPG of a data page; an
+//! equal-value CR3 reload, which flushes the TLB; CR0.TS set
 //! before a V86 entry and cleared by CLTS after the exit (FPU ownership); an
 //! IRETD into a short V86 body whose IN traps to a ring-0 #GP monitor; and a
 //! second flat data selector, so the loop runs under several context stamps.
@@ -84,6 +85,10 @@ fn kernel() -> Vec<u8> {
     a.iretd().unwrap();
     // The monitor returns here at CPL 0 with DS = ES = 10h.
     a.clts().unwrap();
+    // Reload CR3 with its own value, the classic way to flush the TLB
+    // (80386 PRM §5.2.5 p. 5-11: a load flushes even when equal).
+    a.mov(eax, cr3).unwrap();
+    a.mov(cr3, eax).unwrap();
     a.dec(edi).unwrap();
     a.jne(top).unwrap();
     a.hlt().unwrap();
@@ -232,9 +237,10 @@ pub fn setup(model: CpuModel, iterations: u32) -> (Vm, Vcpu) {
 /// Guest instructions retired by `iterations` and the final HLT: per
 /// iteration 3 per read block, then INVLPG, ADD, CMP, Jcc (and MOV at the
 /// wrap), 4 + 2 under the alias selector, 3 for TS, 9 PUSH and the IRETD, 4
-/// in V86 (the faulting IN retires none), 7 in the monitor, CLTS, DEC, JNZ.
+/// in V86 (the faulting IN retires none), 7 in the monitor, CLTS, 2 for the
+/// CR3 reload, DEC, JNZ.
 pub fn expected_retired(iterations: u32) -> u64 {
-    let per = 3 * u64::from(READS) + 4 + 6 + 3 + 10 + 4 + 7 + 3;
+    let per = 3 * u64::from(READS) + 4 + 6 + 3 + 10 + 4 + 7 + 5;
     let pages = (SWEEP_END - SWEEP) / 0x1000;
     let mut start = 0;
     let mut wraps = 0;

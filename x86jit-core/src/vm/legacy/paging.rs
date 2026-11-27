@@ -4,7 +4,7 @@ use super::*;
 #[cfg(feature = "test-hooks")]
 use crate::interp::legacy::paging::execute_for_test;
 use crate::interp::legacy::paging::Insn;
-use crate::interp::legacy::paging::{fetch_bus_for_test, publish_cr2};
+use crate::interp::legacy::paging::{publish_cr2, translate_fetch};
 use std::cell::Cell;
 
 // Checked V86 loops retain one proof per instruction, including multiple
@@ -75,10 +75,8 @@ struct Proof {
 
 #[derive(Default)]
 pub(super) struct State {
-    // The TLB generation last reconciled, and the generation of its last
-    // flush: a flush expires every proof, an advance only their validation.
+    // The TLB generation last reconciled.
     generation: u64,
-    flushed: u64,
     pub(super) tlb: std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
     mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
@@ -206,7 +204,6 @@ impl State {
         self.lane_slots.clear();
         self.tlb.get_mut().invalidate();
         self.generation = self.tlb.get_mut().generation;
-        self.flushed = self.tlb.get_mut().flushed;
         self.stamp = None;
         self.synced = None;
         self.contexts.clear();
@@ -370,17 +367,29 @@ impl State {
         self.quick = quick;
     }
 
-    // A flush (a new translation context: CR3, the paging bits of CR0, A20,
-    // the model, or an explicit invalidation) drops every proof. Any other
-    // advance only makes the proofs validated before it translate their
-    // code pages again on their next hit (`resolve`).
+    // Every advance, a flush of a new translation context (CR3, the paging
+    // bits of CR0, A20, the model) included, only makes the proofs validated
+    // before it translate their code pages again on their next hit
+    // (`resolve`): a proof whose pages walk to the frames it was fetched
+    // from still holds its bytes, which their physical registration guards.
+    // Only `invalidate` (a reset, a mapping change or the embedder's
+    // explicit invalidation) drops them.
     fn reconcile_generation(&mut self) {
-        let tlb = self.tlb.get_mut();
-        if self.flushed != tlb.flushed {
-            self.blocks.clear(why!(Paging));
-            self.flushed = tlb.flushed;
+        self.generation = self.tlb.get_mut().generation;
+    }
+
+    /// A guest CR3 load, equal values included: flush the TLB and keep the
+    /// proofs, which revalidate (xj-to9.70). A load of another value also
+    /// changes the context identity, which names CR3.
+    pub(super) fn load_cr3(&mut self) {
+        self.tlb.get_mut().load_cr3();
+        self.generation = self.tlb.get_mut().generation;
+        self.synced = None;
+        // The dispatcher restarts its identity ids on a CR3 load
+        // (`Execution::invalidate_translations`): none names a recent entry.
+        for entry in self.recent.iter_mut().flatten() {
+            entry.complete = u64::MAX;
         }
-        self.generation = tlb.generation;
     }
 
     fn key(
@@ -455,9 +464,10 @@ impl State {
             {
                 // A fetched entry left the TLB since this proof's code pages
                 // last translated: translate them again, as the fetch would.
+                let mut held = true;
                 if proof.validated.get() != generation {
                     let wrote = Cell::new(false);
-                    let held = pages_hold(vm, cpu, &proof.pages, &self.tlb, &wrote);
+                    held = pages_hold(vm, cpu, &proof.pages, &self.tlb, &wrote);
                     walk_wrote.set(walk_wrote.get() | wrote.get());
                     #[cfg(feature = "test-hooks")]
                     vm.live_fields.diag.revalidated(held);
@@ -466,31 +476,26 @@ impl State {
                         // and look again (the entries now hit).
                         continue;
                     }
-                    if !held {
-                        moved = true;
-                    } else if self.tlb.get_mut().generation == generation {
+                    if held && self.tlb.get_mut().generation == generation {
                         proof.validated.set(generation);
                     }
                 }
+                if held {
+                    probe!(PROOFS);
+                    let version = self.blocks.version();
+                    self.last = Some((Arc::as_ptr(&proof.ir) as usize, version));
+                    remember_lanes(
+                        &mut self.lane_slots,
+                        version,
+                        &proof.ir,
+                        proof.lanes.as_ref(),
+                    );
+                    return Ok((proof.ir.clone(), proof.ordinary));
+                }
+                moved = true;
             }
             if moved {
                 self.blocks.remove(&key, why!(Translation));
-            }
-            if let Some(proof) = self
-                .blocks
-                .get(&key)
-                .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
-            {
-                probe!(PROOFS);
-                self.last = Some((Arc::as_ptr(&proof.ir) as usize, self.blocks.version()));
-                let version = self.blocks.version();
-                remember_lanes(
-                    &mut self.lane_slots,
-                    version,
-                    &proof.ir,
-                    proof.lanes.as_ref(),
-                );
-                return Ok((proof.ir.clone(), proof.ordinary));
             }
             probe!(LIFTS);
             #[cfg(feature = "test-hooks")]
@@ -790,7 +795,7 @@ fn pages_hold(
             Some(physical) => crate::legacy::physical_span(cpu, u32::MAX, u64::from(physical), 1).0,
             None => {
                 let walker = walker.get_or_insert_with(|| cpu.clone());
-                match fetch_bus_for_test(walker, &vm.mem, linear, wrote, Some(tlb)) {
+                match translate_fetch(walker, &vm.mem, linear, wrote, Some(tlb)) {
                     Ok(found) => found,
                     Err(_) => return false,
                 }
@@ -829,7 +834,7 @@ fn fetch(
             crate::AccessKind::Execute,
         )?;
         let bus = if context.paging_enabled {
-            fetch_bus_for_test(cpu, &vm.mem, linear as u32, walk_wrote, Some(tlb))?
+            translate_fetch(cpu, &vm.mem, linear as u32, walk_wrote, Some(tlb))?
         } else {
             crate::legacy::physical_span(cpu, u32::MAX, linear, 1).0
         };
@@ -1175,7 +1180,7 @@ impl Vcpu {
         let outcome = result.map(|(outcome, input)| {
             state.port_input = input;
             if outcome.translations_invalidated {
-                state.invalidate();
+                state.load_cr3();
             } else if outcome.context_changed {
                 // The dispatcher's `sync_class` follows.
                 state.reconcile_translation(&self.cpu);
@@ -1409,7 +1414,7 @@ impl Vcpu {
         // 80386 PRM §5.2.5 p. 5-11; Intel486 PRM §5.3.5 p. 5-22:
         // loading CR3 flushes even when its value is unchanged.
         if outcome.translations_invalidated {
-            state.invalidate();
+            state.load_cr3();
         } else if outcome.context_changed {
             state.reconcile(vm, &self.cpu, model.legacy_model(), None);
         }
@@ -1962,20 +1967,20 @@ mod tests {
     #[test]
     fn replacing_a_fetch_translation_still_expires_its_proofs() {
         // SDM Vol 3A §5.10.2: an edited PTE may stay unobserved until its
-        // translation leaves the TLB. Data page 10Fh (FFFFh:F010h, A20 on)
-        // shares code page Eh's set, so MOV AL,[F010h] replaces the fetch
+        // translation leaves the TLB. Data page 10Ch (FFFFh:C010h, A20 on)
+        // shares code page Eh's set, so MOV AL,[C010h] replaces the fetch
         // entry each iteration and the next fetch must walk to the edited
-        // frame. Code page Eh maps frame 10h, then 30h; page 10Fh frame 51h.
-        // MOV AL,[F010h]; INC CX (DEC CX at frame 30h); JMP to the MOV.
+        // frame. Code page Eh maps frame 10h, then 30h; page 10Ch frame 51h.
+        // MOV AL,[C010h]; INC CX (DEC CX at frame 30h); JMP to the MOV.
         use crate::interp::legacy::paging::Tlb;
-        assert_eq!(Tlb::index(0xe000), Tlb::index(0x10f000));
+        assert_eq!(Tlb::index(0xe000), Tlb::index(0x10c000));
         for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
-            let (vm, mut cpu) = v86_monitor(model, &[0xa0, 0x10, 0xf0, 0x41, 0xeb, 0xfa], true);
-            vm.write_bytes(0x30000, &[0xa0, 0x10, 0xf0, 0x49, 0xeb, 0xfa])
+            let (vm, mut cpu) = v86_monitor(model, &[0xa0, 0x10, 0xc0, 0x41, 0xeb, 0xfa], true);
+            vm.write_bytes(0x30000, &[0xa0, 0x10, 0xc0, 0x49, 0xeb, 0xfa])
                 .unwrap();
             vm.write_bytes(0x2000 + 0xe * 4, &0x10007u32.to_le_bytes())
                 .unwrap();
-            vm.write_bytes(0x2000 + 0x10f * 4, &0x51007u32.to_le_bytes())
+            vm.write_bytes(0x2000 + 0x10c * 4, &0x51007u32.to_le_bytes())
                 .unwrap();
             for (segment, selector) in [(SegmentId::Cs, 0xe00u16), (SegmentId::Ds, 0xffff)] {
                 cpu.cpu.legacy.segments[segment as usize].base = u32::from(selector) << 4;

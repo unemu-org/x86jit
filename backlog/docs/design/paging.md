@@ -238,7 +238,7 @@ re-setting; ordinary table stores do not flush the TLB automatically.
 
 | Trigger | Required engine action |
 |---|---|
-| MOV CR3, including equal value | Clear functional TLB, advance translation generation, discard paged fetch proofs and prevent old-generation block execution. |
+| MOV CR3, including equal value | Clear functional TLB, advance translation generation and prevent old-generation block execution. Paged fetch proofs are kept and walk their code pages again before use (xj-to9.70). |
 | CR0.PG change | Same action; reselect paged/unpaged execution before the next instruction. Keep PG=1/PE=0 #GP before commit. |
 | 486 CR0.WP change | Same conservative flush. The 386 mask continues to ignore this nonexistent control. |
 | 486 INVLPG | Evaluate the addressing form centrally to a linear address without reading/paging the named operand; invalidate its page or conservatively flush the whole functional TLB. End the current block and advance paged block generation. Keep CPL/form checks. INVD/WBINVD remain distinct cache operations. |
@@ -387,9 +387,11 @@ fetch used advances the generation, and a retained proof validated at an older
 generation translates the first fetched byte of each of its code pages again
 (through the TLB, or the walk a fetch would make) before it is used: an
 unchanged bus address keeps it, another frame or a fault relifts it
-(xj-to9.70). Only a flush (CR3 load, PG/WP/CD/NW/PE, A20, model, explicit
-invalidation) drops every paged proof, and physical SMC invalidation expires
-their publication generation. CR0.MP/EM/TS are not part of the paged proof
+(xj-to9.70). A flush (a CR3 load, equal values included, or a PG/WP/CD/NW/PE,
+A20 or model change) advances the generation the same way, so every proof walks
+its code pages again; only an explicit invalidation (the embedder's, a reset, a
+mapping change) drops them. Physical SMC invalidation expires their
+publication generation. CR0.MP/EM/TS are not part of the paged proof
 identity: ESC and WAIT test them when they execute. Replacing a data or stack
 entry expires nothing: no proof depends on it, and a fetch through that page
 later walks and marks its own entry (xj-to9.21). This

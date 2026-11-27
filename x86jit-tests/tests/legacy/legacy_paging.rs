@@ -932,7 +932,14 @@ fn paged_fetch_two_directories_and_equal_cr3_reload() {
             assert_eq!(f.cpu.cpu.legacy.cr3, PD as u32);
             let after = f.cpu.paging_cache_for_test();
             assert!(after.0 > before.0);
-            assert_eq!(after.1, 0);
+            // The proofs stay and walk again (xj-to9.70): unchanged tables
+            // reuse them, an edited PTE relifts. The reload adds its own.
+            assert_eq!(after.1, before.1 + 1);
+            f.fetch_at(0x400).unwrap();
+            assert_eq!(f.cpu.cpu.gpr[0], PD | 0x11);
+            assert_eq!(f.cpu.paging_cache_for_test().2, after.2);
+            f.cpu.cpu.gpr[0] = PD;
+            f.fetch_at(0x500).unwrap();
             f.put(u64::from(CODE_PT), OTHER_FRAME | 7 | A);
             f.fetch_at(0x400).unwrap();
             assert_eq!(f.cpu.cpu.gpr[0], PD | 0x22);
@@ -1074,16 +1081,16 @@ fn paged_fetch_tlb_eviction_replaces_equal_byte_physical_proof() {
             f.fetch_at(0x400).unwrap();
             let before = f.cpu.paging_cache_for_test();
             f.code_mapping(0, OTHER_FRAME);
-            // Pages 0 and 101h share the folded TLB index; force eviction
+            // Pages 0 and 102h share the folded TLB index; force eviction
             // without a guest flush.
-            f.code_mapping(0x101000, OTHER_FRAME);
+            f.code_mapping(0x102000, OTHER_FRAME);
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, &[0x90])
                 .unwrap();
-            f.fetch_at(0x101500).unwrap();
+            f.fetch_at(0x102500).unwrap();
             f.fetch_at(0x400).unwrap();
             let after = f.cpu.paging_cache_for_test();
             assert!(after.0 > before.0);
-            // The 101500h proof stays: its own page still translates.
+            // The 102500h proof stays: its own page still translates.
             assert_eq!(after.1, before.1 + 1);
             assert_eq!(after.2, before.2 + 2);
             assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
@@ -1105,15 +1112,15 @@ fn paged_fetch_proof_survives_eviction_of_an_unchanged_translation() {
         for code32 in [false, true] {
             let mut f = Fixture::new(model, code32, 0);
             f.code_mapping(0, CODE_FRAME);
-            f.code_mapping(0x101000, OTHER_FRAME);
+            f.code_mapping(0x102000, OTHER_FRAME);
             f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
                 .unwrap();
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, &[0x90])
                 .unwrap();
             f.fetch_at(0x400).unwrap();
             let before = f.cpu.paging_cache_for_test();
-            // Pages 0 and 101h share the folded TLB index.
-            f.fetch_at(0x101500).unwrap();
+            // Pages 0 and 102h share the folded TLB index.
+            f.fetch_at(0x102500).unwrap();
             assert!(!f.cpu.paging_tlb_for_test().iter().any(|e| e.1 == 0));
             f.cpu.cpu.gpr[0] = 0;
             f.fetch_at(0x400).unwrap();
@@ -1121,7 +1128,7 @@ fn paged_fetch_proof_survives_eviction_of_an_unchanged_translation() {
             let after = f.cpu.paging_cache_for_test();
             assert!(after.0 > before.0);
             assert_eq!(after.1, before.1 + 1);
-            assert_eq!(after.2, before.2 + 1, "only 101500h lifted");
+            assert_eq!(after.2, before.2 + 1, "only 102500h lifted");
             // The revalidation's walk refilled page 0 as a fetch entry.
             assert!(f
                 .cpu
@@ -1227,6 +1234,91 @@ fn paged_cr0_ts_toggles_keep_proofs_and_fault_at_execution() {
 }
 
 #[test]
+fn paged_fetch_straddling_7fffh_and_8000h_keeps_both_entries_and_its_validation() {
+    // Paging design §3.5: a straddling instruction is fetched through both
+    // pages. Adjacent pages never share a TLB slot (xj-to9.70), so the lift
+    // keeps both entries and the warm proof walks neither again. INVLPG of
+    // the second page revalidates it: an unchanged frame keeps the proof, a
+    // remapped one relifts (Intel486 PRM §26 INVLPG p. 26-172).
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.cpu.cpu.legacy.segments[1].base = 0;
+        // Linear pages 7FFFh and 8000h; both directory entries name CODE_PT.
+        f.code_mapping(0x7fff000, CODE_FRAME);
+        f.code_mapping(0x8000000, OTHER_FRAME);
+        // MOV EAX,11223344h from 7FFFFFEh: B8 44 | 33 22 11.
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0xffe, &[0xb8, 0x44])
+            .unwrap();
+        f.vm.write_bytes(u64::from(OTHER_FRAME), &[0x33, 0x22, 0x11])
+            .unwrap();
+        f.vm.write_bytes(0xd000, &[0x55, 0x66, 0x77]).unwrap();
+        f.fetch_at(0x7ff_fffe).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0x1122_3344);
+        let tlb = f.cpu.paging_tlb_for_test();
+        for page in [0x7fff, 0x8000] {
+            assert!(tlb.iter().any(|e| e.1 == page && e.5), "{page:x}");
+        }
+        let warm = f.cpu.paging_cache_for_test();
+        f.fetch_at(0x7ff_fffe).unwrap();
+        assert_eq!(f.cpu.paging_cache_for_test(), warm, "the warm proof walked");
+        if model == CpuModel::I80386 {
+            continue;
+        }
+        // INVLPG [EBX] on linear page 1 (frame E000h).
+        f.code_mapping(0x1000, 0xe000);
+        f.vm.write_bytes(0xe500, &[0x0f, 0x01, 0x3b]).unwrap();
+        f.cpu.cpu.gpr[3] = 0x800_0000;
+        f.fetch_at(0x1500).unwrap();
+        let before = f.cpu.paging_cache_for_test();
+        f.fetch_at(0x7ff_fffe).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0x1122_3344);
+        assert_eq!(f.cpu.paging_cache_for_test().2, before.2, "unchanged frame");
+        f.code_mapping(0x8000000, 0xd000);
+        f.fetch_at(0x1500).unwrap();
+        let before = f.cpu.paging_cache_for_test();
+        f.fetch_at(0x7ff_fffe).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0], 0x7766_5544);
+        assert_eq!(f.cpu.paging_cache_for_test().2, before.2 + 1);
+        assert!(f.vm.mem.is_code_page(0xd));
+        assert!(!f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
+    }
+}
+
+#[test]
+fn paged_user_code_page_made_supervisor_faults_cpl3_fetch_after_invlpg() {
+    // 80386 PRM §§6.4.1-6.4.2 Table 6-5; SDM Vol 3A §5.6.1: CPL 3 fetches
+    // need U/S. After INVLPG (Intel486 PRM §26 INVLPG p. 26-172) the retained
+    // CPL 3 proof walks again, the walk faults, and the fetch reports #PF
+    // with P and U set (80386 PRM §9.8.14 Fig. 9-8).
+    for model in [CpuModel::I80486Dx, CpuModel::I80486DxCpuid] {
+        let mut f = Fixture::new(model, true, 3);
+        f.cpu.cpu.legacy.segments[1].base = 0;
+        let set_cpl = |f: &mut Fixture, cpl: u8| {
+            f.cpu.cpu.legacy.cpl = cpl;
+            for segment in &mut f.cpu.cpu.legacy.segments {
+                segment.attributes = (segment.attributes & !0x60) | (u16::from(cpl) << 5);
+            }
+        };
+        f.code_mapping(0, CODE_FRAME);
+        f.code_mapping(0x1000, 0xe000);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+            .unwrap();
+        f.vm.write_bytes(0xe500, &[0x0f, 0x01, 0x3b]).unwrap(); // INVLPG [EBX]
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x11);
+        // Supervisor only, present and writable.
+        f.map_code(PD as u32, CODE_PT, 0, CODE_FRAME, 3 | A);
+        set_cpl(&mut f, 0);
+        f.cpu.cpu.gpr[3] = 0;
+        f.fetch_at(0x1500).unwrap();
+        set_cpl(&mut f, 3);
+        f.cpu.cpu.gpr[0] = 0;
+        f.fetch_pf(0x400, 0x400, 5);
+        assert_eq!(f.cpu.cpu.gpr[0], 0);
+    }
+}
+
+#[test]
 fn paged_cr3_load_to_another_frame_with_equal_bytes_relifts() {
     // 80386 PRM §5.2.3 p. 5-9, §5.2.5 p. 5-11: CR3 selects the directory and
     // a load flushes. The same linear page in another directory names
@@ -1256,6 +1348,14 @@ fn paged_cr3_load_to_another_frame_with_equal_bytes_relifts() {
             .unwrap();
         f.fetch_at(0x400).unwrap();
         assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x33);
+        // Back to the first directory: its proof walks to its own frame
+        // again and is reused (xj-to9.70).
+        f.cpu.cpu.gpr[0] = PD;
+        f.fetch_at(0x500).unwrap();
+        let before = f.cpu.paging_cache_for_test();
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x11);
+        assert_eq!(f.cpu.paging_cache_for_test().2, before.2);
     }
 }
 
@@ -1323,11 +1423,11 @@ fn paged_fetch_flush_releases_pages_but_preserves_shared_cache_tags() {
     for model in MODELS {
         let mut f = Fixture::with_vm(Vm::new(VmConfig::flat(0x80000)), model, true, 0);
         let first = 0x10000;
-        // Linear page 100h, the 65th code page, folds onto page 1's TLB set,
+        // Linear page 103h, the 65th code page, folds onto page 1's TLB set,
         // so its fetch replaces a fetched entry.
         let linear = |index: u32| {
             if index == 64 {
-                0x100000
+                0x103000
             } else {
                 index * 0x1000
             }
@@ -1475,8 +1575,9 @@ fn paging_wp_supervisor_writes_both_mapping_classes() {
 }
 
 #[test]
-fn paging_wp_changes_drop_proofs_and_public_cr0_enables_pg() {
-    // Paging design §3.2, Q3: conservative generation change on WP changes.
+fn paging_wp_changes_flush_and_public_cr0_enables_pg() {
+    // Paging design §3.2, Q3: conservative flush on WP changes; the proofs
+    // stay and walk again (xj-to9.70).
     // 80386 PRM §4.1.3 p. 4-3: bit 16 is outside the 386 CR0 mask.
     for model in MODELS {
         for code32 in [false, true] {
@@ -1494,19 +1595,20 @@ fn paging_wp_changes_drop_proofs_and_public_cr0_enables_pg() {
                 if model != CpuModel::I80386 {
                     assert_eq!(f.cpu.cpu.legacy.cr0 & (1 << 16) != 0, wp);
                     assert!(f.cpu.paging_cache_for_test().0 > before.0);
-                    assert_eq!(f.cpu.paging_cache_for_test().1, 0);
+                    assert!(f.cpu.paging_cache_for_test().1 >= before.1);
                 } else {
                     assert_eq!(f.cpu.cpu.legacy.cr0 & (1 << 16), 0);
                 }
             }
-            // WP edited at positive entry must also invalidate.
+            // WP edited at positive entry must also flush. Both WP states
+            // already have a proof of 400h, which walks again.
             if model != CpuModel::I80386 {
                 f.fetch_at(0x400).unwrap();
                 let before = f.cpu.paging_cache_for_test();
                 f.cpu.cpu.legacy.cr0 ^= 1 << 16;
                 f.fetch_at(0x400).unwrap();
                 assert!(f.cpu.paging_cache_for_test().0 > before.0);
-                assert!(f.cpu.paging_cache_for_test().2 > before.2);
+                assert_eq!(f.cpu.paging_cache_for_test().2, before.2);
             }
             f.cpu.cpu.legacy.cr0 &= !0x8000_0000;
             f.cpu.cpu.gpr[0] = 0x8000_0001;
@@ -1652,9 +1754,10 @@ fn paging_read_then_write_sets_dirty_and_rewalks_changed_entries() {
 }
 
 #[test]
-fn paging_a20_change_drops_proofs_and_reselects_directory_and_frame() {
+fn paging_a20_change_flushes_and_reselects_directory_and_frame() {
     // Paging design §§3.2, 3.6: A20 gates table traffic and final physical
-    // traffic after translation; a changed gate invalidates retained proofs.
+    // traffic after translation; a changed gate flushes the TLB. Each gate
+    // state keeps its own proofs, which walk again (xj-to9.70).
     for model in MODELS {
         for code32 in [false, true] {
             let mut f = Fixture::with_vm(Vm::new(VmConfig::flat(0x200000)), model, code32, 0);
@@ -1671,14 +1774,17 @@ fn paging_a20_change_drops_proofs_and_reselects_directory_and_frame() {
                 .unwrap();
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x100400, &[0xb0, 0x22])
                 .unwrap();
-            for (enabled, value) in [(1, 0x22), (0, 0x11), (1, 0x22)] {
+            for (round, (enabled, value)) in
+                [(1, 0x22), (0, 0x11), (1, 0x22)].into_iter().enumerate()
+            {
                 let before = f.cpu.paging_cache_for_test();
                 f.cpu.cpu.legacy.a20_enabled = enabled;
                 f.fetch_at(0x400).unwrap();
                 assert_eq!(f.cpu.cpu.gpr[0] & 0xff, value);
-                assert!(f.cpu.paging_cache_for_test().0 > before.0);
-                assert!(f.cpu.paging_cache_for_test().2 > before.2);
-                assert_eq!(f.cpu.paging_cache_for_test().1, 1);
+                let after = f.cpu.paging_cache_for_test();
+                assert!(after.0 > before.0);
+                assert_eq!(after.2, before.2 + u64::from(round < 2));
+                assert_eq!(after.1, round.min(1) + 1);
             }
         }
     }
@@ -2952,8 +3058,9 @@ fn step4_far_call_and_return_frames_translate_every_slot() {
 }
 
 #[test]
-fn step4_equal_task_cr3_load_discards_private_fetch_proofs() {
-    // Design §3.2 conservative task-load invalidation, including equal CR3;
+fn step4_equal_task_cr3_load_flushes_fetch_entries_and_keeps_proofs() {
+    // Design §3.2 conservative task-load flush, including equal CR3; the
+    // proofs stay and walk again (xj-to9.70);
     // 80386 PRM §§5.2.5, 7.5 pp. 5-11, 7-8; SDM Vol 3A §5.10.4 p. 5-48.
     for model in MODELS {
         let mut f = Fixture::new(model, true, 0);
@@ -2966,7 +3073,8 @@ fn step4_equal_task_cr3_load_discards_private_fetch_proofs() {
             PD as u32 | if model == CpuModel::I80386 { 0 } else { 0x18 }
         );
         assert_eq!(f.cpu.cpu.rip, 0x900);
-        assert_eq!(f.cpu.paging_cache_for_test().1, 0);
+        assert_eq!(f.cpu.paging_cache_for_test().1, 1);
+        assert!(!f.cpu.paging_tlb_for_test().iter().any(|e| e.5));
     }
 }
 

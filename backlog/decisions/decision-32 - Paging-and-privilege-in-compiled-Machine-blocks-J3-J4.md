@@ -441,6 +441,17 @@ compared after every `run_steps`) gains paged and CPL-3 variants of every J2 cas
 Decision-20's amendment of the same day (xj-to9.70) removes the TLB generation and CR0.MP,
 EM and TS from the interpreter's paged proof key and stamp, revalidates a proof's code-page
 translation on a hit after a generation advance, makes INVLPG page-only, and raises the
-paged proof bound to 4096 blocks. Q8 stands: a CR3 load still drops every paged proof. The
-compiled view of §3 is a subset of the `Tlb` and is cleared on every `Tlb` mutation, so it
-follows these rules unchanged; a compiled unit keyed by `physical_pc` is unaffected.
+paged proof bound to 4096 blocks.
+
+Q8 is answered by the same change, accepted by the maintainer on 2026-11-27: paged proofs are
+kept across CR3 loads. A guest CR3 load (equal values included), a task switch's CR3 load,
+and a change of A20, CR0.WP, CR0.PG or the model still flush the `Tlb`: `Tlb::reconcile`
+and the CR3-load path empty every entry and advance the generation. Only the proof drop is
+gone. Every proof walks its code pages again on its next hit, and keeps its key, which names
+CR3 through the stamp. Only a reset, a mapping change and `Vcpu::invalidate_paging` drop the
+paged proofs. Guest and task CR3 flushes are counted as `TlbAdvance::Cr3Load`. `Tlb::index`
+no longer lets adjacent pages share a slot.
+
+The compiled view of §3 is a subset of the `Tlb` and is cleared on every `Tlb` mutation.
+Those flushes still empty the `Tlb`, so the view stays a subset and follows these rules
+unchanged; a compiled unit keyed by `physical_pc` is unaffected.
