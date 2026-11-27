@@ -4329,6 +4329,43 @@ impl Shared {
         )
     }
 
+    /// Decision-29 (J1): compile one ordinary Machine block. Loads and stores
+    /// call the `jit_abi::machine` helpers; an instruction the lowering does not
+    /// complete is an unconditional `RET_MACHINE_DEFER`. Reached only through
+    /// the test-only Machine admission (`Backend::materialize_machine`).
+    fn compile_machine(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        access_config: u64,
+    ) -> Result<CompiledPtr, CompileError> {
+        if ir
+            .legacy_context
+            .is_none_or(|c| c.segment_class != x86jit_core::SegmentClass::Flat32)
+        {
+            return Err(CompileError::BackendError);
+        }
+        check_compile_allowed()?;
+        self.define_with_fault_info(
+            CompiledCodeKind::Block,
+            ir.guest_start,
+            0,
+            Vec::new(),
+            |builder, helpers, alloc_slot| {
+                codegen::translate_machine_block(
+                    builder,
+                    ir,
+                    &self.offsets,
+                    alloc_slot,
+                    helpers,
+                    consistency,
+                    access_config,
+                )
+            },
+            self.foreground_publication(),
+        )
+    }
+
     #[cfg(test)]
     fn compile_with(
         &self,
@@ -4422,6 +4459,8 @@ impl Shared {
         };
         let div_sig = params(6, true); // div(hi, lo, divisor, size, signed, out) -> i64
         let cas_pair_sig = params(6, true);
+        let machine_load_sig = params(5, true); // (cpu, mem, addr, size, config) -> status
+        let machine_store_sig = params(6, true); // (cpu, mem, addr, size, value, config) -> status
         let str_sig = params(8, true); // string(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base) -> i64
         let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> status + private FDP policy
         let xstate_sig = params(6, true);
@@ -4601,6 +4640,16 @@ impl Shared {
                 string: helper!(str_sig, string_helper::<true>, IntegerOnly),
                 // Cold faults own metadata boxes; MMIO rejection snapshots code.
                 cas_pair: helper!(cas_pair_sig, cas_pair_helper, NeedsDefault),
+                machine_load: helper!(
+                    machine_load_sig,
+                    x86jit_core::jit_abi::machine::machine_load,
+                    NeedsDefault
+                ),
+                machine_store: helper!(
+                    machine_store_sig,
+                    x86jit_core::jit_abi::machine::machine_store,
+                    NeedsDefault
+                ),
                 cpuid: helper!(cpuid_sig, cpuid_helper, IntegerOnly),
                 tsc: helper!(tsc_sig, tsc_helper, NeedsDefault),
                 random: helper!(random_sig, random_helper, NeedsDefault),
@@ -5302,6 +5351,19 @@ impl Default for JitBackend {
 }
 
 impl Backend for JitBackend {
+    fn materialize_machine(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        access_config: u64,
+    ) -> Option<CompiledPtr> {
+        self.ensure_maintenance();
+        let _time_compile = x86jit_core::time_stats::ForegroundCompileTimer::enter();
+        self.shared
+            .compile_machine(ir, consistency, access_config)
+            .ok()
+    }
+
     fn time_stats(&self) -> x86jit_core::BackendTimeStats {
         let mut stats = x86jit_core::BackendTimeStats::default();
         stats.background_compile_ns = self.shared.background_ns.load(Ordering::Relaxed);

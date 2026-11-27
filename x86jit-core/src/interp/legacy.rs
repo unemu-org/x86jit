@@ -1,6 +1,7 @@
 //! Machine memory and transactional system helpers for the shared interpreter
 //! (decision-18 §§1, 4; spec.md §§8.1, 17).
 use super::*;
+pub(crate) mod machine_jit;
 pub(crate) mod paging;
 mod privilege;
 pub(crate) mod tasks;
@@ -2824,6 +2825,32 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
     exit_word: &std::sync::atomic::AtomicU64,
     task_switch: &mut tasks::SwitchState,
 ) -> Progress {
+    execute_instructions_from::<ROUTED, ORDER>(
+        ir,
+        cpu,
+        memory,
+        scratch,
+        limit,
+        exit_word,
+        task_switch,
+        0,
+    )
+}
+
+/// [`execute_instructions`] entered at the instruction whose `InsnStart` is op
+/// `from` (decision-29: the walk after a compiled block deferred it).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) fn execute_instructions_from<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+    from: usize,
+) -> Progress {
     debug_assert!(task_switch.context().is_none(), "Direct task continuation");
     #[cfg(debug_assertions)]
     debug_assert!(ir.verify_temp_defs().is_ok(), "{:?}", ir.verify_temp_defs());
@@ -2840,7 +2867,7 @@ pub(crate) fn execute_instructions<const ROUTED: bool, const ORDER: u8>(
         exit_word,
         limit,
     );
-    let outcome = pass.run(cpu, temps, &mut None);
+    let outcome = pass.run_from(cpu, temps, &mut None, from);
     Progress {
         sti_shadow: false,
         ss_shadow: 0,
@@ -2996,9 +3023,20 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         temps: &mut [u64],
         retry: &mut Option<paging::Transaction>,
     ) -> Result<Outcome, Exit> {
+        self.run_from(cpu, temps, retry, 0)
+    }
+
+    /// [`Self::run`] from the instruction whose marker is op `at`.
+    #[inline(always)]
+    pub(super) fn run_from(
+        &mut self,
+        cpu: &mut CpuState,
+        temps: &mut [u64],
+        retry: &mut Option<paging::Transaction>,
+        mut at: usize,
+    ) -> Result<Outcome, Exit> {
         let ir = self.ir;
         let access = self.registers.access;
-        let mut at = 0;
         loop {
             let IrOp::InsnStart { guest_addr } = ir.ops[at] else {
                 unreachable!("instruction marker")
@@ -3371,6 +3409,14 @@ impl<const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool>
                 &mut self.outcome,
             )
         };
+        // Decision-29 §4: an op a compiled Machine block lowers leaves the
+        // default outcome, so a compiled block never skips a walk stop.
+        debug_assert!(
+            result.is_err()
+                || !machine_jit::lowered_op(op)
+                || machine_jit::plain_outcome(&self.outcome),
+            "a lowered op set an outcome field: {op:?}"
+        );
         match result {
             Ok(false) => None,
             Ok(true) => Some(WalkResult::Continue),

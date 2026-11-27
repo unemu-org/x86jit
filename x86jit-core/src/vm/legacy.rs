@@ -14,6 +14,7 @@ use std::hash::{Hash, Hasher};
 mod nmi;
 mod paging;
 
+mod compiled;
 #[cfg(feature = "test-hooks")]
 pub(crate) mod diag;
 mod flat32;
@@ -29,6 +30,7 @@ pub(crate) fn paging_generation() -> u64 {
         .expect("paging proof identifiers exhausted")
 }
 
+pub use compiled::{MachineJitCounters, MachineJitMode};
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
@@ -803,6 +805,8 @@ pub(super) struct Execution {
     flat32: flat32::State,
     // Successor links (`links.rs`).
     links: Box<links::Links>,
+    // Compiled Machine units and their counters (`compiled.rs`, decision-29).
+    machine_jit: Box<compiled::State>,
     event_owner: Option<crate::interp::legacy::tasks::Owner>,
     // The last few retained identities, most recent first, with the epoch of
     // their last use: segment reloads and far transfers alternate between
@@ -870,6 +874,7 @@ impl Execution {
             paging: None,
             flat32: flat32::State::default(),
             links: Box::default(),
+            machine_jit: Box::default(),
         }
     }
     // Whether deliveries copy the registers they begin with for the delivery
@@ -3178,6 +3183,14 @@ impl Vcpu {
         } else {
             None
         };
+        if KIND == MACHINE_DISPATCH && vm.machine_jit != compiled::MachineJitMode::Off {
+            // Decision-29: compiled Machine units live in the VM's code lifetime.
+            self.legacy_execution
+                .as_mut()
+                .unwrap()
+                .machine_jit
+                .begin_run(vm.cache.code_lifetime());
+        }
         let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
         let mut shared_reason = origin;
         let mut blocks_run: u64 = 0;
@@ -3188,6 +3201,10 @@ impl Vcpu {
         let mut ctx = MemCtx::for_memory(&vm.mem);
         ctx.time_enabled = u64::from(vm.time_enabled);
         self.fault_entry.publish(&mut self.cpu, &mut ctx);
+        if KIND == MACHINE_DISPATCH {
+            // Compiled Machine stores test it (decision-29 §4, access helper).
+            ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
+        }
         if KIND == APPLICATION_DISPATCH {
             ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
             // Hand compiled code this vcpu's shadow return stack. `self.ret_stack` is
@@ -3730,7 +3747,20 @@ impl Vcpu {
                 // takes the same provider in such a run, so the hook's
                 // transfer helpers keep one out-of-line copy for both walks.
                 let hook = in_block.get();
-                let progress = if direct20 {
+                // Decision-29: a compiled unit produces the walk's result.
+                let compiled = if KIND == MACHINE_DISPATCH
+                    && vm.machine_jit != compiled::MachineJitMode::Off
+                {
+                    self.machine_progress::<ROUTED, ORDER>(
+                        vm, &ir, walk, context, remaining, &boundary, &mut ctx, exit_word,
+                    )
+                } else {
+                    None
+                };
+                let compiled_stop = compiled.as_ref().is_some_and(|(_, stop)| *stop);
+                let progress = if let Some((progress, _)) = compiled {
+                    progress
+                } else if direct20 {
                     macro_rules! execute_shared20 {
                         ($device:literal) => {
                             crate::interp::legacy::execute_shared20::<ROUTED, ORDER, $device>(
@@ -3983,7 +4013,8 @@ impl Vcpu {
                             && ir.link_exit
                             && outcome.exit.is_none()
                             && !outcome.context_changed
-                            && !single_step;
+                            && !single_step
+                            && !compiled_stop;
                         #[cfg(test)]
                         self.note_link_exit(&ir);
                         if self

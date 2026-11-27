@@ -47,7 +47,7 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 16] = [
+const PATHS: [&str; 17] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
@@ -64,6 +64,9 @@ const PATHS: [&str; 16] = [
     "machine-paged32seg-cpl3",
     "application-interp32",
     "application-jit32",
+    // Decision-29 (J1): compiled Machine blocks, test-only admission
+    // (`--features test-hooks`); interpreted without it.
+    "machine-protected32-jit",
 ];
 const WORKS: [&str; 6] = [
     "register", "memory", "callret", "farseg", "farcall", "segmix",
@@ -118,6 +121,15 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             VmConfig::flat(memory_size),
             Box::new(JitBackend::with_opt_level(OptLevel::Speed)),
         )
+    } else if path == "machine-protected32-jit" {
+        #[allow(unused_mut)]
+        let mut vm = Vm::with_backend(
+            VmConfig::flat(memory_size),
+            Box::new(JitBackend::with_opt_level(OptLevel::Speed)),
+        );
+        #[cfg(feature = "test-hooks")]
+        vm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Forced);
+        vm
     } else {
         Vm::new(VmConfig::flat(memory_size))
     };

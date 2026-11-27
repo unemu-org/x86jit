@@ -25,6 +25,8 @@ pub use legacy::diag::{
 };
 pub(crate) use legacy::live::absorb_at_store;
 pub(crate) use legacy::paging_generation;
+#[doc(hidden)]
+pub use legacy::{MachineJitCounters, MachineJitMode};
 mod nec;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
@@ -386,6 +388,23 @@ pub trait Backend: Send + Sync {
     fn helper_calls(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
     }
+
+    /// Compile one ordinary Machine block for the test-only admission of
+    /// decision-29 (J1): instructions the lowering completes
+    /// ([`jit_abi::machine::lowered_instruction`](crate::jit_abi::machine::lowered_instruction))
+    /// run compiled, every other one is an unconditional `RET_MACHINE_DEFER` at
+    /// its start, and loads and stores call the `jit_abi::machine` helpers with
+    /// `access_config`. The unit is not published to the shared cache. The
+    /// default declines, and the block stays interpreted.
+    #[doc(hidden)]
+    fn materialize_machine(
+        &self,
+        _ir: &IrBlock,
+        _consistency: MemConsistency,
+        _access_config: u64,
+    ) -> Option<CompiledPtr> {
+        None
+    }
 }
 
 /// A hot block handed to a backend for background compilation. Plain data — no
@@ -702,6 +721,9 @@ pub struct Vm {
     /// sight. Cuts one-shot compile cost (run-once blocks never reach the backend)
     /// while hot loops still tier up. Only meaningful with a compiling backend.
     tier_up_after: Option<u32>,
+    /// Test-only admission of compiled Machine blocks (decision-29 §9); `Off`
+    /// in every production build.
+    pub(crate) machine_jit: legacy::MachineJitMode,
     /// Background tier-up: when true — and `tier_up_after` is `Some` with an
     /// async-capable backend — a hot block is compiled on the backend's worker thread
     /// and swapped in when ready, instead of compiling inline on the vcpu's critical
@@ -1148,6 +1170,15 @@ impl Vm {
         self.precise_split_stores
     }
 
+    /// Select the test-only admission of compiled Machine blocks (decision-29
+    /// §9). Only `test-hooks` builds have it: production Machine IR never
+    /// reaches a backend before J2.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_machine_jit_for_test(&mut self, mode: legacy::MachineJitMode) {
+        self.machine_jit = mode;
+    }
+
     /// Enable hotness-gated tier-up: interpret each block until it has run `n`
     /// times, then JIT-compile it. `None` restores eager compilation. Returns
     /// `self` for builder-style setup.
@@ -1431,6 +1462,7 @@ impl Vm {
             backend,
             consistency: self.consistency,
             tier_up_after: self.tier_up_after,
+            machine_jit: self.machine_jit,
             tier_up_background: self.tier_up_background,
             tier_up_region_after: self.tier_up_region_after,
             features: self.features,
@@ -1499,6 +1531,7 @@ impl Vm {
             backend,
             consistency,
             tier_up_after: None,
+            machine_jit: legacy::MachineJitMode::from_environment(),
             tier_up_background: false,
             tier_up_region_after: None,
             features: crate::features::GuestCpuFeatures::default(),

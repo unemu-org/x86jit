@@ -137,3 +137,5 @@ x86jit-tests::legacy legacy_smc_positions::stores_into_every_position_of_a_block
 x86jit-tests::legacy legacy_seg32::budgets_fault_ordinals_and_segment_loads_match_checked
 x86jit-tests::legacy legacy_seg16::budgets_fault_ordinals_and_segment_loads_match_checked
 x86jit-core vm::legacy::tests::context_churn_bounds_retained_contexts_and_their_blocks
+x86jit-tests::legacy machine_j1_lockstep::compiled_machine_blocks_equal_the_interpreter_at_every_call_386
+x86jit-tests::legacy machine_j1_lockstep::compiled_machine_blocks_equal_the_interpreter_at_every_call_486

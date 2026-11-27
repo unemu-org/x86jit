@@ -150,7 +150,10 @@ fn stores_into_one_block_reach_the_next_fetch_of_that_block() {
 #[test]
 fn a_store_into_one_block_keeps_its_neighbours_proved() {
     for (path, model) in CASES {
-        let (vm, mut cpu) = setup(path, model);
+        let (mut vm, mut cpu) = setup(path, model);
+        // An interpreter cost probe: compiled Machine units (decision-29) move
+        // turn boundaries, which is unobservable but changes these counts.
+        vm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Off);
         x86jit_core::Vcpu::take_machine_counters_for_test();
         run(&vm, &mut cpu, 1 << 40);
         let [blocks, _, lifts, proofs, ..] = x86jit_core::Vcpu::take_machine_counters_for_test();

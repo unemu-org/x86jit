@@ -17,6 +17,8 @@ use crate::state::CpuState;
 
 pub mod fault;
 pub mod fp;
+#[doc(hidden)]
+pub mod machine;
 
 /// Every compiled block shares this signature so the dispatcher jumps in
 /// uniformly (§8.2.1).
@@ -79,6 +81,15 @@ pub const RET_HOST_FAULT_DETAIL: u64 = 15;
 /// Return prediction mismatch/underflow. RIP already holds the popped target;
 /// redispatch as RET_CONTINUE while accounting for an indirect resolve.
 pub const RET_RETURN_MISS: u64 = 16;
+/// Machine profile only (decision-29 §4): instructions `0..MemCtx::machine_ordinal`
+/// completed and RIP holds the start of the next one, of which nothing was
+/// committed. The dispatcher walks the rest of the same block on the interpreter.
+pub const RET_MACHINE_DEFER: u64 = 17;
+/// Machine profile only (decision-29 §4): instructions `0..MemCtx::machine_ordinal`
+/// completed, the last in full, and RIP holds the start of the next one. The
+/// dispatcher ends the turn there, as the interpreted walk does after a store
+/// that left the dispatch word set.
+pub const RET_MACHINE_STOP: u64 = 18;
 
 /// Maximum distinct guest-access descriptors in one compiled block or region.
 /// Cranelift user trap codes below 250 are reserved for these descriptors.
@@ -217,6 +228,12 @@ pub struct MemCtx {
     pub helper_operand_size: u64,
     /// In: detailed helper accounting enabled for this run; zero for standalone calls.
     pub time_enabled: u64,
+    /// Out (Machine profile, decision-29 §3): the completed-instruction count of a
+    /// `RET_MACHINE_DEFER` or `RET_MACHINE_STOP`, baked at the exit site. Unused by
+    /// Application code. Appended: every earlier offset is unchanged.
+    pub machine_ordinal: u64,
+    /// Out (Machine profile): the value a Machine load helper read.
+    pub machine_value: u64,
 }
 
 /// Number of frames in the shadow return stack ring (R5). A power of two so the
@@ -411,6 +428,8 @@ impl MemCtx {
             mem_self: mem as *const Memory as u64,
             icount_ptr: 0,
             time_enabled: 0,
+            machine_ordinal: 0,
+            machine_value: 0,
             watch_bits_ptr: mem.watch_bits_ptr(),
             code_range_ptr: mem.code_range_ptr(),
             dispatch_word_ptr: &NO_DISPATCH as *const std::sync::atomic::AtomicU64 as u64,
@@ -1043,7 +1062,9 @@ mod tests {
         let off = |p: *const u64| (p as usize - base) as i32;
         assert_eq!(off(&m.helper_operand_addr), 136);
         assert_eq!(off(&m.helper_operand_size), 144);
-        assert_eq!(std::mem::size_of::<MemCtx>(), 160);
+        assert_eq!(std::mem::size_of::<MemCtx>(), 176);
+        assert_eq!(off(&m.machine_ordinal), 160);
+        assert_eq!(off(&m.machine_value), 168);
         assert_eq!(off(&m.dispatch_word_ptr), MEMCTX_DISPATCH_WORD_PTR);
         assert_eq!(MEMCTX_DISPATCH_WORD_PTR, 128);
         assert_eq!(m.dispatch_word_ptr, &NO_DISPATCH as *const _ as u64);
@@ -1204,6 +1225,8 @@ mod frozen_application_abi {
         field!(MemCtx, mem, helper_operand_addr, (136, 8, 8));
         field!(MemCtx, mem, helper_operand_size, (144, 8, 8));
         field!(MemCtx, mem, time_enabled, (152, 8, 8));
+        field!(MemCtx, mem, machine_ordinal, (160, 8, 8));
+        field!(MemCtx, mem, machine_value, (168, 8, 8));
         assert_eq!(offsets.gpr, 0);
         assert_eq!(offsets.rip, 128);
         assert_eq!(offsets.fs_base, 136);
@@ -1247,6 +1270,8 @@ mod frozen_application_abi {
         assert_eq!(RET_EXCEPTION_DETAIL, 14);
         assert_eq!(RET_HOST_FAULT_DETAIL, 15);
         assert_eq!(RET_RETURN_MISS, 16);
+        assert_eq!(RET_MACHINE_DEFER, 17);
+        assert_eq!(RET_MACHINE_STOP, 18);
         assert_eq!(MAX_GUEST_ACCESS_DESCRIPTORS, 249);
         assert_eq!(RET_STACK_LEN, 64);
         assert_eq!(MEMCTX_BASE, 0);
@@ -1270,7 +1295,7 @@ mod frozen_application_abi {
         assert_eq!(RETSTACK_ENTRIES, 8);
         assert_eq!(RETSTACK_STRIDE, 16);
         assert_eq!((size_of::<Flags>(), align_of::<Flags>()), (8, 1));
-        assert_eq!((size_of::<MemCtx>(), align_of::<MemCtx>()), (160, 8));
+        assert_eq!((size_of::<MemCtx>(), align_of::<MemCtx>()), (176, 8));
         assert_eq!(
             (size_of::<CpuOffsets>(), align_of::<CpuOffsets>()),
             (104, 4)

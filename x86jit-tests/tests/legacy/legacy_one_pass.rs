@@ -608,7 +608,11 @@ fn a_warm_block_is_one_op_walk_and_a_budget_cut_keeps_it_one() {
                     code.push((-(code.len() as i8 + 1)) as u8);
                 }
                 for budget in [3, 4 * (instructions + 1) + 5] {
-                    let ((avm, mut a), _) = pair(world, model, &code, false);
+                    let ((mut avm, mut a), _) = pair(world, model, &code, false);
+                    // An interpreter cost probe: compiled Machine units
+                    // (decision-29) move turn boundaries, which is
+                    // unobservable but changes these counts.
+                    avm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Off);
                     // BP holds the loop's start: the code's offset in CS.
                     a.cpu.gpr[5] = a.cpu.rip;
                     let what = format!("{world:?} {model:?} {code:02x?} budget={budget}");

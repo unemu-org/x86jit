@@ -326,6 +326,31 @@ impl CodeLifetime {
         }
     }
 
+    /// [`Self::discard`] for several unpublished units, in one retirement: the
+    /// compiled Machine units a vCPU owns (decision-29), which are never
+    /// published to a cache.
+    pub(crate) fn discard_many(&self, blocks: &[CachedBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        let starts: Vec<_> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                CachedBlock::Compiled { entry } => Some(*entry),
+                CachedBlock::Interpreted(_) => None,
+            })
+            .filter(|entry| {
+                state
+                    .live
+                    .get(&(entry.0 as usize))
+                    .is_some_and(|u| u.unit.generation == entry.generation() && u.publications == 0)
+            })
+            .map(|entry| entry.0 as usize)
+            .collect();
+        self.retire_many(&mut state, starts);
+    }
+
     /// Backend teardown, after compilation has stopped and workers have joined.
     ///
     /// # Safety

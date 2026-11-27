@@ -1241,8 +1241,13 @@ mod tests {
                                 "{model:?} {class:?} {} before={before} slice={slice:?} tf={tf}",
                                 form.name
                             );
-                            let (vm, mut cpu) = machine(model, class, true, MEMORY);
-                            let (rvm, mut reference) = machine(model, class, false, MEMORY);
+                            let (mut vm, mut cpu) = machine(model, class, true, MEMORY);
+                            let (mut rvm, mut reference) = machine(model, class, false, MEMORY);
+                            // A lift-count probe: compiled Machine units
+                            // (decision-29) move turn boundaries, which is
+                            // unobservable but changes the counts.
+                            vm.set_machine_jit_for_test(crate::MachineJitMode::Off);
+                            rvm.set_machine_jit_for_test(crate::MachineJitMode::Off);
                             for (vm, cpu) in [(&vm, &mut cpu), (&rvm, &mut reference)] {
                                 load_census(vm, cpu, &form, before, N);
                                 if tf {
@@ -1314,8 +1319,12 @@ mod tests {
         setup: &dyn Fn(&Vm),
         what: &str,
     ) -> (Vm, u64, u64) {
-        let (vm, mut cpu) = machine(CpuModel::I80486Dx, class, true, MEMORY);
-        let (rvm, mut reference) = machine(CpuModel::I80486Dx, class, false, MEMORY);
+        let (mut vm, mut cpu) = machine(CpuModel::I80486Dx, class, true, MEMORY);
+        let (mut rvm, mut reference) = machine(CpuModel::I80486Dx, class, false, MEMORY);
+        // A lift-count probe: compiled Machine units (decision-29) move turn
+        // boundaries, which is unobservable but changes the counts.
+        vm.set_machine_jit_for_test(crate::MachineJitMode::Off);
+        rvm.set_machine_jit_for_test(crate::MachineJitMode::Off);
         for (vm, cpu) in [(&vm, &mut cpu), (&rvm, &mut reference)] {
             load_census(vm, cpu, form, before, 32);
             setup(vm);

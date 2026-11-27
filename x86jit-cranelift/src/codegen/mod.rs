@@ -17,6 +17,9 @@ mod trap_tests;
 
 use std::collections::HashMap;
 
+mod machine;
+pub use machine::translate_machine_block;
+
 use cranelift::prelude::*;
 
 use cranelift::codegen::ir::{self, ConstantData, StackSlotData, StackSlotKind};
@@ -115,6 +118,9 @@ pub struct Helpers {
     pub div: Helper,
     pub string: Helper,
     pub cas_pair: Helper,
+    /// Decision-29: the Machine load and store helpers (`jit_abi::machine`).
+    pub machine_load: Helper,
+    pub machine_store: Helper,
     pub cpuid: Helper,
     pub tsc: Helper,
     pub random: Helper,
@@ -228,6 +234,8 @@ impl Helpers {
             div: mk(),
             string: mk(),
             cas_pair: mk(),
+            machine_load: mk(),
+            machine_store: mk(),
             cpuid: mk(),
             tsc: mk(),
             random: mk(),
@@ -330,6 +338,7 @@ pub fn translate_block(
         guest_base,
         icount_on,
         cfg!(target_arch = "aarch64"),
+        None,
     )
 }
 
@@ -345,6 +354,7 @@ fn translate_block_for_target(
     guest_base: u64,
     icount_on: bool,
     aarch64: bool,
+    machine: Option<u64>,
 ) -> Box<[u64]> {
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);
@@ -388,7 +398,11 @@ fn translate_block_for_target(
         preflighted_stores: Vec::new(),
         alignment_tail: None,
         alignment_recoveries: Vec::new(),
+        machine: None,
     };
+    if let Some(config) = machine {
+        t.machine = Some(machine::MachineLowering::new(&mut *t.builder, config));
+    }
 
     if helpers.mxcsr_mode != 0
         && cfg!(target_arch = "aarch64")
@@ -408,6 +422,13 @@ fn translate_block_for_target(
     let masks =
         x86jit_core::lift::elide_dead_flags_with_options(&mut narrowed, helpers.flag_elision);
     for (index, (original, op)) in masks.into_iter().zip(&narrowed).enumerate() {
+        // Decision-29 §4: a Machine block stops at an instruction start after a
+        // store that set the dispatch word, and defers an instruction it does
+        // not lower.
+        if t.machine.is_some() && t.machine_instruction(&ir.ops, index) {
+            terminated = true;
+            break;
+        }
         t.prepare_instruction_flags(&narrowed[index..], index == 0);
         if t.op_with_flags(original, op) {
             terminated = true;
@@ -496,6 +517,7 @@ pub fn translate_region(
         preflighted_stores: Vec::new(),
         alignment_tail: None,
         alignment_recoveries: Vec::new(),
+        machine: None,
     };
 
     if helpers.mxcsr_mode != 0
@@ -704,6 +726,9 @@ struct Translator<'a, 'b> {
     preflighted_stores: Vec<(Value, u8)>,
     alignment_tail: Option<Block>,
     alignment_recoveries: Vec<(Block, [Option<FlagRecipe>; 6])>,
+    /// Decision-29: the Machine lowering of a compiled Machine block, `None`
+    /// for Application code.
+    machine: Option<machine::MachineLowering>,
 }
 
 impl Translator<'_, '_> {
@@ -895,6 +920,11 @@ impl Translator<'_, '_> {
     fn op(&mut self, op: &IrOp) -> bool {
         self.stack_access = op.memory_access().stack();
         self.access_bytes = op.memory_access().bytes();
+        if self.machine.is_some() {
+            if let Some(terminated) = self.machine_op(op) {
+                return terminated;
+            }
+        }
         match op {
             IrOp::InsnStart { guest_addr, .. } => self.emit_insn_start(guest_addr),
             IrOp::CheckAlign { addr, bytes } => {

@@ -259,4 +259,6 @@ pub use vm::{
     GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
     ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass,
 };
+#[doc(hidden)]
+pub use vm::{MachineJitCounters, MachineJitMode};
 pub use x87::FpuKind;

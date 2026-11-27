@@ -23,6 +23,13 @@ pub(crate) fn lockstep_trace() -> Option<Trace> {
     ))
 }
 
+/// The test-only compiled-Machine mode named by `X86JIT_TEST_MACHINE_JIT`
+/// (decision-29 §9): `forced`, `delayed:K` or `scripted:SEED`.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_machine_jit() -> Option<String> {
+    std::env::var("X86JIT_TEST_MACHINE_JIT").ok()
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn host_writable_region_end(at: usize) -> Option<usize> {
     // Linux proc_pid_maps(5): ordered address ranges followed by rwxs permissions.

@@ -93,6 +93,7 @@ fn compile_ir(ir: &IrBlock, target: &str, tier: MemConsistency, opt: crate::OptL
         0,
         false,
         target.starts_with("aarch64"),
+        None,
     );
     builder.finalize(isa.frontend_config());
     ctx.set_disasm(true);
