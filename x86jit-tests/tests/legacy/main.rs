@@ -54,6 +54,7 @@ mod legacy_segment_blocks;
 mod legacy_smc_positions;
 mod legacy_smc_selective;
 mod legacy_sse_integer;
+mod legacy_string16;
 mod legacy_task_registers;
 mod legacy_task_switch;
 mod legacy_tf_loop;
