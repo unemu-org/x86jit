@@ -400,12 +400,12 @@ fn a_paged_loop_that_turns_the_tlb_over_lifts_each_block_once() {
             .any(|&(why, n)| why == x86jit_core::TlbAdvance::Replaced && n > 0),
         "{d}"
     );
-    // The CR3 reload flushed the TLB every iteration; no proof dropped.
+    // The CR3 reload flushed the TLB once per iteration; no proof dropped.
     assert!(
         d.tlb
             .advances
             .iter()
-            .any(|&(why, n)| why == x86jit_core::TlbAdvance::Cr3Load && n >= u64::from(ITERATIONS)),
+            .any(|&(why, n)| why == x86jit_core::TlbAdvance::Cr3Load && n == u64::from(ITERATIONS)),
         "{d}"
     );
     assert!(d.tlb.revalidated > 0, "{d}");

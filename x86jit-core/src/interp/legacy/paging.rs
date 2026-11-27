@@ -453,8 +453,8 @@ impl Tlb {
         // and data separated by 1 MiB must not repeatedly expire each other's
         // instruction proofs. The fold leaves bit 0 alone, so adjacent pages
         // never share a slot: a block straddling two pages keeps both
-        // entries (xj-to9.70).
-        ((page ^ (((page >> 8) ^ (page >> 16)) << 1)) as usize) & (TLB_ENTRIES - 1)
+        // entries (xj-to9.70); bits 8-14 and 15-19 enter at bits 1-7.
+        ((page ^ (((page >> 8) ^ (page >> 15)) << 1)) as usize) & (TLB_ENTRIES - 1)
     }
 
     /// Advance the generation, counting why.
@@ -4303,13 +4303,24 @@ mod tests {
 
     #[test]
     fn adjacent_pages_never_share_a_tlb_slot() {
-        // A block straddling two pages keeps both fetch entries (xj-to9.70).
+        // A block straddling two pages keeps both fetch entries (xj-to9.70),
+        // and every page-number bit reaches the slot: pages that differ in
+        // one bit never share it.
         for page in 0..0xf_ffffu32 {
             assert_ne!(
                 Tlb::index(page << 12),
                 Tlb::index((page + 1) << 12),
                 "{page:#x}"
             );
+        }
+        for bit in 0..20 {
+            for page in (0..0x10_0000u32).step_by(0x101) {
+                assert_ne!(
+                    Tlb::index(page << 12),
+                    Tlb::index((page ^ (1 << bit)) << 12),
+                    "{page:#x} bit {bit}"
+                );
+            }
         }
     }
 

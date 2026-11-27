@@ -153,6 +153,14 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         }
     }
 
+    /// Drop every proof whose key `drop` names, recording why.
+    pub(super) fn remove_where(&mut self, drop: impl Fn(&K) -> bool, why: Why) {
+        let keys: Vec<K> = self.proofs.keys().filter(|k| drop(k)).copied().collect();
+        for key in keys {
+            self.remove_because(&key, why, None);
+        }
+    }
+
     /// Drop the proof for `key`, if any, recording why.
     pub(super) fn remove(&mut self, key: &K, why: Why) {
         self.remove_because(key, why, None);

@@ -81,7 +81,10 @@ pub(super) struct State {
     mapping: Option<Arc<()>>,
     stamp: Option<LegacyContextStamp>,
     pub(super) context_id: u64,
-    contexts: EngineMap<LegacyContextStamp, u64>,
+    // Each retained stamp's identity id and last use (`uses`); ids are never
+    // reused before `invalidate`, which restarts `next_context`.
+    contexts: EngineMap<LegacyContextStamp, (u64, u64)>,
+    next_context: u64,
     model: Option<LegacyCpuModel>,
     memory: usize,
     blocks: super::proof_map::ProofMap<Key, Proof>,
@@ -207,6 +210,7 @@ impl State {
         self.stamp = None;
         self.synced = None;
         self.contexts.clear();
+        self.next_context = 0;
         *self.recent = [None; 4];
     }
 
@@ -332,18 +336,21 @@ impl State {
             return;
         }
         let stamp = LegacyContextStamp::new_paged(cpu, model);
-        let id = if let Some(id) = self.contexts.get(&stamp) {
+        let id = if let Some((id, used)) = self.contexts.get_mut(&stamp) {
+            *used = self.uses;
             *id
         } else {
-            // Bound context identities as well as blocks. Clear both before
-            // reusing an ID; this does not expire cached translations.
+            // Bound context identities as well as blocks: evict the least
+            // recently used identity and only its proofs, as the
+            // dispatcher's retained contexts do (`Execution::enter_context`).
+            // A guest with many address spaces keeps a user and a kernel
+            // stamp per CR3, and its kernel's proofs stay (xj-to9.70).
             if self.contexts.len() == MAX_CONTEXTS {
-                self.blocks.clear(why!(Paging));
-                self.contexts.clear();
-                *self.recent = [None; 4];
+                self.evict_context();
             }
-            let id = self.contexts.len() as u64;
-            self.contexts.insert(stamp, id);
+            let id = self.next_context;
+            self.next_context += 1;
+            self.contexts.insert(stamp, (id, self.uses));
             id
         };
         let slot = self
@@ -385,11 +392,40 @@ impl State {
         self.tlb.get_mut().load_cr3();
         self.generation = self.tlb.get_mut().generation;
         self.synced = None;
-        // The dispatcher restarts its identity ids on a CR3 load
-        // (`Execution::invalidate_translations`): none names a recent entry.
+    }
+
+    /// The dispatcher restarted its identity ids
+    /// (`Execution::invalidate_translations`, after a CR3 load or an epoch
+    /// rollover): none names a recent entry any more.
+    pub(super) fn forget_dispatch_ids(&mut self) {
+        self.synced = None;
         for entry in self.recent.iter_mut().flatten() {
             entry.complete = u64::MAX;
         }
+    }
+
+    // The least recently used identity leaves with its proofs. The recent
+    // entries' uses are the latest; the map records the rest.
+    #[cold]
+    fn evict_context(&mut self) {
+        for recent in self.recent.iter().flatten() {
+            if let Some((_, used)) = self.contexts.get_mut(&recent.stamp) {
+                *used = (*used).max(recent.used);
+            }
+        }
+        let Some((&stamp, &(id, _))) = self.contexts.iter().min_by_key(|(_, &(_, used))| used)
+        else {
+            return;
+        };
+        self.contexts.remove(&stamp);
+        for slot in self.recent.iter_mut() {
+            if slot.is_some_and(|r| r.id == id) {
+                *slot = None;
+            }
+        }
+        self.blocks
+            .remove_where(|key| key.decode.context_id == id, why!(ContextEvicted));
+        self.lane_slots.clear();
     }
 
     fn key(

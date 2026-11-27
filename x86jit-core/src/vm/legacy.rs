@@ -1065,11 +1065,12 @@ impl Execution {
         // Context identities restart: no link may name one.
         self.links.clear();
         self.retry_slices.clear();
-        // The paged proofs keep their own identities and revalidate their
-        // code pages after the flush (xj-to9.70).
+        // The paged proofs keep their own identities: a CR3 load flushed
+        // the paged TLB where it executed (`execute_paged`), once; only the
+        // ids this restarts must leave the paged recent entries (xj-to9.70).
         self.context_dirty();
         if let Some(paging) = &mut self.paging {
-            paging.load_cr3();
+            paging.forget_dispatch_ids();
         }
         self.direct_proofs.clear();
         self.blocks.clear();

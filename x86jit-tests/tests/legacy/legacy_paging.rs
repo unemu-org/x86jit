@@ -1319,6 +1319,43 @@ fn paged_user_code_page_made_supervisor_faults_cpl3_fetch_after_invlpg() {
 }
 
 #[test]
+fn paged_context_table_evicts_the_least_recent_identity_and_only_its_proofs() {
+    // Paging design §3.5 bounded retention (xj-to9.70): more paged context
+    // stamps than the 64 retained (here a data selector per stamp, as a
+    // guest's processes bring their own) evict the least recently used
+    // identity and its proofs; the hot identity keeps its proof.
+    for model in MODELS {
+        let mut f = Fixture::new(model, true, 0);
+        f.code_mapping(0, CODE_FRAME);
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x400, &[0xb0, 0x11])
+            .unwrap(); // MOV AL,11h
+        f.vm.write_bytes(u64::from(CODE_FRAME) + 0x600, &[0x90])
+            .unwrap(); // NOP
+        let hot = f.cpu.cpu.ds;
+        f.fetch_at(0x400).unwrap();
+        let start = f.cpu.paging_cache_for_test().2;
+        const COLD: u64 = 200;
+        for i in 0..COLD {
+            f.cpu.cpu.ds = 0x100 + 8 * i as u16;
+            f.fetch_at(0x600).unwrap();
+            if i % 8 == 7 {
+                f.cpu.cpu.ds = hot;
+                let before = f.cpu.paging_cache_for_test().2;
+                f.fetch_at(0x400).unwrap();
+                assert_eq!(
+                    f.cpu.paging_cache_for_test().2,
+                    before,
+                    "hot proof lost at {i}"
+                );
+            }
+            assert!(f.cpu.paging_cache_for_test().1 <= 65);
+        }
+        // Every cold identity lifted its NOP once, the hot one nothing.
+        assert_eq!(f.cpu.paging_cache_for_test().2, start + COLD);
+    }
+}
+
+#[test]
 fn paged_cr3_load_to_another_frame_with_equal_bytes_relifts() {
     // 80386 PRM §5.2.3 p. 5-9, §5.2.5 p. 5-11: CR3 selects the directory and
     // a load flushes. The same linear page in another directory names
