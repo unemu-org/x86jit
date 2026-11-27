@@ -21,6 +21,7 @@
 //! the register loop in two address spaces that share the code and data
 //! pages, with a CR3 load every MACHINE32_CR3_INTERVAL iterations (default
 //! 1000), on the CPL-0 paged32 paths only.
+//! Decision-33: MACHINE32_SPARSE=1 runs the -bg paths on a 4 GiB sparse span.
 use std::sync::Arc;
 use std::time::Instant;
 use x86jit_core::{
@@ -185,10 +186,14 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         vm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Forced);
         vm
     } else if path.ends_with("-bg") || path == "machine-protected32-bg-nochain" {
-        let mut vm = Vm::with_backend(
-            VmConfig::flat(memory_size),
-            Box::new(JitBackend::with_opt_level(OptLevel::Speed)),
-        );
+        let backend = Box::new(JitBackend::with_opt_level(OptLevel::Speed));
+        // Decision-33: a 4 GiB sparse span with only the workload's RAM
+        // committed.
+        let mut vm = if std::env::var("MACHINE32_SPARSE").as_deref() == Ok("1") {
+            Vm::with_backend_sparse(VmConfig::flat(1 << 32), backend).unwrap()
+        } else {
+            Vm::with_backend(VmConfig::flat(memory_size), backend)
+        };
         vm.set_tier_up_after(Some(50));
         vm.set_tier_up_background(true);
         #[cfg(feature = "test-hooks")]

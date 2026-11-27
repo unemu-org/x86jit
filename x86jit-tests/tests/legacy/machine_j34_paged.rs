@@ -29,9 +29,10 @@ use x86jit_core::{
 };
 use x86jit_cranelift::JitBackend;
 
-const PAGED: Setup = Setup {
+pub(crate) const PAGED: Setup = Setup {
     a20_off: false,
     sparse: false,
+    sparse_compile: false,
     watch: false,
     mxcsr_mode: false,
     rf: false,
@@ -41,7 +42,7 @@ const PAGED: Setup = Setup {
     user: false,
     wp: false,
 };
-const PAGED_USER: Setup = Setup {
+pub(crate) const PAGED_USER: Setup = Setup {
     user: true,
     ..PAGED
 };
@@ -84,7 +85,7 @@ fn pair(
 /// Run both machines with this budget schedule until the program ends; the
 /// subject's counters and its last stop.
 #[allow(clippy::too_many_arguments)]
-fn lockstep(
+pub(crate) fn lockstep(
     model: CpuModel,
     code: &[u8],
     subject: Subject,
@@ -117,7 +118,7 @@ fn lockstep(
     (a.machine_jit_counters_for_test(), last)
 }
 
-fn plain(_: &Vm, _: &mut Vcpu) {}
+pub(crate) fn plain(_: &Vm, _: &mut Vcpu) {}
 
 /// Decision-32 §9: the J1 programs and families, paged at CPL 0 and CPL 3
 /// and unpaged at CPL 3, in every compiled mode, against the interpreter.

@@ -540,7 +540,9 @@ supervisor; the rest await review. None changes an answered question.
    test and test-hooks builds.
 10. **Admission (§2 items 2-3).** Sparse backing never compiles (spec §4.1, as Application
     already enforces), nor does a backend whose code space is exhausted. This holds in the
-    Forced and Delayed test modes too; Scripted runs no generated code.
+    Forced and Delayed test modes too; Scripted runs no generated code. *Amended by
+    decision-33 (2026-11-28): sparse Machine VMs compile; only the Application profile
+    keeps sparse backing on the checked interpreter.*
 11. **Retry.** A slot waiting for a unit asks again every threshold's turns as well as after a
     publication, so a refused or rejected request does not stall it.
 12. **Interpreter cost with compilation off.** Every Machine check on the shared cache's

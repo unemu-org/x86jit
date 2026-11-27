@@ -284,11 +284,22 @@ host API failures: anonymous Unix memory still follows the host's overcommit/OOM
 policy, so success cannot guarantee that the OS will service every future page
 fault. No whole-span zeroing or copying is performed.
 
-Sparse backing executes **all** guest instructions through the checked interpreter,
-even with an injected JIT backend. Block compilation, region formation and tier-up
-are bypassed. This keeps retirement and step accounting exact without charging
-compiled suffixes that later defer to the interpreter, and requires no host signal
-handler. Ordinary backing's generated code is unchanged. Because `Vm::mem` is
+Sparse backing executes **Application** code through the checked interpreter, even
+with an injected JIT backend: Application block compilation, region formation and
+tier-up are bypassed, because an Application inline access checks only the span bound
+and could touch an uncommitted page. This keeps retirement and step accounting exact
+without charging compiled suffixes that later defer to the interpreter, and requires
+no host signal handler. **Compiled Machine blocks run** on sparse backing as on
+ordinary backing (decision-33), because they dereference guest memory inline only
+through frames proved inside a mapped region. The invariant: every host byte a
+compiled Machine unit reads or writes inline lies in a region mapped at that moment,
+so on a host page that region's `map` committed. The compiled view fills only 4 KiB
+frames that lie in one RAM or ROM region (`Memory::fast_frame`); live fields lie in
+bytes the interpreter fetched for their unit, and `Vm::unmap` drops the units of the
+pages it unmaps; regions change only under `&mut Vm`, between runs, and each
+compiling run empties the view when the mapping changed. A new inline access class
+in compiled Machine code must keep this invariant. Ordinary backing's generated code
+is unchanged, and so is the Machine code generated for sparse backing. Because `Vm::mem` is
 public, run entry detects a sparse/ordinary backing-policy change and invalidates
 translations, chained links, vCPU predictions and pending publications before
 dispatch; switching back to ordinary backing can compile fresh code.

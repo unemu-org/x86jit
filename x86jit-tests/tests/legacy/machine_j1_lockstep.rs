@@ -43,9 +43,13 @@ pub(crate) enum Subject {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Setup {
     pub(crate) a20_off: bool,
-    /// Sparse backing (`Vm::with_backend_sparse`): spec §4.1 keeps it on the
-    /// checked interpreter, so no unit is ever entered.
+    /// Sparse backing (`Vm::with_backend_sparse`) over the same span as the
+    /// owned one: compiled Machine blocks run on it (decision-33).
     pub(crate) sparse: bool,
+    /// Decision-33: sparse backing over a 4 GiB span, with the regions
+    /// below `SIZE` plus [`SPARSE_EDGE`] and [`SPARSE_ROM`]; the rest of
+    /// the span is an uncommitted hole.
+    pub(crate) sparse_compile: bool,
     /// Watched data pages (`Vm::watch_range`): every compiled store then
     /// calls the store barrier, so the code-tag gate is tested without it.
     pub(crate) watch: bool,
@@ -62,6 +66,12 @@ pub(crate) struct Setup {
     /// With `paged`, CR0.WP (an Intel486 control; the 80386 has none).
     pub(crate) wp: bool,
 }
+
+/// Decision-33: with [`Setup::sparse_compile`], a 4 KiB RAM region alone in
+/// its host page (on a 16 KiB-page host the next three frames are committed
+/// but unmapped), and the top 4 KiB page of the span as ROM.
+pub(crate) const SPARSE_EDGE: u64 = 0x20_0000;
+pub(crate) const SPARSE_ROM: u64 = 0xffff_f000;
 
 /// The page directory and the one table of [`Setup::paged`]: 4 MiB of linear
 /// space, every page user-writable but the cause pages below; pages from
@@ -108,7 +118,14 @@ pub(crate) fn machine(
     setup: Setup,
     seed: u64,
 ) -> (Vm, Vcpu) {
-    let mut vm = if setup.sparse {
+    let mut vm = if setup.sparse_compile {
+        let mut vm = Vm::with_backend_sparse(VmConfig::flat(1 << 32), Box::new(backend)).unwrap();
+        vm.map(SPARSE_EDGE, 0x1000, Prot::RW, RegionKind::Ram)
+            .unwrap();
+        vm.map(SPARSE_ROM, 0x1000, Prot::RX, RegionKind::Rom)
+            .unwrap();
+        vm
+    } else if setup.sparse {
         Vm::with_backend_sparse(VmConfig::flat(SIZE), Box::new(backend)).unwrap()
     } else {
         Vm::with_backend(VmConfig::flat(SIZE), Box::new(backend))
@@ -143,6 +160,9 @@ pub(crate) fn machine(
     }
     let rom: Vec<u8> = (0..0x1000u32).map(|i| (i * 7 + 3) as u8).collect();
     vm.write_bytes(ROM, &rom).unwrap();
+    if setup.sparse_compile {
+        vm.write_bytes(SPARSE_ROM, &rom).unwrap();
+    }
     vm.write_bytes(0x1000, code).unwrap();
     let mut cpu = vm.new_vcpu();
     cpu.cpu.rip = 0x1000;
@@ -1094,10 +1114,10 @@ fn background_tier_up_equals_the_interpreter() {
     }
 }
 
-/// Spec §4.1, decision-30 §2: sparse backing executes through the checked
-/// interpreter, even with a compiling backend, in every compile mode.
+/// Decision-33: Machine VMs on sparse backing compile, in every compile
+/// mode, and equal the interpreter.
 #[test]
-fn sparse_backing_stays_interpreted() {
+fn sparse_backing_compiles() {
     let (_, register, _) = programs(CpuModel::I80386).remove(0);
     let sparse = Setup {
         sparse: true,
@@ -1117,8 +1137,10 @@ fn sparse_backing_stays_interpreted() {
             &mut |_| 64,
             "sparse",
         );
-        assert_eq!(c.entries, 0, "{subject:?}: {c:?}");
-        assert_eq!(c.compiled, 0, "{subject:?}: {c:?}");
+        // A background compile need not land within this short program.
+        if subject != Subject::Background(1) {
+            assert!(c.entries > 0, "{subject:?}: {c:?}");
+        }
     }
 }
 

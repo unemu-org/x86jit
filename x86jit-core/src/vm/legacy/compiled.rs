@@ -818,12 +818,20 @@ fn compiles(vm: &Vm) -> bool {
 
 /// Whether a VM may run compiled Machine code at all, in production or in
 /// a test mode: a backend that compiles Machine IR and has code space left,
-/// and memory that is neither sparse (spec §4.1: sparse backing executes
-/// through the checked interpreter, even with a JIT backend) nor recovering
-/// host faults (decision-30 Q7).
+/// and memory that does not recover host faults (decision-30 Q7). Sparse
+/// backing compiles too (decision-33; the Application profile keeps it on
+/// the checked interpreter, spec §4.1).
+///
+/// Decision-33 invariant: every host byte a compiled Machine unit reads or
+/// writes inline lies in a mapped region, hence on a committed host page
+/// (`Memory::map` commits before it publishes the region). The view fills
+/// only frames inside one RAM or ROM region (`Memory::fast_frame`); live
+/// fields lie in their unit's fetched bytes, and `Vm::unmap` drops the
+/// units of the frames it unmaps; regions change only under `&mut Vm`, and
+/// `State::begin_run` empties the view when the mapping changed. A new
+/// inline access class must keep it.
 pub(super) fn admits(vm: &Vm) -> bool {
-    !vm.mem.is_sparse()
-        && !vm.mem.host_fault_recovery()
+    !vm.mem.host_fault_recovery()
         && vm.backend.compiles_machine()
         && !vm.backend.code_space_exhausted()
 }
