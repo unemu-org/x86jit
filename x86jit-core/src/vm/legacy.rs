@@ -30,7 +30,7 @@ pub(crate) fn paging_generation() -> u64 {
         .expect("paging proof identifiers exhausted")
 }
 
-pub use compiled::{MachineJitCounters, MachineJitMode};
+pub use compiled::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
@@ -4117,7 +4117,7 @@ impl Vcpu {
                 self.legacy_execution.as_mut().unwrap().last_direct_fetch =
                     (direct && !retained).then_some(linear_fetch);
                 probe!(BLOCKS);
-                let (ir, walk) = match resolved {
+                let (mut ir, walk) = match resolved {
                     Ok(ir) => ir,
                     Err(exit) => {
                         self.legacy_execution
@@ -4183,12 +4183,33 @@ impl Vcpu {
                         hook.unwrap().arm(devices, self, &ir, steps);
                     }
                     let compiled = self.machine_progress::<ROUTED, ORDER>(
-                        vm, &ir, walk, context, remaining, &boundary, &mut ctx, exit_word,
+                        vm,
+                        &ir,
+                        walk,
+                        context,
+                        remaining,
+                        &boundary,
+                        &mut ctx,
+                        exit_word,
+                        if armed { hook } else { None },
                     );
                     if armed {
                         hook.unwrap().disarm();
                     }
-                    compiled
+                    match compiled {
+                        // Decision-31 §2.3: a chain charges its completed
+                        // blocks first; the turn then goes on as for the
+                        // last block alone.
+                        Some((compiled, Some(chain))) => {
+                            steps += chain.prefix;
+                            self.retired += chain.prefix;
+                            self.executed += chain.prefix;
+                            ir = chain.ir;
+                            Some(compiled)
+                        }
+                        Some((compiled, None)) => Some(compiled),
+                        None => None,
+                    }
                 } else {
                     None
                 };

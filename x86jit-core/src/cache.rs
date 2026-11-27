@@ -1216,6 +1216,22 @@ impl TranslationCache {
             .publish_entry_if_current(since_epoch, entry, publish)
     }
 
+    /// [`Self::publish_entry_if_current`] for a Machine link slot: the
+    /// target descriptor is registered only when the publication is allowed
+    /// (decision-31 §2.4), and `store` receives its address.
+    pub(crate) fn publish_machine_target_if_current(
+        &self,
+        since_epoch: u64,
+        entry: CompiledPtr,
+        target: crate::code_lifetime::MachineTarget,
+        store: impl FnOnce(u64),
+    ) -> bool {
+        let _spans = self.spans.write().unwrap();
+        let _publication = self.map.publication();
+        self.code_lifetime()
+            .publish_machine_target_if_current(since_epoch, entry, target, store)
+    }
+
     /// Execution and predictor lifetime shared with the compiling backend.
     pub fn code_lifetime(&self) -> Arc<crate::code_lifetime::CodeLifetime> {
         self.lifetime.read().unwrap().clone()
@@ -1545,7 +1561,8 @@ impl TranslationCache {
         }
     }
 
-    /// Chained transfers taken (the block-chaining "fires" counter, §12 M5).
+    /// Chained transfers taken (the block-chaining "fires" counter, §12 M5),
+    /// Application block links and Machine chain transfers (decision-31) alike.
     pub fn chained(&self) -> u64 {
         self.chained.load(Ordering::Relaxed)
     }

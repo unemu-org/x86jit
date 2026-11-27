@@ -5155,3 +5155,27 @@ the core lib tests fail (the TLB D-bit and write-protect witnesses, the SMC and 
 suites, `legacy_flat32`, `legacy_seg16`/`seg32`, `legacy_segment_blocks`, `legacy_census_386`,
 `legacy_one_pass`, the core `vm` tests). Not run: the lockstep tracer, the fuzz binary, the
 ladder.
+
+## Compiled-to-compiled Machine chains (J2b, xj-to9.54) — MEASURED 2026-11-27
+
+Decision-31 done-when 2. `machine32_loops`, release, ARM64, 2,000,000 iterations, host
+instructions per guest step, last of three rounds (one process per cell). J2 is 1402da6c built
+from the same tree without the J2b change.
+
+| Path | register | memory | callret |
+|---|---:|---:|---:|
+| J2 background, T1 = 50 (production build) | 120.2 | 135.8 | 362.5 |
+| J2b background, T1 = 50 (production build) | **20.0** | **35.6** | **66.2** |
+| Gate (decision-30 done-when 2) | 102 | 133 | 326 |
+| Decision-31 §7 planning (RET chained) | 19-22 | 43-48 | 72-83 |
+| Compat32 JIT (`application-jit32`) | 18.2 | 41.6 | 68.2 |
+
+Sliced (`run_steps(64)`, `-sliced` workloads), recorded, not gated: J2 170.3 / 191.8 / 420.8,
+J2b 75.3 / 96.4 / 107.6. A slice is one full turn plus one chain, ended by the edge budget test.
+
+Edge census (`--features test-hooks`, whose counters and edge hook add host instructions;
+per 1000 retired): chained transfers 200 (register, memory: one per five-instruction block) and
+600 (callret: three blocks per five instructions); a whole run is one chain, ending at the final
+HLT singleton (empty slot). Sliced register: 184.4 chained, 15.6 budget ends, one per slice. The
+test-hooks chain-off reference (`machine-protected32-bg-nochain`) costs 141.3 / 156.9 / 429.9
+against 33.0 / 48.6 / 105.2 chained in the same build.

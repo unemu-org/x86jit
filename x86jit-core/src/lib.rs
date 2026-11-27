@@ -254,11 +254,11 @@ pub use vm::{
     SourceIdError, StepOptions, StepRun, StepRunError, StepStop, TierUpFinished, TierUpRequest,
     TierUpSubmit, TierUpUnit, Vcpu, Vm, VmConfig,
 };
+#[doc(hidden)]
+pub use vm::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
 #[cfg(feature = "test-hooks")]
 pub use vm::{
     GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
     ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass,
 };
-#[doc(hidden)]
-pub use vm::{MachineJitCounters, MachineJitMode};
 pub use x87::FpuKind;

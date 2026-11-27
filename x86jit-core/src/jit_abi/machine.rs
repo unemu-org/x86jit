@@ -63,17 +63,26 @@ pub const ENTRY_SHIFT: i64 = 5;
 /// code-tag table, so the view is emptied whenever A20, the mapping or the
 /// physical mask it was filled under changes. Code-tag words are read live,
 /// so a page tagged after the fill is seen by the next store.
+///
+/// The vCPU's shadow return ring for compiled Machine CALL and RET
+/// (decision-31 §2.1) follows the entries, at [`RING_OFFSET`]: Machine code
+/// reaches both through `MemCtx::ret_stack`, so `MemCtx` keeps its layout.
 #[repr(C)]
 pub struct MachineTlb {
     pub entries: [FastEntry; TLB_SLOTS],
+    pub ring: super::RetStack,
     a20: bool,
     mask: u32,
 }
+
+/// Byte offset of [`MachineTlb::ring`], for generated code.
+pub const RING_OFFSET: i64 = std::mem::offset_of!(MachineTlb, ring) as i64;
 
 impl Default for MachineTlb {
     fn default() -> Self {
         Self {
             entries: [FastEntry::default(); TLB_SLOTS],
+            ring: super::RetStack::new(),
             a20: false,
             mask: 0,
         }
@@ -138,6 +147,65 @@ pub fn lowered_op(op: &IrOp) -> bool {
 /// defer at its start.
 pub fn lowered_instruction(ops: &[IrOp]) -> bool {
     crate::interp::legacy::machine_jit::lowered_instruction(ops)
+}
+
+/// How a Machine block's last instruction transfers (decision-31 §3), for
+/// its lowering: a near CALL pushes the shadow return ring, a near RET
+/// predicts through it. The ring only gates a chain, so this bears on cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineExit {
+    /// Any other last instruction.
+    Plain,
+    /// A near CALL that pushes this return address.
+    Call(u64),
+    /// A near RET, with or without imm16: the last `Jump` is to a temp and
+    /// the block's `IrBlock::link_exit` flag holds. The flag, recorded when
+    /// the block is published, holds for a direct exit or a near RET, so with
+    /// an indirect jump it names a near RET.
+    Return,
+}
+
+/// The last instruction's transfer kind of a Machine block.
+pub fn machine_exit(ir: &crate::ir::IrBlock) -> MachineExit {
+    use crate::ir::Val;
+    let start = ir
+        .ops
+        .iter()
+        .rposition(|op| matches!(op, IrOp::InsnStart { .. }))
+        .unwrap_or(0);
+    let last = &ir.ops[start..];
+    let Some(IrOp::Jump { target }) = last
+        .iter()
+        .rev()
+        .find(|op| !matches!(op, IrOp::Legacy(crate::legacy::LegacyOp::SharedWalk)))
+    else {
+        return MachineExit::Plain;
+    };
+    // A near CALL (`lift::legacy`, `push_value` then `Jump`): the return
+    // address is the next instruction's offset in the operand size, and
+    // ESP is written.
+    let end = ir.guest_start.wrapping_add(u64::from(ir.guest_len));
+    let sp = last.iter().any(|op| {
+        matches!(
+            op,
+            IrOp::WriteReg {
+                reg: crate::Reg::Rsp,
+                ..
+            }
+        )
+    });
+    let pushed = last.iter().find_map(|op| match op {
+        IrOp::Store {
+            src: Val::Imm(value),
+            ..
+        } if *value == end & 0xffff_ffff || *value == end & 0xffff => Some(*value),
+        _ => None,
+    });
+    match (target, pushed) {
+        (_, Some(value)) if sp => MachineExit::Call(value),
+        (Val::Temp(_), _) if ir.link_exit => MachineExit::Return,
+        _ => MachineExit::Plain,
+    }
 }
 
 /// The helpers' baked access configuration: the model's physical mask, the
@@ -315,6 +383,8 @@ mod tests {
         assert_eq!(offset_of!(FastEntry, frame) as i32, ENTRY_FRAME);
         assert_eq!(offset_of!(FastEntry, tag_bit) as i32, ENTRY_TAG_BIT);
         assert_eq!(offset_of!(MachineTlb, entries), 0);
+        assert_eq!(offset_of!(MachineTlb, ring) as i64, RING_OFFSET);
+        assert_eq!(RING_OFFSET % 8, 0);
         assert!(TLB_SLOTS.is_power_of_two());
         assert_eq!(
             size_of::<[FastEntry; TLB_SLOTS]>(),

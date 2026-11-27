@@ -375,3 +375,44 @@ followed by the other.
 - Revisit if a cell exceeds §7's ΔE = 50 column (profile the edge; option (b)), if the embedder
   census shows chains ending mostly on the word poll (find the writer), or if indirect transfers
   dominate its turns (Q9).
+
+## Implementation notes (2026-11-27, proposed record diff)
+
+Recorded while implementing J2b (bead xj-to9.54). None changes an answered question.
+
+1. **Where the ring lives (§2.1, §6).** J2 gave `MemCtx::ret_stack` its Machine meaning, the
+   compiled TLB view (decision-30 implementation note 5). The vCPU's Machine shadow ring is a
+   field of that view (`MachineTlb::ring`, at `jit_abi::machine::RING_OFFSET`), so Machine
+   CALL and RET reach it through `ret_stack` plus a constant: no `MemCtx` field, the frozen
+   offsets unchanged. The ring is emptied when the participation epoch it was used in
+   changes, and when the vCPU follows another code lifetime.
+2. **Which CALL and RET.** Machine IR has no `IrOp::Call` or `IrOp::Ret`: near CALL and RET
+   are a push or a load, the ESP write and a `Jump`. `jit_abi::machine::machine_exit`
+   classifies the block's last instruction: a stored immediate equal to the next
+   instruction's offset with an ESP write is a CALL (direct or indirect: both push the ring,
+   only a direct one chains), and an indirect `Jump` of a block whose `IrBlock::link_exit`
+   flag holds is a near RET: the flag holds for a direct exit or a near RET, so with an
+   indirect jump only a near RET sets it. This bears on cost only.
+3. **The fill condition (§2.4).** A `RET_LINK` leaves its fill in the vCPU's Machine state
+   with the vCPU's retired count after the chain. The next compiled entry takes it, and
+   publishes it only when the retired count is unchanged, the block starts at the target and
+   its key flags equal the fill's; the epoch is tested under the lifetime's lock
+   (`publish_entry_if_current`). A turn that delivered an event or ran a service step moves
+   the IP or nothing that the successor key depends on (§2.5); each run starts without one.
+4. **Descriptors.** `code_lifetime::MachineTarget` holds the entry, the block, its count and
+   its key flags; the block's `link_exit` is read from the block. Descriptors are retired with
+   the IBTC descriptors when slots are cleared and collected by the same grace rule.
+5. **The chain's result.** `machine_progress` returns the last block's result with the chain
+   prefix and the last block; the dispatcher charges the prefix and goes on with that block
+   as the turn's block. A chained DEFER's suffix runs inside `machine_progress`, after the
+   guard, with the device hook pointed at a clone of the last block (`InBlock::advance`), so
+   `Run::decided` is consumed before any boundary (Q7).
+6. **Census and test hooks.** `MachineJitCounters` gains `chained` and `chain_ends` (nine
+   reasons, `CHAIN_END_NAMES`), counted in test and test-hooks builds only; a `RET_CHAIN`
+   with no chain started (chains off, or the cold epilogue) counts as `unchained`. The
+   vCPU's `chained` counter, flushed into `TranslationCache::chained`, now counts Machine
+   chain transfers too, in every build, beside the Application block links. The chain-off
+   switch is `Vm::set_machine_chains_for_test`, and `Vcpu::raise_at_chain_edge_for_test`
+   raises an exit request, an NMI edge, a code write, a retirement or exhausted code space at
+   a chosen edge (`ChainEdgeAction`). Scripted chains end each completed scripted block with a
+   seeded chain to the block the resolver returns, a link or a continue.

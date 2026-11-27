@@ -47,7 +47,7 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 18] = [
+const PATHS: [&str; 19] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
@@ -70,6 +70,9 @@ const PATHS: [&str; 18] = [
     // Decision-30 (J2): the production configuration, hotness-gated
     // background tier-up at T1 = 50.
     "machine-protected32-bg",
+    // Decision-31 (J2b): the same with chains off (`--features test-hooks`;
+    // chained without it), the reference for the chain edge's cost.
+    "machine-protected32-bg-nochain",
 ];
 const WORKS: [&str; 6] = [
     "register", "memory", "callret", "farseg", "farcall", "segmix",
@@ -133,13 +136,17 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         #[cfg(feature = "test-hooks")]
         vm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Forced);
         vm
-    } else if path == "machine-protected32-bg" {
+    } else if path == "machine-protected32-bg" || path == "machine-protected32-bg-nochain" {
         let mut vm = Vm::with_backend(
             VmConfig::flat(memory_size),
             Box::new(JitBackend::with_opt_level(OptLevel::Speed)),
         );
         vm.set_tier_up_after(Some(50));
         vm.set_tier_up_background(true);
+        #[cfg(feature = "test-hooks")]
+        if path == "machine-protected32-bg-nochain" {
+            vm.set_machine_chains_for_test(false);
+        }
         vm
     } else {
         Vm::new(VmConfig::flat(memory_size))
@@ -444,6 +451,8 @@ fn main() {
                 let retired_before = cpu.retired_instructions();
                 #[cfg(feature = "test-hooks")]
                 x86jit_core::Vcpu::take_machine_counters_for_test();
+                #[cfg(feature = "test-hooks")]
+                let chain_before = cpu.machine_jit_counters_for_test();
                 let host_before = instructions();
                 let start = Instant::now();
                 execute(&vm, &mut cpu, real, n, sliced);
@@ -458,6 +467,23 @@ fn main() {
                         .map(|c| (c * 1000) as f64 / retired.max(1) as f64),
                     cpu.take_proof_bytes_for_test()
                 );
+                // Decision-31 §8: chained transfers and chain ends per 1000 retired.
+                #[cfg(feature = "test-hooks")]
+                {
+                    let c = cpu.machine_jit_counters_for_test();
+                    let per = |n: u64| (n * 1000) as f64 / retired.max(1) as f64;
+                    let ends: Vec<_> = x86jit_core::MachineJitCounters::CHAIN_END_NAMES
+                        .iter()
+                        .zip(c.chain_ends.iter().zip(chain_before.chain_ends))
+                        .filter(|(_, (now, before))| *now != before)
+                        .map(|(name, (now, before))| format!("{name} {:.3}", per(now - before)))
+                        .collect();
+                    eprintln!(
+                        "chains {work} {path}: chained {:.3}, ends {}",
+                        per(c.chained - chain_before.chained),
+                        ends.join(", ")
+                    );
+                }
                 let count = (match base_work {
                     "farseg" => 8 + u64::from(sliced),
                     "farcall" => farcall_interval(),

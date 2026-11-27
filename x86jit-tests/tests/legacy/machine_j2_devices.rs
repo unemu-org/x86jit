@@ -12,8 +12,9 @@ mod fixture;
 use fixture::descriptor;
 use iced_x86::code_asm::*;
 use x86jit_core::{
-    CpuModel, DeviceContext, DeviceIo, DeviceRange, DeviceRequest, DeviceResult, ExceptionDelivery,
-    Exit, MachineJitMode, Prot, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig,
+    CpuModel, DeviceContext, DeviceError, DeviceIo, DeviceRange, DeviceRequest, DeviceResult,
+    DeviceStop, ExceptionDelivery, Exit, MachineJitMode, Prot, RegionKind, StepOptions, StepStop,
+    Vcpu, Vm, VmConfig,
 };
 use x86jit_cranelift::JitBackend;
 
@@ -22,18 +23,60 @@ const MMIO: u64 = 0x9000;
 
 /// Answers reads from the address and the request's position, accepts
 /// writes, and falls back at `MMIO + 0xf0`, recording every request.
+///
+/// With `effects`, the handler also acts on the vCPU and RAM through its
+/// context: a read at `MMIO + 0x20` raises INTR every fifth time, a write at
+/// `MMIO + 0x30` writes RAM at `DATA` (and every seventh time the code bytes
+/// at `effects`), and a read at `MMIO + 0x40` returns DeviceFault every
+/// fourth time.
 #[derive(Default)]
 struct Recorder {
     requests: Vec<DeviceRequest>,
+    effects: Option<u64>,
+}
+
+/// The RAM a handler with effects writes.
+const DATA: u64 = 0x6000;
+
+impl Recorder {
+    fn with_effects(code_patch: u64) -> Self {
+        Recorder {
+            requests: Vec::new(),
+            effects: Some(code_patch),
+        }
+    }
 }
 
 impl DeviceIo for Recorder {
-    fn access(&mut self, request: &DeviceRequest, _: &mut DeviceContext<'_>) -> DeviceResult {
+    fn access(&mut self, request: &DeviceRequest, context: &mut DeviceContext<'_>) -> DeviceResult {
         self.requests.push(request.clone());
         if request.address == MMIO + 0xf0 {
             return DeviceResult::Fallback;
         }
-        DeviceResult::Handled(request.address ^ request.position.retired_instructions)
+        let value = request.address ^ request.position.retired_instructions;
+        let Some(patch) = self.effects else {
+            return DeviceResult::Handled(value);
+        };
+        let n = self
+            .requests
+            .iter()
+            .filter(|r| r.address == request.address)
+            .count() as u64;
+        match request.address - MMIO {
+            0x20 if n % 5 == 2 => context.set_intr(true),
+            0x30 => {
+                let word = (request.value ^ request.position.retired_instructions) as u32;
+                context
+                    .write_ram(DATA + (n % 4) * 4, &word.to_le_bytes())
+                    .unwrap();
+                if n % 7 == 3 {
+                    context.write_ram(patch, &(n as u32).to_le_bytes()).unwrap();
+                }
+            }
+            0x40 if n % 4 == 1 => return DeviceResult::DeviceFault(DeviceError::new(5)),
+            _ => {}
+        }
+        DeviceResult::Handled(value)
     }
 }
 
@@ -41,6 +84,8 @@ impl DeviceIo for Recorder {
 enum Subject {
     Interpreted,
     Forced,
+    /// Forced, with the test-only chain-off switch (decision-31 §8).
+    ForcedChainOff,
     Background,
 }
 
@@ -63,6 +108,10 @@ fn machine(code: &[u8], subject: Subject) -> (Vm, Vcpu) {
     match subject {
         Subject::Interpreted => vm.set_machine_jit_for_test(MachineJitMode::Off),
         Subject::Forced => vm.set_machine_jit_for_test(MachineJitMode::Forced),
+        Subject::ForcedChainOff => {
+            vm.set_machine_jit_for_test(MachineJitMode::Forced);
+            vm.set_machine_chains_for_test(false);
+        }
         Subject::Background => {
             vm.set_machine_jit_for_test(MachineJitMode::Off);
             vm.set_tier_up_after(Some(2));
@@ -99,9 +148,16 @@ fn live(cpu: &x86jit_core::CpuState) -> String {
 
 /// Run reference and subject in lockstep with this budget until HLT.
 fn lockstep(code: &[u8], subject: Subject, budget: u64) {
+    lockstep_with(code, subject, budget, Recorder::default);
+}
+
+/// [`lockstep`] with handlers made by `handler`. An INTR the handler raised
+/// is lowered on both when a run stops for it, and a DeviceFault is
+/// completed on both with the same value.
+fn lockstep_with(code: &[u8], subject: Subject, budget: u64, handler: impl Fn() -> Recorder) {
     let (bvm, mut b) = machine(code, Subject::Interpreted);
     let (avm, mut a) = machine(code, subject);
-    let (mut subject_handler, mut reference_handler) = (Recorder::default(), Recorder::default());
+    let (mut subject_handler, mut reference_handler) = (handler(), handler());
     for call in 0..100_000 {
         let what = format!("{subject:?} budget {budget} call {call}");
         let ar = a
@@ -147,9 +203,18 @@ fn lockstep(code: &[u8], subject: Subject, budget: u64) {
                 a.complete_mmio_write();
                 b.complete_mmio_write();
             }
+            StepStop::Exit(Exit::Device(DeviceStop::IntrReady)) => {
+                a.set_intr(false);
+                b.set_intr(false);
+            }
+            StepStop::Exit(Exit::Device(DeviceStop::Fault { .. })) => {
+                let value = a.retired_instructions() ^ 0x5a5a;
+                assert!(a.complete_device_fault(value), "{what}");
+                assert!(b.complete_device_fault(value), "{what}");
+            }
             StepStop::Exit(Exit::Hlt) => {
                 // A budget below the block length keeps it interpreted (E4).
-                if matches!(subject, Subject::Forced) && budget >= 64 {
+                if matches!(subject, Subject::Forced | Subject::ForcedChainOff) && budget >= 64 {
                     let c = a.machine_jit_counters_for_test();
                     assert!(c.compiled_retired > 0, "{what}: {c:?}");
                 }
@@ -259,4 +324,164 @@ fn a_transfer_after_a_compiled_defer_reports_the_whole_block_position() {
     );
     assert!(c.defers_at_zero < c.unconditional_defers, "{c:?}");
     assert_eq!(handler.requests.len(), 100, "one call per transfer");
+}
+
+/// Twelve blocks per iteration, chained (decision-31): handled reads and
+/// writes in the first, second and twelfth block, and a Fallback write in
+/// the twelfth.
+fn chained_devices(iterations: u32) -> Vec<u8> {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.mov(ebp, iterations).unwrap();
+    a.set_label(&mut top).unwrap();
+    for block in 0..11u32 {
+        let mut next = a.create_label();
+        match block {
+            0 => {
+                a.mov(eax, dword_ptr(0x9000)).unwrap();
+                a.add(ebx, eax).unwrap();
+            }
+            1 => a.mov(dword_ptr(0x9004), ebx).unwrap(),
+            _ => a.add(ecx, block).unwrap(),
+        }
+        a.jmp(next).unwrap();
+        a.set_label(&mut next).unwrap();
+    }
+    a.movzx(edx, byte_ptr(0x9008)).unwrap();
+    a.add(esi, edx).unwrap();
+    a.mov(dword_ptr(0x90f0), ecx).unwrap();
+    a.dec(ebp).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    a.assemble(0x1000).unwrap()
+}
+
+/// Decision-31 §4.4, §8 Devices: handled transfers in the first, second and
+/// twelfth block of a chain report the interpreter's positions, the handler
+/// is called once per transfer, and the blocks chained.
+#[test]
+fn device_accesses_in_chained_blocks_equal_the_interpreter() {
+    let code = chained_devices(60);
+    for subject in [Subject::Forced, Subject::Background] {
+        for budget in [1, 2, 7, 13, 64, 100_000] {
+            lockstep(&code, subject, budget);
+        }
+    }
+    let (vm, mut cpu) = machine(&code, Subject::Forced);
+    let mut handler = Recorder::default();
+    loop {
+        let run = cpu
+            .run_steps_with_devices(&vm, 100_000, StepOptions::default(), Some(&mut handler))
+            .unwrap();
+        match run.into_stop() {
+            StepStop::Exit(Exit::MmioWrite { .. }) => cpu.complete_mmio_write(),
+            StepStop::Exit(Exit::Hlt) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    let c = cpu.machine_jit_counters_for_test();
+    assert!(c.chained > 0, "{c:?}");
+    assert_eq!(handler.requests.len(), 60 * 4, "one call per transfer");
+}
+
+/// The imm32 of `add ecx, imm32` in [`chained_effects`]' sixth block, which a
+/// handler with effects rewrites.
+const PATCH_IMM: u32 = 0x1234_5678;
+
+/// Twelve blocks per iteration, chained (decision-31), with the device
+/// accesses past the chain's first block: block 2 reads `MMIO + 0x20` (INTR),
+/// block 3 reads the RAM the handler writes, block 4 writes `MMIO + 0x30`
+/// (RAM, and the code of block 5), block 5 adds the rewritten immediate, and
+/// block 6 reads `MMIO + 0x40` (DeviceFault). Instructions follow each access
+/// in its block. IF is set, so a raised INTR stops the run at a boundary.
+fn chained_effects(iterations: u32) -> Vec<u8> {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.sti().unwrap();
+    a.mov(ebp, iterations).unwrap();
+    a.set_label(&mut top).unwrap();
+    for block in 0..11u32 {
+        let mut next = a.create_label();
+        match block {
+            2 => {
+                a.mov(eax, dword_ptr(MMIO + 0x20)).unwrap();
+                a.add(ebx, eax).unwrap();
+                a.inc(edi).unwrap();
+            }
+            3 => {
+                a.add(edx, dword_ptr(DATA + 4)).unwrap();
+                a.xor(edx, dword_ptr(DATA + 8)).unwrap();
+            }
+            4 => {
+                a.mov(dword_ptr(MMIO + 0x30), ebx).unwrap();
+                a.add(ebx, edx).unwrap();
+            }
+            5 => a.add(ecx, PATCH_IMM).unwrap(),
+            6 => {
+                a.mov(eax, dword_ptr(MMIO + 0x40)).unwrap();
+                a.add(esi, eax).unwrap();
+                a.rol(esi, 3).unwrap();
+            }
+            _ => a.add(ecx, block).unwrap(),
+        }
+        a.jmp(next).unwrap();
+        a.set_label(&mut next).unwrap();
+    }
+    a.dec(ebp).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    a.assemble(0x1000).unwrap()
+}
+
+/// Where [`PATCH_IMM`] sits in `code`, assembled at 1000h.
+fn patch_address(code: &[u8]) -> u64 {
+    let imm = PATCH_IMM.to_le_bytes();
+    0x1000 + code.windows(4).position(|w| w == imm).unwrap() as u64
+}
+
+/// Decision-31 §4.4, §8 Devices: a handler that raises INTR, writes RAM
+/// (data, and code the chain runs through) or returns DeviceFault from
+/// block 2 to 6 of a chain leaves the same transcript, retired count,
+/// registers, RAM and exit as the interpreter, with chains on and off.
+#[test]
+fn device_effects_in_chained_blocks_equal_the_interpreter() {
+    let code = chained_effects(60);
+    let patch = patch_address(&code);
+    for subject in [
+        Subject::Forced,
+        Subject::ForcedChainOff,
+        Subject::Background,
+    ] {
+        for budget in [1, 2, 7, 13, 64, 100_000] {
+            lockstep_with(&code, subject, budget, || Recorder::with_effects(patch));
+        }
+    }
+    // The chain ran through the accesses, and every effect happened.
+    let (vm, mut cpu) = machine(&code, Subject::Forced);
+    let mut handler = Recorder::with_effects(patch);
+    let (mut intr, mut faults) = (0, 0);
+    loop {
+        let run = cpu
+            .run_steps_with_devices(&vm, 100_000, StepOptions::default(), Some(&mut handler))
+            .unwrap();
+        match run.into_stop() {
+            StepStop::Exit(Exit::Device(DeviceStop::IntrReady)) => {
+                intr += 1;
+                cpu.set_intr(false);
+            }
+            StepStop::Exit(Exit::Device(DeviceStop::Fault { .. })) => {
+                faults += 1;
+                assert!(cpu.complete_device_fault(0));
+            }
+            StepStop::Exit(Exit::Hlt) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    let c = cpu.machine_jit_counters_for_test();
+    assert!(c.chained > 0, "{c:?}");
+    assert_eq!(intr, 12, "every fifth of 60 INTR reads");
+    assert_eq!(faults, 15, "every fourth of 60 fault reads");
+    let mut imm = [0; 4];
+    vm.read_bytes(patch, &mut imm).unwrap();
+    assert_ne!(u32::from_le_bytes(imm), PATCH_IMM, "the code was rewritten");
 }

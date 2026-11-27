@@ -80,6 +80,12 @@ pub const RET_EXCEPTION_DETAIL: u64 = 14;
 pub const RET_HOST_FAULT_DETAIL: u64 = 15;
 /// Return prediction mismatch/underflow. RIP already holds the popped target;
 /// redispatch as RET_CONTINUE while accounting for an indirect resolve.
+///
+/// Machine profile (decision-31 Q4): a compiled Machine block also returns
+/// [`RET_CHAIN`], [`RET_LINK`] and `RET_RETURN_MISS`, each meaning that all of
+/// its instructions completed and RIP holds the successor. Its filled link
+/// slot holds a [`crate::code_lifetime::MachineTarget`] descriptor, which
+/// `MemCtx::next_entry` names on `RET_CHAIN`.
 pub const RET_RETURN_MISS: u64 = 16;
 /// Machine profile only (decision-29 §4): instructions `0..MemCtx::machine_ordinal`
 /// completed and RIP holds the start of the next one, of which nothing was
@@ -132,7 +138,8 @@ pub struct MemCtx {
     ///
     /// Machine profile (decision-30 §4): the vCPU's compiled view of its TLB
     /// ([`machine::MachineTlb`]), probed inline by compiled Machine loads and
-    /// stores, or zero. Machine code has no shadow return stack.
+    /// stores, or zero. Machine CALL and RET reach the vCPU's shadow return
+    /// ring inside it, at [`machine::RING_OFFSET`] (decision-31 §2.1).
     pub ret_stack: u64,
     /// Guest address the RAM buffer (`base`) represents at offset 0 (§4.1, identity
     /// mapping). `0` is the historical zero-based layout; non-zero means a guest

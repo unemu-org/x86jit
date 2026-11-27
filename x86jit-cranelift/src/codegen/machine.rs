@@ -7,6 +7,13 @@
 //! dispatch word set. The completed count goes to `MemCtx::machine_ordinal`,
 //! baked at the exit site; the dispatcher charges it. Loads and stores call
 //! the `jit_abi::machine` helpers, which run the interpreter's checked access.
+//!
+//! Decision-31 (J2b): every static exit chains. A JMP, Jcc, LOOP-family,
+//! direct CALL or fall-through exit loads its link slot and returns
+//! `RET_CHAIN` (filled) or `RET_LINK` (empty); a near CALL pushes the shadow
+//! return ring and a near RET predicts through it (`RET_RETURN_MISS` on a
+//! miss). Each of them means that the whole block completed and RIP holds
+//! the successor. Indirect exits return `RET_CONTINUE`.
 use super::*;
 use x86jit_core::jit_abi::machine as abi;
 use x86jit_core::jit_abi::MEMCTX_GUEST_BASE;
@@ -22,10 +29,12 @@ pub(crate) struct MachineLowering {
     stop: Variable,
     /// A store has been translated, so instruction starts test `stop`.
     stored: bool,
+    /// The block's last transfer (decision-31 §3).
+    exit: abi::MachineExit,
 }
 
 impl MachineLowering {
-    pub(crate) fn new(builder: &mut FunctionBuilder, config: u64) -> Self {
+    pub(crate) fn new(builder: &mut FunctionBuilder, config: u64, ir: &IrBlock) -> Self {
         let stop = builder.declare_var(types::I8);
         let clear = builder.ins().iconst(types::I8, 0);
         builder.def_var(stop, clear);
@@ -35,6 +44,7 @@ impl MachineLowering {
             started: false,
             stop,
             stored: false,
+            exit: abi::machine_exit(ir),
         }
     }
 }
@@ -314,21 +324,32 @@ impl Translator<'_, '_> {
                 self.builder.switch_to_block(tk);
                 let target = self.iconst(u64::from(*taken));
                 self.store_cpu(self.offsets.rip, target);
-                self.ret(RET_CONTINUE);
+                self.machine_chain();
                 self.builder.switch_to_block(fl);
                 let target = self.iconst(u64::from(*next));
                 self.store_cpu(self.offsets.rip, target);
-                self.ret(RET_CONTINUE);
+                self.machine_chain();
                 Some(true)
             }
             // A near transfer in a Flat32 context: the 32-bit target, whose CS
             // limit check cannot fail (`interp::legacy::target`). It ends the
-            // block; the dispatcher's turn follows its successor.
-            IrOp::Jump { target, .. } => {
-                let target = self.val(*target);
+            // block. A direct target chains (decision-31 §3); a near CALL
+            // pushes the return ring first, a near RET predicts through it,
+            // and any other indirect target returns to the dispatcher's turn.
+            IrOp::Jump { target: operand } => {
+                let target = self.val(*operand);
                 let target = self.builder.ins().band_imm_s(target, 0xffff_ffff);
                 self.store_cpu(self.offsets.rip, target);
-                self.ret(RET_CONTINUE);
+                let exit = self.machine.as_ref().unwrap().exit;
+                if let abi::MachineExit::Call(return_addr) = exit {
+                    let cont_slot = (self.alloc_slot)();
+                    self.emit_ret_push(return_addr, cont_slot);
+                }
+                match (operand, exit) {
+                    (Val::Imm(_), _) => self.machine_chain(),
+                    (_, abi::MachineExit::Return) => self.emit_ret_predict(target),
+                    _ => self.ret(RET_CONTINUE),
+                }
                 Some(true)
             }
             IrOp::Branch {
@@ -346,15 +367,22 @@ impl Translator<'_, '_> {
                 self.builder.switch_to_block(tk);
                 let target = self.iconst(*taken & 0xffff_ffff);
                 self.store_cpu(self.offsets.rip, target);
-                self.ret(RET_CONTINUE);
+                self.machine_chain();
                 self.builder.switch_to_block(fl);
                 let target = self.iconst(*fallthrough);
                 self.store_cpu(self.offsets.rip, target);
-                self.ret(RET_CONTINUE);
+                self.machine_chain();
                 Some(true)
             }
             _ => None,
         }
+    }
+
+    /// A static exit (decision-31 §2.1): RIP holds the target; chain through
+    /// a fresh link slot.
+    fn machine_chain(&mut self) {
+        let slot = (self.alloc_slot)();
+        self.chain_or_link(slot);
     }
 
     /// The J1 load: the checked helper, a defer when it refuses.

@@ -404,7 +404,7 @@ fn translate_block_for_target(
         machine: None,
     };
     if let Some(config) = machine {
-        t.machine = Some(machine::MachineLowering::new(&mut *t.builder, config));
+        t.machine = Some(machine::MachineLowering::new(&mut *t.builder, config, ir));
     }
 
     if helpers.mxcsr_mode != 0
@@ -443,7 +443,13 @@ fn translate_block_for_target(
         // Straight-line block with no control-flow terminator: flow on past it.
         let end = t.iconst(t.guest_end);
         t.store_cpu(offsets.rip, end);
-        t.ret(RET_CONTINUE);
+        if t.machine.is_some() {
+            // Decision-31 §3: a Machine fall-through chains to its static target.
+            let slot = (t.alloc_slot)();
+            t.chain_or_link(slot);
+        } else {
+            t.ret(RET_CONTINUE);
+        }
     }
     t.emit_alignment_tail();
     t.emit_exit_tails();
@@ -5552,10 +5558,7 @@ impl Translator<'_, '_> {
     /// by the caller.
     pub(crate) fn chain_or_link(&mut self, slot_addr: u64) {
         let slot = self.iconst(slot_addr);
-        let entry = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), slot, 0);
+        let entry = self.load_slot(slot);
         let chain = self.builder.create_block();
         let link = self.builder.create_block();
         self.builder.ins().brif(entry, chain, &[], link, &[]);
@@ -5614,14 +5617,37 @@ impl Translator<'_, '_> {
         self.ret(RET_IBTC_MISS);
     }
 
-    /// Load this vcpu's shadow return stack pointer from `MemCtx` (R5).
+    /// A link slot's value. A Machine slot holds a target descriptor that the
+    /// dispatcher reads after the return (decision-31 §2.1), so its load is an
+    /// acquire, pairing with the publisher's Release store.
+    fn load_slot(&mut self, slot: Value) -> Value {
+        if self.machine.is_some() {
+            self.builder
+                .ins()
+                .atomic_load(types::I64, MemFlagsData::trusted(), slot)
+        } else {
+            self.builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), slot, 0)
+        }
+    }
+
+    /// Load this vcpu's shadow return stack pointer from `MemCtx` (R5). A
+    /// Machine block's ring is inside its compiled TLB view (decision-31 §2.1).
     pub(crate) fn ret_stack_ptr(&mut self) -> Value {
-        self.builder.ins().load(
+        let rs = self.builder.ins().load(
             types::I64,
             MemFlagsData::trusted(),
             self.mem,
             MEMCTX_RET_STACK,
-        )
+        );
+        if self.machine.is_some() {
+            self.builder
+                .ins()
+                .iadd_imm_s(rs, x86jit_core::jit_abi::machine::RING_OFFSET)
+        } else {
+            rs
+        }
     }
 
     /// Byte address of ring frame `sp & (LEN-1)` given the ring base and a `sp`.
@@ -5707,10 +5733,7 @@ impl Translator<'_, '_> {
 
         // Prediction matched: chain through the continuation slot (fill it if cold).
         self.builder.switch_to_block(hit);
-        let slotval = self
-            .builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), cont_slot, 0);
+        let slotval = self.load_slot(cont_slot);
         let chain = self.builder.create_block();
         let link = self.builder.create_block();
         self.builder.ins().brif(slotval, chain, &[], link, &[]);

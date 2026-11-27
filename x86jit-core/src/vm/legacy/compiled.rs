@@ -3,9 +3,12 @@
 //! the interpreted walk of the same block returns. Admitted only by the
 //! test-only [`MachineJitMode`]; production runs never reach this module.
 use super::*;
+use crate::code_lifetime::MachineTarget;
 use crate::interp::legacy::machine_jit;
 use crate::interp::legacy::Progress;
-use crate::jit_abi::{MemCtx, RET_CONTINUE, RET_MACHINE_DEFER, RET_MACHINE_STOP};
+use crate::jit_abi::{
+    MemCtx, RET_CHAIN, RET_CONTINUE, RET_LINK, RET_MACHINE_DEFER, RET_MACHINE_STOP, RET_RETURN_MISS,
+};
 
 use crate::jit_abi::machine::HELPER_DEFER;
 
@@ -85,6 +88,158 @@ pub struct MachineJitCounters {
     pub refused: u64,
     /// Units retired: released blocks, a cleared map, a changed code lifetime.
     pub retired: u64,
+    /// Compiled-to-compiled transfers without a turn (decision-31).
+    pub chained: u64,
+    /// Why each compiled turn's last block was the last, indexed by the
+    /// `CHAIN_END_*` constants (decision-31 §8 done-when 1).
+    pub chain_ends: [u64; CHAIN_ENDS],
+}
+
+/// Chain-end reasons (decision-31 §8): the edge's budget test, the dispatch
+/// word, the execution epoch, the flags compare, an empty slot (`RET_LINK`),
+/// a return-ring miss, an unchained exit (`RET_CONTINUE`, or a `RET_CHAIN`
+/// with no chain started: chains off or the cold epilogue), DEFER, STOP.
+const CHAIN_END_BUDGET: usize = 0;
+const CHAIN_END_WORD: usize = 1;
+const CHAIN_END_EPOCH: usize = 2;
+const CHAIN_END_FLAGS: usize = 3;
+const CHAIN_END_EMPTY_SLOT: usize = 4;
+const CHAIN_END_RETURN_MISS: usize = 5;
+const CHAIN_END_UNCHAINED: usize = 6;
+const CHAIN_END_DEFER: usize = 7;
+const CHAIN_END_STOP: usize = 8;
+const CHAIN_ENDS: usize = 9;
+
+impl MachineJitCounters {
+    /// The names of [`Self::chain_ends`]' entries, in order.
+    pub const CHAIN_END_NAMES: [&'static str; CHAIN_ENDS] = [
+        "budget",
+        "word",
+        "epoch",
+        "flags",
+        "empty slot",
+        "return miss",
+        "unchained",
+        "defer",
+        "stop",
+    ];
+}
+
+/// The blocks a compiled turn completed before its last one (decision-31
+/// §2.3): the dispatcher charges `prefix` first, then handles the result as
+/// that of `ir`, the last block.
+pub(super) struct Chain {
+    pub(super) prefix: u64,
+    pub(super) ir: Arc<IrBlock>,
+}
+
+/// A slot a `RET_LINK` left to fill (decision-31 §2.4): published by the next
+/// compiled entry of this vCPU when nothing retired in between, its block
+/// starts at `target` under the same key flags, and `epoch` is still current.
+#[derive(Clone, Copy)]
+struct Fill {
+    slot: u64,
+    target: u64,
+    flags: u32,
+    epoch: u64,
+    retired: u64,
+}
+
+/// Whether compiled Machine blocks chain (decision-31 §8: the test-only
+/// chain-off switch, `Vm::set_machine_chains_for_test`).
+#[inline(always)]
+fn chains(vm: &Vm) -> bool {
+    #[cfg(any(test, feature = "test-hooks"))]
+    return !vm.machine_chain_off;
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    {
+        let _ = vm;
+        true
+    }
+}
+
+/// Test-only (decision-31 §8, chains broken mid-run): what to raise at a
+/// chosen chain edge, before the edge's tests.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainEdgeAction {
+    /// The host's exit request (`ExitRequest::request_exit`).
+    ExitRequest,
+    /// An NMI edge (`NmiLine::raise`).
+    NmiEdge,
+    /// A store by another vCPU into code at this bus address (its bytes
+    /// unchanged): `DISPATCH_DIRTY` in every vCPU's word.
+    CodeWrite(u64),
+    /// Every link slot cleared and the execution epoch advanced, as a
+    /// retirement does.
+    Retire,
+    /// The backend's code space ran out.
+    CodeSpaceExhausted,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    // (edges to pass first, the action, the retired count it was raised at).
+    static EDGE_HOOK: std::cell::Cell<(u64, Option<ChainEdgeAction>, Option<u64>)> =
+        const { std::cell::Cell::new((0, None, None)) };
+}
+
+impl Vcpu {
+    /// Test-only (decision-31 §8): raise `action` on this thread at the
+    /// `edge`-th chain edge from now (0: the next one), once.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn raise_at_chain_edge_for_test(edge: u64, action: ChainEdgeAction) {
+        EDGE_HOOK.with(|hook| hook.set((edge, Some(action), None)));
+    }
+
+    /// Test-only: the retired-instruction count at which the action of
+    /// [`Self::raise_at_chain_edge_for_test`] was raised, if it was.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn chain_edge_raised_at_for_test() -> Option<u64> {
+        EDGE_HOOK.with(|hook| hook.get().2)
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[cold]
+#[inline(never)]
+fn edge_hook(vm: &Vm, exit_word: &AtomicU64, retired: u64) {
+    EDGE_HOOK.with(|hook| {
+        let (edge, action, raised) = hook.get();
+        let Some(action) = action else {
+            return;
+        };
+        if edge != 0 {
+            hook.set((edge - 1, Some(action), raised));
+            return;
+        }
+        match action {
+            ChainEdgeAction::ExitRequest => {
+                exit_word.fetch_or(crate::vm::EXIT_REQUESTED, Ordering::Release);
+            }
+            ChainEdgeAction::NmiEdge => {
+                exit_word.fetch_or(crate::vm::NMI_EDGE, Ordering::Release);
+            }
+            ChainEdgeAction::CodeWrite(address) => vm.mem.note_write(address, 1),
+            ChainEdgeAction::Retire => vm.cache.code_lifetime().flush_predictions(),
+            ChainEdgeAction::CodeSpaceExhausted => {
+                exit_word.fetch_or(crate::vm::CODE_SPACE_EXHAUSTED, Ordering::Release);
+            }
+        }
+        hook.set((0, None, Some(retired)));
+    });
+}
+
+#[inline(always)]
+fn census(counters: &mut MachineJitCounters, reason: usize) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        counters.chain_ends[reason] += 1;
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = (counters, reason);
 }
 
 /// A compiled walk result (decision-30 §6): either `count` lowered
@@ -166,26 +321,33 @@ pub(super) struct State {
     pub(super) compiling: Option<Box<Compiling>>,
     lifetime: Option<Arc<crate::code_lifetime::CodeLifetime>>,
     participant: Option<crate::code_lifetime::ExecutionParticipant>,
-    pub(super) counters: MachineJitCounters,
 }
 
 /// The state only a run that compiles uses.
 pub(super) struct Compiling {
+    pub(super) counters: MachineJitCounters,
     memo: Box<[Option<Slot>]>,
     hot_pages: [HotPage; 16],
     /// The compiled view of the TLB (decision-30 §4), at a stable address
     /// for `MemCtx::ret_stack` (its Machine meaning), and the mapping its entries were filled from.
     pub(super) tlb: crate::jit_abi::machine::MachineTlb,
     mapping: Option<Arc<()>>,
+    fill: Option<Fill>,
+    /// The epoch the shadow return ring's continuation slots belong to: a new
+    /// epoch discards them (decision-31 §5), as Application's `fast_clear`.
+    ring_epoch: u64,
 }
 
 impl Default for Compiling {
     fn default() -> Self {
         Self {
+            counters: MachineJitCounters::default(),
             memo: (0..MEMO).map(|_| None).collect(),
             hot_pages: [HotPage::default(); 16],
             tlb: crate::jit_abi::machine::MachineTlb::default(),
             mapping: None,
+            fill: None,
+            ring_epoch: 0,
         }
     }
 }
@@ -240,6 +402,15 @@ impl Compiling {
 }
 
 impl State {
+    /// The counters of a run that compiles: its share exists.
+    pub(super) fn counters(&mut self) -> &mut MachineJitCounters {
+        &mut self
+            .compiling
+            .as_deref_mut()
+            .expect("compiled Machine counters outside a compiling run")
+            .counters
+    }
+
     /// A drained code write dropped compiled units while this vCPU ran the
     /// code page `page` (decision-27 §2.5).
     #[cold]
@@ -257,6 +428,8 @@ impl State {
         mapping: Arc<()>,
     ) {
         let compiling = self.compiling.get_or_insert_with(Box::default);
+        // A link is filled only in the run that left it (decision-31 §2.4).
+        compiling.fill = None;
         // Regions change only between runs (`Vm::map` takes `&mut Vm`).
         if compiling
             .mapping
@@ -274,6 +447,9 @@ impl State {
             return;
         }
         compiling.memo.iter_mut().for_each(|slot| *slot = None);
+        // Epoch numbers belong to a domain.
+        compiling.tlb.ring.sp = 0;
+        compiling.ring_epoch = 0;
         self.participant = Some(lifetime.participant());
         self.lifetime = Some(lifetime);
     }
@@ -319,8 +495,20 @@ fn machine_key(
     cpu: &CpuState,
     model_semantics_id: u64,
 ) -> crate::cache::MachineBlockKey {
+    crate::cache::MachineBlockKey {
+        physical_pc: physical,
+        decode_ip: ir.guest_start as u32,
+        model_semantics_id,
+        flags: key_flags(context, cpu),
+        mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
+    }
+}
+
+/// `MachineBlockKey::flags`: the context, A20 and CR0.AM.
+#[inline(always)]
+fn key_flags(context: MachineContext, cpu: &CpuState) -> u32 {
     let wide = |bits: u8| u32::from(bits == 32);
-    let flags = (context.regime as u32)
+    (context.regime as u32)
         | wide(context.default_operand_bits) << 2
         | wide(context.default_address_bits) << 3
         | wide(context.stack_address_bits) << 4
@@ -328,14 +516,31 @@ fn machine_key(
         | u32::from(context.cpl) << 9
         | u32::from(context.paging_enabled) << 11
         | u32::from(cpu.legacy.a20_enabled != 0) << 12
-        | u32::from(cpu.legacy.cr0 & (1 << 18) != 0) << 13;
-    crate::cache::MachineBlockKey {
-        physical_pc: physical,
-        decode_ip: ir.guest_start as u32,
-        model_semantics_id,
-        flags,
-        mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
-    }
+        | u32::from(cpu.legacy.cr0 & (1 << 18) != 0) << 13
+}
+
+/// Publish a `RET_LINK`'s slot with the unit this turn enters (decision-31
+/// §2.4): a descriptor, stored with Release under the lifetime's lock only
+/// while `fill.epoch` is current and `entry` live, so a slot that a
+/// retirement cleared is never refilled with a dead entry.
+#[cold]
+#[inline(never)]
+fn fill_slot(vm: &Vm, fill: Fill, entry: crate::CompiledPtr, ir: &Arc<IrBlock>) {
+    let target = MachineTarget {
+        entry,
+        ir: ir.clone(),
+        icount: ir.icount,
+        flags: fill.flags,
+    };
+    let slot = fill.slot as *const AtomicU64;
+    let _ = vm
+        .cache
+        .publish_machine_target_if_current(fill.epoch, entry, target, |target| {
+            // SAFETY: the slot belongs to a unit live in `fill.epoch`, which is
+            // current under the lifetime's lock: no retirement has cleared and
+            // released it.
+            unsafe { (*slot).store(target, Ordering::Release) };
+        });
 }
 
 /// The bytes a compiled unit of `ir` depends on: its bus span minus the live
@@ -408,7 +613,8 @@ impl Vcpu {
     pub fn machine_jit_counters_for_test(&self) -> MachineJitCounters {
         self.legacy_execution
             .as_ref()
-            .map_or_else(MachineJitCounters::default, |e| e.machine_jit.counters)
+            .and_then(|e| e.machine_jit.compiling.as_deref())
+            .map_or_else(MachineJitCounters::default, |c| c.counters)
     }
 
     /// Decision-29 §2: the walk result of this turn's block from a compiled
@@ -425,9 +631,16 @@ impl Vcpu {
         boundary: &MachineBoundary,
         ctx: &mut MemCtx,
         exit_word: &AtomicU64,
-    ) -> Option<Compiled> {
+        hook: Option<&crate::vm::device::InBlock>,
+    ) -> Option<(Compiled, Option<Chain>)> {
         let n = u64::from(ir.icount);
         let execution = self.legacy_execution.as_mut().unwrap();
+        // A pending fill is offered to this turn's entry only.
+        let fill = execution
+            .machine_jit
+            .compiling
+            .as_deref_mut()
+            .and_then(|state| state.fill.take());
         // E2: the admitted class. E3-E5: no boundary is due inside the block.
         // E6: no fetch policy. Decision-29 adds two: compiled code assumes the
         // default MXCSR mode and does not clear RF, which a retiring
@@ -451,7 +664,7 @@ impl Vcpu {
             && self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0
             && self.cpu.rflags_system & (1 << 16) == 0;
         if !eligible {
-            execution.machine_jit.counters.refused += 1;
+            execution.machine_jit.counters().refused += 1;
             return None;
         }
         let index = memo_index(ir);
@@ -482,9 +695,10 @@ impl Vcpu {
             slot.runs += 1;
             if let MachineJitMode::Scripted(seed) = vm.machine_jit {
                 let runs = slot.runs;
-                return Some(
-                    self.scripted::<ROUTED, ORDER>(vm, ir, remaining, seed, runs, exit_word),
-                );
+                let chain = chains(vm) && !boundary.cold_epilogue;
+                return Some(self.scripted::<ROUTED, ORDER>(
+                    vm, ir, context, remaining, seed, runs, exit_word, chain, hook,
+                ));
             }
         }
         let generation = execution.flat32.generation();
@@ -503,7 +717,7 @@ impl Vcpu {
         let State {
             compiling,
             participant,
-            counters,
+            lifetime,
             ..
         } = &mut *execution.machine_jit;
         let state = compiling.as_deref_mut().unwrap();
@@ -514,7 +728,15 @@ impl Vcpu {
         if cold {
             return None;
         }
-        let slot = state.memo[index].as_mut().unwrap();
+        let Compiling {
+            counters,
+            memo,
+            tlb,
+            ring_epoch,
+            fill: next_fill,
+            ..
+        } = state;
+        let slot = memo[index].as_mut().unwrap();
         // Participation precedes probing or calling any executable pointer
         // (`code_lifetime::ExecutionParticipant`); it lasts through the call.
         let guard = participant
@@ -578,32 +800,170 @@ impl Vcpu {
                 found
             }
         };
+        if let Some(fill) = fill {
+            if fill.retired == retired
+                && fill.target == ir.guest_start
+                && fill.flags == key_flags(context, &self.cpu)
+            {
+                fill_slot(vm, fill, entry, ir);
+            }
+        }
+        // Continuation slots pushed in an earlier epoch may name retired
+        // units (decision-31 §5).
+        if *ring_epoch != epoch {
+            tlb.ring.sp = 0;
+            *ring_epoch = epoch;
+        }
+        let lifetime = lifetime.as_deref().expect("a Machine run lifetime");
         // The hot path's counters exist for the witnesses only.
         #[cfg(any(test, feature = "test-hooks"))]
         {
             counters.entries += 1;
         }
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let _ = counters;
         ctx.machine_ordinal = 0;
         if vm.time_enabled {
             crate::time_stats::compiled();
         }
         // SAFETY: `entry` is a Machine unit compiled to this ABI and live in
         // the guard's epoch, which this vCPU announces until the call returns.
-        let code = unsafe { crate::jit_abi::call_block_in_mode(entry, &mut self.cpu, ctx) };
+        let mut code = unsafe { crate::jit_abi::call_block_in_mode(entry, &mut self.cpu, ctx) };
+        // Decision-31 §2.3: the chain loop. No chain starts under the cold
+        // epilogue (Q6). `cur` is the running block's target; `None` for the
+        // first block, which `ir` names.
+        let mut cur: Option<&MachineTarget> = None;
+        let mut prefix = 0u64;
+        let mut flags = None;
+        let chain = code == RET_CHAIN && !boundary.cold_epilogue && chains(vm);
+        if code == RET_CHAIN && !chain {
+            // No chain starts: the block's end is an unchained exit, which
+            // `machine_result` does not count for a `RET_CHAIN`.
+            census(counters, CHAIN_END_UNCHAINED);
+        }
+        if chain {
+            let chain_flags = key_flags(context, &self.cpu);
+            flags = Some(chain_flags);
+            loop {
+                let completed = cur.map_or(n, |t| u64::from(t.icount));
+                // SAFETY: a filled Machine slot holds a `MachineTarget`,
+                // published with Release and loaded with acquire; this vCPU
+                // has participated in `epoch` since before that load, so the
+                // descriptor is not reclaimed until the guard drops.
+                let t = unsafe { &*(ctx.next_entry as *const MachineTarget) };
+                let done = prefix + completed;
+                #[cfg(any(test, feature = "test-hooks"))]
+                edge_hook(vm, exit_word, retired + done);
+                // §4.3 the dispatch word, §5 the epoch, §2.5 the flags, §4.1
+                // the budget (E4 at every chained entry).
+                let end = if exit_word.load(Ordering::Relaxed) != 0 {
+                    Some(CHAIN_END_WORD)
+                } else if lifetime.epoch() != epoch {
+                    Some(CHAIN_END_EPOCH)
+                } else if t.flags != chain_flags {
+                    Some(CHAIN_END_FLAGS)
+                } else if remaining - done < u64::from(t.icount) {
+                    Some(CHAIN_END_BUDGET)
+                } else {
+                    None
+                };
+                if let Some(reason) = end {
+                    // A completion of `cur`, at RIP = t's start.
+                    census(counters, reason);
+                    break;
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                {
+                    counters.continues += 1;
+                    counters.compiled_retired += completed;
+                    counters.entries += 1;
+                    counters.chained += 1;
+                }
+                // §4.4: the in-block device hook follows the running block.
+                if let Some(hook) = hook {
+                    hook.advance(&t.ir, completed);
+                }
+                self.chained += 1;
+                prefix = done;
+                cur = Some(t);
+                ctx.machine_ordinal = 0;
+                // SAFETY: published only while live (`fill_slot`), and its
+                // retirement would have advanced the epoch the edge tested,
+                // which the guard pins against reclamation.
+                code = unsafe { crate::jit_abi::call_block_in_mode(t.entry, &mut self.cpu, ctx) };
+                if code != RET_CHAIN {
+                    break;
+                }
+            }
+        }
+        let last = cur.map(|t| t.ir.clone());
+        let n_last = cur.map_or(n, |t| u64::from(t.icount));
+        if code == RET_LINK {
+            *next_fill = Some(Fill {
+                slot: ctx.link_slot,
+                target: self.cpu.rip,
+                flags: flags.unwrap_or_else(|| key_flags(context, &self.cpu)),
+                epoch,
+                retired: retired + prefix + n_last,
+            });
+        }
         drop(guard);
         if vm.time_enabled {
             crate::time_stats::interpreted();
         }
         let ordinal = ctx.machine_ordinal;
-        let counters = &mut self.legacy_execution.as_mut().unwrap().machine_jit.counters;
-        Some(match code {
-            RET_CONTINUE => {
+        let Some(last) = last else {
+            return Some((
+                self.machine_result::<ROUTED, ORDER>(vm, ir, code, ordinal, remaining, exit_word),
+                None,
+            ));
+        };
+        // §4.4: a DEFER's suffix serves its transfers for the last block.
+        if let Some(hook) = hook {
+            hook.advance(&last, 0);
+        }
+        let result = self.machine_result::<ROUTED, ORDER>(
+            vm,
+            &last,
+            code,
+            ordinal,
+            remaining - prefix,
+            exit_word,
+        );
+        Some((result, Some(Chain { prefix, ir: last })))
+    }
+
+    /// A compiled block's return, for `ir`, the block that returned it, with
+    /// `remaining` its budget (decision-29 §3; decision-31 Q4: `RET_CHAIN`
+    /// that ends a chain, `RET_LINK` and `RET_RETURN_MISS` are completions).
+    fn machine_result<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        ir: &Arc<IrBlock>,
+        code: u64,
+        ordinal: u64,
+        remaining: u64,
+        exit_word: &AtomicU64,
+    ) -> Compiled {
+        let n = u64::from(ir.icount);
+        let counters = self
+            .legacy_execution
+            .as_mut()
+            .unwrap()
+            .machine_jit
+            .counters();
+        match code {
+            RET_CONTINUE | RET_CHAIN | RET_LINK | RET_RETURN_MISS => {
                 #[cfg(any(test, feature = "test-hooks"))]
                 {
                     counters.continues += 1;
                     counters.compiled_retired += n;
+                }
+                match code {
+                    RET_CONTINUE => census(counters, CHAIN_END_UNCHAINED),
+                    RET_LINK => census(counters, CHAIN_END_EMPTY_SLOT),
+                    RET_RETURN_MISS => census(counters, CHAIN_END_RETURN_MISS),
+                    // Counted at the edge that ended the chain, or as
+                    // unchained where no chain started (`machine_progress`).
+                    _ => {}
                 }
                 Compiled::Done {
                     count: n,
@@ -613,6 +973,7 @@ impl Vcpu {
             RET_MACHINE_STOP => {
                 counters.stops += 1;
                 counters.compiled_retired += ordinal;
+                census(counters, CHAIN_END_STOP);
                 debug_assert!(ordinal != 0 && ordinal < n, "a STOP inside its block");
                 Compiled::Done {
                     count: ordinal,
@@ -626,10 +987,11 @@ impl Vcpu {
                 } else {
                     counters.unconditional_defers += 1;
                 }
+                census(counters, CHAIN_END_DEFER);
                 Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word))
             }
             other => panic!("compiled Machine block returned invalid ABI code {other}"),
-        })
+        }
     }
 
     /// `RET_MACHINE_DEFER` at ordinal `c`: the interpreter walks the rest of
@@ -666,7 +1028,7 @@ impl Vcpu {
             &mut execution.task_switch,
             machine_jit::instruction_op(ir, c),
         );
-        let counters = &mut execution.machine_jit.counters;
+        let counters = execution.machine_jit.counters();
         counters.compiled_retired += c;
         counters.defers_at_zero += u64::from(c == 0);
         counters.suffix[machine_jit::suffix_kind(&suffix)] += 1;
@@ -679,8 +1041,98 @@ impl Vcpu {
 
     /// Mode 4: complete a scripted prefix on the interpreter, then return as a
     /// compiled unit would. Deferring or stopping is legal at any instruction
-    /// start, so every choice must equal the interpreted walk.
+    /// start, so every choice must equal the interpreted walk. A completed
+    /// block also ends with a seeded `RET_CHAIN` to the block the resolver
+    /// returns next, `RET_LINK` or `RET_CONTINUE` (decision-31 §8), so the
+    /// chain loop's half in the dispatcher meets every end reason after every
+    /// block, and DEFER and STOP at every ordinal of every chained block.
+    #[allow(clippy::too_many_arguments)]
     fn scripted<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        ir: &Arc<IrBlock>,
+        context: MachineContext,
+        remaining: u64,
+        seed: u64,
+        runs: u64,
+        exit_word: &AtomicU64,
+        chain: bool,
+        hook: Option<&crate::vm::device::InBlock>,
+    ) -> (Compiled, Option<Chain>) {
+        let flags = key_flags(context, &self.cpu);
+        let model = self.legacy_model.unwrap_or(LegacyCpuModel {
+            generation: CpuGeneration::I286,
+            model_semantics_id: 0,
+        });
+        // The running block, at a stable address the device hook may name.
+        let mut cur = ir.clone();
+        let mut prefix = 0u64;
+        loop {
+            let n = u64::from(cur.icount);
+            let (result, z) = self.scripted_block::<ROUTED, ORDER>(
+                vm,
+                &cur,
+                remaining - prefix,
+                seed,
+                runs.wrapping_add(prefix.wrapping_mul(0x1_0000_0001)),
+                exit_word,
+            );
+            let execution = self.legacy_execution.as_mut().unwrap();
+            let counters = execution.machine_jit.counters();
+            let complete = matches!(result, Compiled::Done { stop: false, .. });
+            let end = if !complete {
+                None
+            } else if !chain {
+                Some(CHAIN_END_UNCHAINED)
+            } else {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if (z >> 40) % 3 == 0 {
+                    edge_hook(vm, exit_word, self.retired + prefix + n);
+                }
+                match (z >> 40) % 3 {
+                    1 => Some(CHAIN_END_EMPTY_SLOT),
+                    2 => Some(CHAIN_END_UNCHAINED),
+                    _ if exit_word.load(Ordering::Relaxed) != 0 => Some(CHAIN_END_WORD),
+                    _ if key_flags(context, &self.cpu) != flags => Some(CHAIN_END_FLAGS),
+                    _ => None,
+                }
+            };
+            if let Some(reason) = end {
+                census(counters, reason);
+            }
+            if !complete || end.is_some() {
+                return (result, (prefix != 0).then_some(Chain { prefix, ir: cur }));
+            }
+            // The block the next turn would resolve here.
+            let next = if execution.context_id == u64::MAX {
+                None
+            } else {
+                execution
+                    .resolve::<MACHINE_DISPATCH>(vm, &self.cpu, model, context, exit_word)
+                    .ok()
+                    .filter(|(_, walk)| matches!(walk, BlockWalk::Direct))
+            };
+            let counters = execution.machine_jit.counters();
+            let Some((next, _)) = next else {
+                census(counters, CHAIN_END_UNCHAINED);
+                return (result, (prefix != 0).then_some(Chain { prefix, ir: cur }));
+            };
+            if remaining - prefix - n < u64::from(next.icount) {
+                census(counters, CHAIN_END_BUDGET);
+                return (result, (prefix != 0).then_some(Chain { prefix, ir: cur }));
+            }
+            counters.chained += 1;
+            self.chained += 1;
+            prefix += n;
+            cur = next;
+            if let Some(hook) = hook {
+                hook.advance(&cur, n);
+            }
+        }
+    }
+
+    /// One scripted block (mode 4), and the seeded draw it made.
+    fn scripted_block<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
         ir: &Arc<IrBlock>,
@@ -688,7 +1140,7 @@ impl Vcpu {
         seed: u64,
         runs: u64,
         exit_word: &AtomicU64,
-    ) -> Compiled {
+    ) -> (Compiled, u64) {
         let n = u64::from(ir.icount);
         // SplitMix64 over the seed, the block and its run count.
         let mut z = seed
@@ -700,7 +1152,7 @@ impl Vcpu {
         let c = z % (n + 1);
         let kind = (z >> 32) % 3;
         let execution = self.legacy_execution.as_mut().unwrap();
-        execution.machine_jit.counters.entries += 1;
+        execution.machine_jit.counters().entries += 1;
         let prefix = if c == 0 {
             machine_jit::completed(0)
         } else {
@@ -714,18 +1166,22 @@ impl Vcpu {
                 &mut execution.task_switch,
             )
         };
-        let counters = &mut execution.machine_jit.counters;
+        let counters = execution.machine_jit.counters();
         if !machine_jit::is_completed(&prefix, c) {
             // The interpreter itself ended the prefix: its result is the walk's.
-            return Compiled::Walk(prefix);
+            census(counters, CHAIN_END_UNCHAINED);
+            return (Compiled::Walk(prefix), z);
         }
         if c == n {
             counters.continues += 1;
             counters.compiled_retired += n;
-            return Compiled::Done {
-                count: n,
-                stop: false,
-            };
+            return (
+                Compiled::Done {
+                    count: n,
+                    stop: false,
+                },
+                z,
+            );
         }
         // A compiled store that leaves the dispatch word set stops the block
         // after its instruction (`jit_abi::machine::ACCESS_STOP`); a prefix
@@ -734,13 +1190,21 @@ impl Vcpu {
         if (kind == 0 || stop) && c != 0 {
             counters.stops += 1;
             counters.compiled_retired += c;
-            return Compiled::Done {
-                count: c,
-                stop: true,
-            };
+            census(counters, CHAIN_END_STOP);
+            return (
+                Compiled::Done {
+                    count: c,
+                    stop: true,
+                },
+                z,
+            );
         }
         counters.unconditional_defers += 1;
-        Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word))
+        census(counters, CHAIN_END_DEFER);
+        (
+            Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word)),
+            z,
+        )
     }
 }
 

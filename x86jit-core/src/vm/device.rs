@@ -1089,6 +1089,21 @@ impl InBlock {
         self.retired.set(cpu.retired);
         self.steps.set(steps);
     }
+    /// Decision-31 §4.4: a chained compiled block starts `completed`
+    /// instructions after the armed one, and the hook follows it: its
+    /// transfers report the positions the interpreter reports, and
+    /// `sole_access` reads the block that runs. `ir` must stay where it is
+    /// until the next `advance` or `disarm`. A hook the walk left unarmed
+    /// stays so.
+    #[inline(always)]
+    pub fn advance(&self, ir: &Arc<crate::ir::IrBlock>, completed: u64) {
+        if self.run.get().is_null() {
+            return;
+        }
+        self.ir.set(ir);
+        self.retired.set(self.retired.get() + completed);
+        self.steps.set(self.steps.get() + completed);
+    }
     #[inline(always)]
     pub fn disarm(&self) {
         self.run.set(std::ptr::null_mut());

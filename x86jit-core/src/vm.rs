@@ -26,7 +26,7 @@ pub use legacy::diag::{
 pub(crate) use legacy::live::absorb_at_store;
 pub(crate) use legacy::paging_generation;
 #[doc(hidden)]
-pub use legacy::{MachineJitCounters, MachineJitMode};
+pub use legacy::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
 mod nec;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{
@@ -733,6 +733,10 @@ pub struct Vm {
     /// Test-only admission of compiled Machine blocks (decision-29 §9); `Off`
     /// in every production build.
     pub(crate) machine_jit: legacy::MachineJitMode,
+    /// Test-only: compiled Machine blocks return to the turn after every
+    /// block (decision-31 §8, the chain-off reference).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) machine_chain_off: bool,
     /// Background tier-up: when true — and `tier_up_after` is `Some` with an
     /// async-capable backend — a hot block is compiled on the backend's worker thread
     /// and swapped in when ready, instead of compiling inline on the vcpu's critical
@@ -1188,6 +1192,14 @@ impl Vm {
         self.machine_jit = mode;
     }
 
+    /// Test-only (decision-31 §8): whether compiled Machine blocks chain to
+    /// each other, or return to the dispatcher's turn after every block.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_machine_chains_for_test(&mut self, on: bool) {
+        self.machine_chain_off = !on;
+    }
+
     /// Enable hotness-gated tier-up: interpret each block until it has run `n`
     /// times, then JIT-compile it. `None` restores eager compilation. Returns
     /// `self` for builder-style setup.
@@ -1472,6 +1484,8 @@ impl Vm {
             consistency: self.consistency,
             tier_up_after: self.tier_up_after,
             machine_jit: self.machine_jit,
+            #[cfg(any(test, feature = "test-hooks"))]
+            machine_chain_off: self.machine_chain_off,
             tier_up_background: self.tier_up_background,
             tier_up_region_after: self.tier_up_region_after,
             features: self.features,
@@ -1541,6 +1555,8 @@ impl Vm {
             consistency,
             tier_up_after: None,
             machine_jit: legacy::MachineJitMode::from_environment(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            machine_chain_off: false,
             tier_up_background: false,
             tier_up_region_after: None,
             features: crate::features::GuestCpuFeatures::default(),
@@ -2289,6 +2305,7 @@ pub struct Vcpu {
     /// same reason as `fast_hits`, and far more urgently: chaining is the engine's
     /// hottest event (~1M per frame in a real game vs ~5k indirect misses), so it
     /// must not touch a shared line. `run` flushes it into the shared counter.
+    /// Machine compiled-to-compiled transfers count here too (decision-31).
     chained: u64,
     /// Reused temps buffer for `interpret_block` — grows to the largest block's
     /// `temp_count`, avoiding a per-dispatch allocation. Real16 blocks define temps

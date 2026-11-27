@@ -145,3 +145,5 @@ x86jit-tests::legacy machine_j1_lockstep::background_compiled_stores_into_code_e
 x86jit-tests::legacy machine_j1_lockstep::every_lowered_family_runs_compiled
 x86jit-tests::legacy legacy_relift_diag::an_opcode_store_and_the_proof_bound_are_named
 x86jit-tests::threads bg_tier::shutdown_wait_idle_race_finishes_compiler_destruction
+x86jit-tests::legacy machine_j2b_chains::chained_blocks_equal_the_interpreter_at_every_call
+x86jit-tests::legacy machine_j2b_chains::vcpus_on_threads_share_slots_while_their_code_is_rewritten

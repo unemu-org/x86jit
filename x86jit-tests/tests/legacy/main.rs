@@ -65,3 +65,4 @@ mod legacy_x87_absent;
 mod legacy_x87_bcd;
 mod machine_j1_lockstep;
 mod machine_j2_devices;
+mod machine_j2b_chains;

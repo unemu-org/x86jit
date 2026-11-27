@@ -69,6 +69,38 @@ struct State {
     participants: Vec<Weak<AtomicU64>>,
     descriptors: Vec<Box<[u64; 2]>>,
     retired_descriptors: Vec<(u64, Box<[u64; 2]>)>,
+    // Allocated by the first Machine link-slot publication: a domain that
+    // never chains Machine code keeps its base layout and allocates nothing.
+    machine: Option<Box<MachineTargets>>,
+}
+
+impl State {
+    fn machine_retired(&self) -> bool {
+        self.machine
+            .as_ref()
+            .is_some_and(|machine| !machine.retired.is_empty())
+    }
+}
+
+/// Machine target descriptors: published, and retired awaiting grace.
+#[derive(Default)]
+#[allow(clippy::vec_box)] // Descriptor addresses are loaded by generated code.
+struct MachineTargets {
+    published: Vec<Box<MachineTarget>>,
+    retired: Vec<(u64, Box<MachineTarget>)>,
+}
+
+/// What a filled Machine link slot points to (decision-31 §2.2): the
+/// successor unit's entry, the block it was entered for, its instruction count
+/// and its key flags, which a chain edge reads after one dependent load.
+/// Immutable once published, and retired with the IBTC descriptors: when
+/// slots are cleared, then freed after execution grace.
+pub struct MachineTarget {
+    pub entry: CompiledPtr,
+    pub ir: Arc<crate::ir::IrBlock>,
+    pub icount: u32,
+    /// The successor's `MachineBlockKey::flags`.
+    pub flags: u32,
 }
 
 /// Shared by a backend and every cache publishing its units. No registry lock is
@@ -176,7 +208,11 @@ impl CodeLifetime {
         state
             .retired_descriptors
             .extend(state.descriptors.drain(..).map(|d| (epoch, d)));
-        if !state.retired_descriptors.is_empty() {
+        if let Some(machine) = &mut state.machine {
+            let MachineTargets { published, retired } = &mut **machine;
+            retired.extend(published.drain(..).map(|d| (epoch, d)));
+        }
+        if !state.retired_descriptors.is_empty() || state.machine_retired() {
             self.maintenance.notify_all();
         }
         state.slots.retain(|weak| {
@@ -349,14 +385,19 @@ impl CodeLifetime {
 
     pub fn has_pending_reclamation(&self) -> bool {
         let state = self.state.lock().unwrap();
-        !state.retired.is_empty() || !state.retired_descriptors.is_empty()
+        !state.retired.is_empty()
+            || !state.retired_descriptors.is_empty()
+            || state.machine_retired()
     }
 
     /// Park without polling while idle; pending grace periods are retried at
     /// `interval`. Retirement and shutdown notify under the same state mutex.
     pub fn wait_for_reclamation(&self, stop: &AtomicBool, interval: std::time::Duration) -> bool {
         let mut state = self.state.lock().unwrap();
-        while state.retired.is_empty() && state.retired_descriptors.is_empty() {
+        while state.retired.is_empty()
+            && state.retired_descriptors.is_empty()
+            && !state.machine_retired()
+        {
             if stop.load(Ordering::Acquire) {
                 return false;
             }
@@ -496,11 +537,54 @@ impl CodeLifetime {
         address
     }
 
-    /// Collect immutable descriptors only after slots were cleared and every
-    /// participant which could have loaded their pointers has left execution.
+    /// Publish a Machine link slot's target descriptor (decision-31 §2.2),
+    /// cold, as [`Self::alloc_ibtc_descriptor`]: owned by the execution
+    /// domain and retired with the IBTC descriptors. Under the registry lock,
+    /// and only while `epoch` is current and `entry` live, the descriptor is
+    /// registered and `store` runs with its address, which it must publish
+    /// with a `Release` store. A refused publication registers nothing: the
+    /// descriptor is dropped here, not kept until the next retirement.
+    pub(crate) fn publish_machine_target_if_current(
+        &self,
+        epoch: u64,
+        entry: CompiledPtr,
+        target: MachineTarget,
+        store: impl FnOnce(u64),
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if self.epoch() != epoch || !self.matches(&state, entry) {
+            return false;
+        }
+        let descriptor = Box::new(target);
+        let address = &*descriptor as *const MachineTarget as u64;
+        state
+            .machine
+            .get_or_insert_with(Box::default)
+            .published
+            .push(descriptor);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store(address)));
+        drop(state);
+        match result {
+            Ok(()) => true,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Machine target descriptors, published and awaiting grace.
+    pub fn machine_target_count(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |machine| machine.published.len() + machine.retired.len())
+    }
+
+    /// Collect immutable descriptors (IBTC and Machine targets) only after
+    /// slots were cleared and every participant which could have loaded their
+    /// pointers has left execution.
     pub fn collect_ibtc_descriptors(&self) {
         let mut state = self.state.lock().unwrap();
-        if state.retired_descriptors.is_empty() {
+        if state.retired_descriptors.is_empty() && !state.machine_retired() {
             return;
         }
         state.slots.retain(|slot| slot.strong_count() != 0);
@@ -514,6 +598,11 @@ impl CodeLifetime {
         state
             .retired_descriptors
             .retain(|(epoch, _)| oldest.is_some_and(|old| old <= *epoch));
+        if let Some(machine) = &mut state.machine {
+            machine
+                .retired
+                .retain(|(epoch, _)| oldest.is_some_and(|old| old <= *epoch));
+        }
     }
 
     pub fn ibtc_descriptor_count(&self) -> usize {

@@ -25,36 +25,38 @@ use x86jit_core::{
 };
 use x86jit_cranelift::JitBackend;
 
-const MODELS: [CpuModel; 2] = [CpuModel::I80386, CpuModel::I80486Dx];
-const SIZE: u64 = 0x120000;
-const MMIO: u64 = 0x9000;
-const ROM: u64 = 0xa000;
+pub(crate) const MODELS: [CpuModel; 2] = [CpuModel::I80386, CpuModel::I80486Dx];
+pub(crate) const SIZE: u64 = 0x120000;
+pub(crate) const MMIO: u64 = 0x9000;
+pub(crate) const ROM: u64 = 0xa000;
 /// All RAM and ROM: everything but the MMIO page.
-const SPANS: [(u64, u64); 3] = [(0, MMIO), (ROM, ROM + 0x1000), (ROM + 0x1000, SIZE)];
+pub(crate) const SPANS: [(u64, u64); 3] = [(0, MMIO), (ROM, ROM + 0x1000), (ROM + 0x1000, SIZE)];
 
 /// How the subject machine compiles: a test-only mode, or the production
 /// configuration of decision-30 §2 (hotness-gated background tier-up at T1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Subject {
+pub(crate) enum Subject {
     Mode(MachineJitMode),
     Background(u32),
 }
 
 #[derive(Clone, Copy, Default)]
-struct Setup {
-    a20_off: bool,
+pub(crate) struct Setup {
+    pub(crate) a20_off: bool,
     /// Sparse backing (`Vm::with_backend_sparse`): spec §4.1 keeps it on the
     /// checked interpreter, so no unit is ever entered.
-    sparse: bool,
+    pub(crate) sparse: bool,
     /// Watched data pages (`Vm::watch_range`): every compiled store then
     /// calls the store barrier, so the code-tag gate is tested without it.
-    watch: bool,
-    mxcsr_mode: bool,
-    rf: bool,
-    tf: bool,
+    pub(crate) watch: bool,
+    pub(crate) mxcsr_mode: bool,
+    pub(crate) rf: bool,
+    pub(crate) tf: bool,
+    /// Decision-31 §8: compiled blocks return to the turn after each block.
+    pub(crate) chain_off: bool,
 }
 
-fn machine(
+pub(crate) fn machine(
     backend: JitBackend,
     model: CpuModel,
     code: &[u8],
@@ -87,6 +89,9 @@ fn machine(
             vm.set_tier_up_after(Some(t1));
             vm.set_tier_up_background(true);
         }
+    }
+    if setup.chain_off {
+        vm.set_machine_chains_for_test(false);
     }
     // Stores the programs make into watched pages are reported in both tiers.
     if setup.watch {
@@ -145,13 +150,13 @@ fn machine(
 }
 
 /// The registers without the retry ledger's dead entries.
-fn live(cpu: &CpuState) -> String {
+pub(crate) fn live(cpu: &CpuState) -> String {
     let mut cpu = cpu.clone();
     cpu.mmio_parts[usize::from(cpu.mmio_parts_len)..].fill((0, 0));
     format!("{cpu:?}")
 }
 
-fn same_memory(avm: &Vm, bvm: &Vm, spans: &[(u64, u64)], what: &str) {
+pub(crate) fn same_memory(avm: &Vm, bvm: &Vm, spans: &[(u64, u64)], what: &str) {
     for &(start, end) in spans {
         let mut am = vec![0; (end - start) as usize];
         let mut bm = vec![0; (end - start) as usize];
@@ -171,13 +176,13 @@ fn same_memory(avm: &Vm, bvm: &Vm, spans: &[(u64, u64)], what: &str) {
     }
 }
 
-fn same(a: &Vcpu, b: &Vcpu, what: &str) {
+pub(crate) fn same(a: &Vcpu, b: &Vcpu, what: &str) {
     assert_eq!(live(&a.cpu), live(&b.cpu), "{what}");
     assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
 }
 
 /// Answer an exit identically on both machines; false when the run is over.
-fn answer(cpu: &mut Vcpu, stop: &StepStop) -> bool {
+pub(crate) fn answer(cpu: &mut Vcpu, stop: &StepStop) -> bool {
     match stop {
         StepStop::Exit(Exit::BudgetExhausted) => true,
         StepStop::Exit(Exit::MmioRead { addr, .. }) => {
@@ -211,7 +216,7 @@ fn lockstep(
     lockstep_subject(model, code, Subject::Mode(mode), setup, seed, budgets, what)
 }
 
-fn lockstep_subject(
+pub(crate) fn lockstep_subject(
     model: CpuModel,
     code: &[u8],
     subject: Subject,
@@ -254,7 +259,7 @@ fn lockstep_subject(
     a.machine_jit_counters_for_test()
 }
 
-fn asm(build: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
+pub(crate) fn asm(build: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
     let mut a = CodeAssembler::new(32).unwrap();
     build(&mut a);
     a.assemble(0x1000).unwrap()
@@ -747,7 +752,7 @@ fn programs(model: CpuModel) -> Vec<(String, Vec<u8>, Setup)> {
     out
 }
 
-fn add(total: &mut MachineJitCounters, c: MachineJitCounters) {
+pub(crate) fn add(total: &mut MachineJitCounters, c: MachineJitCounters) {
     total.compiled += c.compiled;
     total.entries += c.entries;
     total.compiled_retired += c.compiled_retired;
@@ -758,6 +763,10 @@ fn add(total: &mut MachineJitCounters, c: MachineJitCounters) {
     total.defers_at_zero += c.defers_at_zero;
     total.refused += c.refused;
     for (t, s) in total.suffix.iter_mut().zip(c.suffix) {
+        *t += s;
+    }
+    total.chained += c.chained;
+    for (t, s) in total.chain_ends.iter_mut().zip(c.chain_ends) {
         *t += s;
     }
 }
