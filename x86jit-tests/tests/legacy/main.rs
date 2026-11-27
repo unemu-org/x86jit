@@ -64,3 +64,4 @@ mod legacy_v86_round_trip;
 mod legacy_x87_absent;
 mod legacy_x87_bcd;
 mod machine_j1_lockstep;
+mod machine_j2_devices;

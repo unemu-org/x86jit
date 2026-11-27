@@ -121,6 +121,8 @@ pub struct Helpers {
     /// Decision-29: the Machine load and store helpers (`jit_abi::machine`).
     pub machine_load: Helper,
     pub machine_store: Helper,
+    /// Decision-30 §4: the Machine store barrier (`jit_abi::machine::machine_note`).
+    pub machine_note: Helper,
     pub cpuid: Helper,
     pub tsc: Helper,
     pub random: Helper,
@@ -236,6 +238,7 @@ impl Helpers {
             cas_pair: mk(),
             machine_load: mk(),
             machine_store: mk(),
+            machine_note: mk(),
             cpuid: mk(),
             tsc: mk(),
             random: mk(),

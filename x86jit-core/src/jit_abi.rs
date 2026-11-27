@@ -129,6 +129,10 @@ pub struct MemCtx {
     /// `ret`s pop and, on a matching prediction, chain straight to the caller's
     /// continuation. Never null: the dispatcher points it at the vcpu's ring, and
     /// `run_compiled` at a local scratch ring.
+    ///
+    /// Machine profile (decision-30 §4): the vCPU's compiled view of its TLB
+    /// ([`machine::MachineTlb`]), probed inline by compiled Machine loads and
+    /// stores, or zero. Machine code has no shadow return stack.
     pub ret_stack: u64,
     /// Guest address the RAM buffer (`base`) represents at offset 0 (§4.1, identity
     /// mapping). `0` is the historical zero-based layout; non-zero means a guest
@@ -232,7 +236,9 @@ pub struct MemCtx {
     /// `RET_MACHINE_DEFER` or `RET_MACHINE_STOP`, baked at the exit site. Unused by
     /// Application code. Appended: every earlier offset is unchanged.
     pub machine_ordinal: u64,
-    /// Out (Machine profile): the value a Machine load helper read.
+    /// Machine profile: in, the instruction IP a compiled block stores before
+    /// an access helper call (decision-30 §4, the in-block device path's
+    /// request); out, the value a Machine load helper read.
     pub machine_value: u64,
 }
 

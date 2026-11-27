@@ -9,6 +9,7 @@
 //! the `jit_abi::machine` helpers, which run the interpreter's checked access.
 use super::*;
 use x86jit_core::jit_abi::machine as abi;
+use x86jit_core::jit_abi::MEMCTX_GUEST_BASE;
 use x86jit_core::jit_abi::{MemCtx, RET_MACHINE_DEFER, RET_MACHINE_STOP};
 use x86jit_core::legacy::LegacyOp;
 
@@ -134,20 +135,11 @@ impl Translator<'_, '_> {
                 dst, addr, size, ..
             } => {
                 let addr = self.val(*addr);
-                let size = self.iconst(u64::from(*size));
-                let config = self.iconst(config);
-                let call = self.call_memory_helper(
-                    self.helpers.machine_load,
-                    &[self.cpu, self.mem, addr, size, config],
-                    Some(GuestAccessKind::Read),
-                );
-                let status = self.builder.inst_results(call)[0];
-                let deferred =
-                    self.builder
-                        .ins()
-                        .icmp_imm_s(IntCC::NotEqual, status, abi::ACCESS_DONE as i64);
-                self.machine_defer_if(deferred);
-                let value = self.load_mem(std::mem::offset_of!(MemCtx, machine_value) as i32);
+                let value = if config & abi::CONFIG_ROUTED == 0 {
+                    self.machine_inline_load(addr, *size, config)
+                } else {
+                    self.machine_helper_load(addr, *size, config)
+                };
                 self.set(*dst, value);
                 Some(false)
             }
@@ -156,23 +148,11 @@ impl Translator<'_, '_> {
             } => {
                 let addr = self.val(*addr);
                 let value = self.val(*src);
-                let size = self.iconst(u64::from(*size));
-                let config = self.iconst(config);
-                let call = self.call_memory_helper(
-                    self.helpers.machine_store,
-                    &[self.cpu, self.mem, addr, size, value, config],
-                    Some(GuestAccessKind::Write),
-                );
-                let status = self.builder.inst_results(call)[0];
-                let deferred =
-                    self.builder
-                        .ins()
-                        .icmp_imm_s(IntCC::Equal, status, abi::ACCESS_DEFER as i64);
-                self.machine_defer_if(deferred);
-                let stopped =
-                    self.builder
-                        .ins()
-                        .icmp_imm_s(IntCC::Equal, status, abi::ACCESS_STOP as i64);
+                let stopped = if config & abi::CONFIG_ROUTED == 0 {
+                    self.machine_inline_store(addr, value, *size, config)
+                } else {
+                    self.machine_helper_store(addr, value, *size, config)
+                };
                 let machine = self.machine.as_mut().unwrap();
                 machine.stored = true;
                 let stop = machine.stop;
@@ -195,6 +175,151 @@ impl Translator<'_, '_> {
                 self.machine_defer_if(deferred);
                 self.set(*dst, offset);
                 Some(false)
+            }
+            // A live instruction field (decision-30 §5): one load of its bytes
+            // from the bus address the fetch translated, where the op stands.
+            IrOp::Legacy(LegacyOp::LiveField {
+                dst,
+                bus,
+                bytes,
+                extend,
+            }) => {
+                let base = self.load_mem(MEMCTX_BASE);
+                let guest_base = self.load_mem(MEMCTX_GUEST_BASE);
+                let at = self.builder.ins().iadd_imm_s(base, *bus as i64);
+                let host = self.builder.ins().isub(at, guest_base);
+                let ty = int_ty(*bytes);
+                let raw = self
+                    .builder
+                    .ins()
+                    .load(ty, MemFlagsData::trusted(), host, 0);
+                let value = if *extend == 0 {
+                    self.builder.ins().uextend(types::I64, raw)
+                } else {
+                    let signed = self.builder.ins().sextend(types::I64, raw);
+                    if *extend >= 64 {
+                        signed
+                    } else {
+                        self.builder
+                            .ins()
+                            .band_imm_s(signed, ((1u64 << *extend) - 1) as i64)
+                    }
+                };
+                self.set(*dst, value);
+                Some(false)
+            }
+            // MOV r/m, Sreg: the selector, read live (decision-30 §3).
+            IrOp::Legacy(LegacyOp::ReadSelector { dst, segment }) => {
+                use x86jit_core::legacy::SegmentId;
+                let index = match segment {
+                    SegmentId::Es => 0,
+                    SegmentId::Cs => 1,
+                    SegmentId::Ss => 2,
+                    SegmentId::Ds => 3,
+                    SegmentId::Fs => 4,
+                    SegmentId::Gs => 5,
+                };
+                self.machine_selector(*dst, index);
+                Some(false)
+            }
+            IrOp::ReadSelector { dst, segment } => {
+                self.machine_selector(*dst, *segment);
+                Some(false)
+            }
+            IrOp::ReadReg { dst, reg } if reg.gpr_index().is_none() => {
+                let index = match reg {
+                    Reg::Es => 0,
+                    Reg::Cs => 1,
+                    Reg::Ss => 2,
+                    Reg::Ds => 3,
+                    _ => unreachable!("a lowered register read: {reg:?}"),
+                };
+                self.machine_selector(*dst, index);
+                Some(false)
+            }
+            // A checkpoint saves the interpreter's rollback image. The
+            // classifier admits an instruction holding one only when nothing
+            // that can defer follows its first commit (decision-30 §3).
+            IrOp::Legacy(LegacyOp::Checkpoint) => Some(false),
+            // DIV and IDIV: the shared helper; #DE defers, and the
+            // interpreter raises it (decision-30 §3).
+            IrOp::Div {
+                quot,
+                rem,
+                hi,
+                lo,
+                divisor,
+                size,
+                signed,
+            } => {
+                let (hi, lo, divisor) = (self.val(*hi), self.val(*lo), self.val(*divisor));
+                let width = self.iconst(u64::from(*size));
+                let signed = self.iconst(u64::from(*signed));
+                let (slot, call) =
+                    self.call_with_out_slot(self.helpers.div, &[hi, lo, divisor, width, signed]);
+                let fault = self.builder.inst_results(call)[0];
+                self.machine_defer_if(fault);
+                let q = self
+                    .builder
+                    .ins()
+                    .stack_load(types::I64, types::I64, slot, 0);
+                let r = self
+                    .builder
+                    .ins()
+                    .stack_load(types::I64, types::I64, slot, 8);
+                self.set(*quot, q);
+                self.set(*rem, r);
+                Some(false)
+            }
+            // LOOP, LOOPE, LOOPNE, JECXZ: the count and the branch, as the
+            // interpreter's `execute_loop`. The target cannot fault: CS's
+            // limit is 0xFFFFFFFF (SDM Vol 2A LOOP/LOOPcc p. 3-571).
+            IrOp::Legacy(LegacyOp::Loop {
+                kind,
+                count_bits,
+                taken,
+                next,
+                ..
+            }) => {
+                use x86jit_core::ir::LoopKind;
+                let width = *count_bits / 8;
+                let mask = if width == 2 { 0xffff } else { 0xffff_ffff };
+                let ecx = self.read_gpr(1);
+                let count = self.builder.ins().band_imm_s(ecx, mask);
+                let take = if matches!(kind, LoopKind::Jcxz) {
+                    self.builder.ins().icmp_imm_s(IntCC::Equal, count, 0)
+                } else {
+                    let less = self.builder.ins().iadd_imm_s(count, -1);
+                    let less = self.builder.ins().band_imm_s(less, mask);
+                    let more = self.builder.ins().icmp_imm_s(IntCC::NotEqual, less, 0);
+                    let take = match kind {
+                        LoopKind::Loope => {
+                            let zf = self.eval_cond(Cond::Eq);
+                            self.builder.ins().band(more, zf)
+                        }
+                        LoopKind::Loopne => {
+                            let nz = self.eval_cond(Cond::Ne);
+                            self.builder.ins().band(more, nz)
+                        }
+                        _ => more,
+                    };
+                    self.write_gpr(1, less, width);
+                    take
+                };
+                let tk = self.builder.create_block();
+                let fl = self.builder.create_block();
+                self.builder.ins().brif(take, tk, &[], fl, &[]);
+                self.builder.seal_block(tk);
+                self.builder.seal_block(fl);
+                self.builder.switch_to_block(tk);
+                let target = self.iconst(u64::from(*taken));
+                self.store_cpu(self.offsets.rip, target);
+                self.ret(RET_CONTINUE);
+                self.builder.switch_to_block(fl);
+                let target = self.iconst(u64::from(*next));
+                self.store_cpu(self.offsets.rip, target);
+                self.ret(RET_CONTINUE);
+                Some(true)
             }
             // A near transfer in a Flat32 context: the 32-bit target, whose CS
             // limit check cannot fail (`interp::legacy::target`). It ends the
@@ -230,5 +355,205 @@ impl Translator<'_, '_> {
             }
             _ => None,
         }
+    }
+
+    /// The J1 load: the checked helper, a defer when it refuses.
+    fn machine_helper_load(&mut self, addr: Value, size: u8, config: u64) -> Value {
+        let ip = self.iconst(self.cur_addr);
+        self.store_mem(std::mem::offset_of!(MemCtx, machine_value) as i32, ip);
+        let size = self.iconst(u64::from(size));
+        let config = self.iconst(config);
+        let call = self.call_memory_helper(
+            self.helpers.machine_load,
+            &[self.cpu, self.mem, addr, size, config],
+            Some(GuestAccessKind::Read),
+        );
+        let status = self.builder.inst_results(call)[0];
+        let deferred =
+            self.builder
+                .ins()
+                .icmp_imm_s(IntCC::NotEqual, status, abi::ACCESS_DONE as i64);
+        self.machine_defer_if(deferred);
+        self.load_mem(std::mem::offset_of!(MemCtx, machine_value) as i32)
+    }
+
+    /// The J1 store: the checked helper, a defer when it refuses. Returns an
+    /// I8 that is set when the helper reported `ACCESS_STOP`.
+    fn machine_helper_store(&mut self, addr: Value, value: Value, size: u8, config: u64) -> Value {
+        let ip = self.iconst(self.cur_addr);
+        self.store_mem(std::mem::offset_of!(MemCtx, machine_value) as i32, ip);
+        let size = self.iconst(u64::from(size));
+        let config = self.iconst(config);
+        let call = self.call_memory_helper(
+            self.helpers.machine_store,
+            &[self.cpu, self.mem, addr, size, value, config],
+            Some(GuestAccessKind::Write),
+        );
+        let status = self.builder.inst_results(call)[0];
+        let deferred =
+            self.builder
+                .ins()
+                .icmp_imm_s(IntCC::Equal, status, abi::ACCESS_DEFER as i64);
+        self.machine_defer_if(deferred);
+        self.builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, abi::ACCESS_STOP as i64)
+    }
+
+    /// Decision-30 §4: the slot of `addr`'s page in the vCPU's compiled TLB
+    /// view, and whether `tag_offset`'s tag names that page with the whole
+    /// `size`-byte access inside it.
+    fn machine_probe(&mut self, addr: Value, size: u8, tag_offset: i32) -> (Value, Value) {
+        let page = self.builder.ins().ushr_imm_s(addr, 12);
+        let index = self
+            .builder
+            .ins()
+            .band_imm_s(page, (abi::TLB_SLOTS - 1) as i64);
+        let offset = self.builder.ins().ishl_imm_s(index, abi::ENTRY_SHIFT);
+        let tlb = self.load_mem(std::mem::offset_of!(MemCtx, ret_stack) as i32);
+        let entry = self.builder.ins().iadd(tlb, offset);
+        let tag = self
+            .builder
+            .ins()
+            .uload32(MemFlagsData::trusted(), entry, tag_offset);
+        let want = self.builder.ins().iadd_imm_s(page, 1);
+        let hit = self.builder.ins().icmp(IntCC::Equal, tag, want);
+        let within = self.builder.ins().band_imm_s(addr, 0xfff);
+        let inside = self.builder.ins().icmp_imm_s(
+            IntCC::UnsignedLessThanOrEqual,
+            within,
+            0x1000 - i64::from(size),
+        );
+        let ok = self.builder.ins().band(hit, inside);
+        (entry, ok)
+    }
+
+    /// A load through the view, the helper on a miss or a page-crossing access.
+    fn machine_inline_load(&mut self, addr: Value, size: u8, config: u64) -> Value {
+        self.sync_guest_fault_state();
+        let (entry, ok) = self.machine_probe(addr, size, abi::ENTRY_READ_TAG);
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        self.builder.set_cold_block(slow);
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+        self.builder.switch_to_block(fast);
+        let addend = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            entry,
+            abi::ENTRY_ADDEND,
+        );
+        let host = self.builder.ins().iadd(addend, addr);
+        let value = self.load_guest(host, size);
+        self.builder.ins().jump(join, &[value.into()]);
+        self.builder.switch_to_block(slow);
+        let value = self.machine_helper_load(addr, size, config);
+        self.builder.ins().jump(join, &[value.into()]);
+        self.builder.seal_block(join);
+        self.builder.switch_to_block(join);
+        self.builder.block_params(join)[0]
+    }
+
+    /// A store through the view, then the store barrier: the frame's live
+    /// code-tag bit, or any watched page, calls `machine_note`, whose status
+    /// may stop the block after this instruction. The helper on a miss.
+    fn machine_inline_store(&mut self, addr: Value, value: Value, size: u8, config: u64) -> Value {
+        self.sync_guest_fault_state();
+        let (entry, ok) = self.machine_probe(addr, size, abi::ENTRY_WRITE_TAG);
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let note = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I8);
+        self.builder.set_cold_block(slow);
+        self.builder.set_cold_block(note);
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+        self.builder.seal_block(fast);
+        self.builder.seal_block(slow);
+        self.builder.switch_to_block(fast);
+        let addend = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            entry,
+            abi::ENTRY_ADDEND,
+        );
+        let host = self.builder.ins().iadd(addend, addr);
+        self.store_guest(host, value, size);
+        // Code tag: the frame's live bit, read after the store as the
+        // Application barrier reads its watermark.
+        let word_ptr = self.builder.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            entry,
+            abi::ENTRY_TAG_WORD,
+        );
+        let word = self
+            .builder
+            .ins()
+            .atomic_load(types::I64, MemFlagsData::trusted(), word_ptr);
+        let bit = self
+            .builder
+            .ins()
+            .uload32(MemFlagsData::trusted(), entry, abi::ENTRY_TAG_BIT);
+        let shifted = self.builder.ins().ushr(word, bit);
+        let code = self.builder.ins().band_imm_s(shifted, 1);
+        let watch_ptr = self.load_mem(MEMCTX_WATCH_COUNT_PTR);
+        let watched = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), watch_ptr, 0);
+        let either = self.builder.ins().bor(code, watched);
+        let clear = self.builder.ins().iconst(types::I8, 0);
+        self.builder
+            .ins()
+            .brif(either, note, &[], join, &[clear.into()]);
+        self.builder.seal_block(note);
+        self.builder.switch_to_block(note);
+        let frame = self
+            .builder
+            .ins()
+            .uload32(MemFlagsData::trusted(), entry, abi::ENTRY_FRAME);
+        let base = self.builder.ins().ishl_imm_s(frame, 12);
+        let within = self.builder.ins().band_imm_s(addr, 0xfff);
+        let physical = self.builder.ins().bor(base, within);
+        let width = self.iconst(u64::from(size));
+        let call = self.call_helper(
+            self.helpers.machine_note,
+            &[self.cpu, self.mem, physical, width],
+        );
+        let status = self.builder.inst_results(call)[0];
+        let stopped = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, status, abi::ACCESS_STOP as i64);
+        self.builder.ins().jump(join, &[stopped.into()]);
+        self.builder.switch_to_block(slow);
+        let stopped = self.machine_helper_store(addr, value, size, config);
+        self.builder.ins().jump(join, &[stopped.into()]);
+        self.builder.seal_block(join);
+        self.builder.switch_to_block(join);
+        self.builder.block_params(join)[0]
+    }
+
+    /// A selector register (ES, CS, SS, DS, FS, GS by `index`), read live.
+    fn machine_selector(&mut self, dst: u32, index: u8) {
+        use x86jit_core::CpuState;
+        let offset = match index {
+            0 => std::mem::offset_of!(CpuState, es),
+            1 => std::mem::offset_of!(CpuState, cs),
+            2 => std::mem::offset_of!(CpuState, ss),
+            3 => std::mem::offset_of!(CpuState, ds),
+            4 => std::mem::offset_of!(CpuState, fs),
+            _ => std::mem::offset_of!(CpuState, gs),
+        } as i32;
+        let value =
+            self.builder
+                .ins()
+                .uload16(types::I64, MemFlagsData::trusted(), self.cpu, offset);
+        self.set(dst, value);
     }
 }

@@ -3553,13 +3553,18 @@ impl Vcpu {
         } else {
             None
         };
-        if KIND == MACHINE_DISPATCH && vm.machine_jit != compiled::MachineJitMode::Off {
+        // Decision-30 §2: compiled Flat32 blocks, in production or under a
+        // test-only mode. Off, this costs two tests per run.
+        let machine_compile = KIND == MACHINE_DISPATCH
+            && (vm.tier_up_after.is_some() || vm.machine_jit != compiled::MachineJitMode::Off)
+            && compiled::compiles(vm);
+        if machine_compile {
             // Decision-29: compiled Machine units live in the VM's code lifetime.
             self.legacy_execution
                 .as_mut()
                 .unwrap()
                 .machine_jit
-                .begin_run(vm.cache.code_lifetime());
+                .begin_run(vm.cache.code_lifetime(), vm.mem.mapping_identity());
         }
         let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
         let mut shared_reason = origin;
@@ -3574,6 +3579,13 @@ impl Vcpu {
         if KIND == MACHINE_DISPATCH {
             // Compiled Machine stores test it (decision-29 §4, access helper).
             ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
+            if machine_compile {
+                // Decision-30 §4: compiled loads and stores probe the view
+                // (Machine code has no shadow return stack).
+                ctx.ret_stack =
+                    std::ptr::addr_of!(*self.legacy_execution.as_ref().unwrap().machine_jit.tlb)
+                        as u64;
+            }
         }
         if KIND == APPLICATION_DISPATCH {
             ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
@@ -3776,6 +3788,11 @@ impl Vcpu {
                         stop: StepStop::Exit(Exit::BudgetExhausted),
                     });
                 }
+                // `ctx.ret_stack` holds the compiled TLB view exactly when this
+                // run compiles (decision-30 §4), so the loop keeps no flag.
+                if KIND == MACHINE_DISPATCH && ctx.ret_stack != 0 && vm.cache.machine_inflight() {
+                    compiled::drain(vm, exit_word, &self.engine_sections);
+                }
                 if refresh_boundary {
                     boundary = self.machine_boundary::<SINGLE, KIND>(options);
                     // NEC V20/V30 8080 mode decides its boundary after the
@@ -3960,6 +3977,17 @@ impl Vcpu {
                 vm.handle_smc(exit_word);
                 let execution = self.legacy_execution.as_mut().unwrap();
                 if dropped.is_some_and(|before| before != vm.cache.invalidated_blocks()) {
+                    if KIND == MACHINE_DISPATCH && ctx.ret_stack != 0 && !direct {
+                        // Decision-27 §2.5: shared units dropped by a code write.
+                        // The page the compiled key names: a Flat32 EIP
+                        // through the bus mask (`compiled::machine_key`).
+                        let eip = self.cpu.rip & 0xffff_ffff;
+                        let fetched =
+                            crate::legacy::physical_span(&self.cpu, physical_mask, eip, 1).0;
+                        execution
+                            .machine_jit
+                            .note_code_drop(fetched >> crate::memory::CODE_PAGE_BITS, self.retired);
+                    }
                     if let Some(last) = execution.last_direct_fetch {
                         // This bounded page hint is only a lowering choice. Precise
                         // source invalidation and byte revalidation remain authoritative.
@@ -4132,14 +4160,60 @@ impl Vcpu {
                 // transfer helpers keep one out-of-line copy for both walks.
                 let hook = in_block.get();
                 // Decision-29: a compiled unit produces the walk's result.
-                let compiled = if KIND == MACHINE_DISPATCH
-                    && vm.machine_jit != compiled::MachineJitMode::Off
-                {
-                    self.machine_progress::<ROUTED, ORDER>(
+                let compiled = if KIND == MACHINE_DISPATCH && ctx.ret_stack != 0 {
+                    // Decision-30 §4: compiled accesses to devices served in
+                    // process take the in-block path, armed for this block.
+                    let armed = DEVICES
+                        && hook.is_some()
+                        && self
+                            .legacy_execution
+                            .as_ref()
+                            .unwrap()
+                            .event_retry
+                            .is_none();
+                    if armed {
+                        hook.unwrap().arm(devices, self, &ir, steps);
+                    }
+                    let compiled = self.machine_progress::<ROUTED, ORDER>(
                         vm, &ir, walk, context, remaining, &boundary, &mut ctx, exit_word,
-                    )
+                    );
+                    if armed {
+                        hook.unwrap().disarm();
+                    }
+                    compiled
                 } else {
                     None
+                };
+                // Decision-30 §6: a compiled block that completed its
+                // instructions with the default outcome takes the fast arm.
+                // It armed no shadow, changed no boundary input and left no
+                // retry (E3-E5), so the boundary stays valid for the next turn.
+                let compiled = match compiled {
+                    Some(compiled::Compiled::Done { count, stop }) if !boundary.cold_epilogue => {
+                        if DEVICES {
+                            devices.unit_start = crate::DevicePosition {
+                                retired_instructions: self.retired + count,
+                                steps: steps + count,
+                            };
+                            devices.instruction_ip = self.cpu.rip;
+                            devices.code_segment = self.cpu.cs;
+                        }
+                        steps += count;
+                        self.retired += count;
+                        self.executed += count;
+                        self.sti_shadow = false;
+                        self.ss_shadow = 0;
+                        refresh_boundary = false;
+                        link_from = linking && ir.link_exit && !stop;
+                        #[cfg(test)]
+                        self.note_link_exit(&ir);
+                        continue;
+                    }
+                    Some(compiled::Compiled::Done { count, stop }) => {
+                        Some((compiled::completed(count), stop))
+                    }
+                    Some(compiled::Compiled::Walk(progress)) => Some((progress, false)),
+                    None => None,
                 };
                 let compiled_stop = compiled.as_ref().is_some_and(|(_, stop)| *stop);
                 let progress = if let Some((progress, _)) = compiled {

@@ -492,3 +492,84 @@ the three interpreter cost probes in Off.
 - Revisit if the census puts the turn above 400 after §6 (J2b moves up), if conflict misses
   dominate memory workloads (resize or re-index the view), or if the embedder census shows that
   strings, x87 or port singletons dominate its compiled-class time (lower that family next).
+
+## Implementation notes (2026-11-27, proposed record diff)
+
+Recorded while implementing J2 (bead xj-to9.2). Items 1, 3 and 4 were reviewed by the
+supervisor; the rest await review. None changes an answered question.
+
+1. **Where a vCPU caches a unit (§2, §6).** The compiled entry, the hotness count and the
+   request state live in a per-vCPU direct-mapped memo of 256 slots keyed by the block a proof
+   or a link returns (`vm/legacy/compiled.rs`), not in `flat32::Proof` and `links::Link`. Both
+   paths return the same `Arc<IrBlock>`, so one memo serves both, and neither structure
+   changes. A conflict costs a recount and one cold lookup of the shared unit.
+2. **Machine units in the cache (Q10).** As accepted: `MachineBlockKey`, a Machine map
+   beside `map`, and a second `SourceIndex` instance (made generic over its key) with Machine
+   pending and suppression sets, under the one spans lock (`cache.rs`). Application's
+   `BlockKey`, hash stream and dispatch map are unchanged.
+3. **Test modes.** `Delayed(k)` keeps J1's meaning: a synchronous compile, entered k eligible
+   turns later. Real background publication is a separate witness mode: the production
+   configuration (`tier_up_after` + background) at T1 = 1, 3 and 50.
+4. **Device requests from compiled code.** `linear_address` stays `None` for unpaged
+   requests, which is what the exit path reports with paging off, so transcripts are equal
+   in both tiers. `sole_access` now accepts `Flat32Address` before the access, the Flat32
+   whole-operand check that faults before any call.
+5. **MemCtx.** No field is added: `MemCtx` stays 176 bytes and the frozen-offset test is
+   unchanged, as §8 said. The Machine meaning of two existing fields carries what §4 needed:
+   `ret_stack` holds the compiled TLB view (Machine code has no shadow return stack, and the
+   Machine dispatcher never set it), and `machine_value` (J1's helper output) also carries
+   the instruction IP a compiled block stores before an access helper call. A first cut
+   appended two fields (176 to 192 bytes). Every run of every dispatcher then initialised
+   16 more bytes, and the Machine loop kept two more live flags. Both showed in the
+   interpreter perf gate with compilation off. The code-tag word and bit are in the view's
+   entry. `FastEntry` is 32 bytes, pinned by `fast_entry_layout_matches_generated_code`.
+6. **Selectors.** The Flat32 lift reads CS/DS/ES/SS with `ReadReg` and FS/GS with
+   `IrOp::ReadSelector`. Both are lowered as live loads, besides `LegacyOp::ReadSelector`.
+7. **The block's bus address.** The dispatcher's per-turn fetch address is computed as
+   `(CS << 4) + EIP` on every path, the real-mode form. The links compare it consistently,
+   but it is not the Flat32 bus address. The compiled key and the unit's sources therefore
+   use the block's EIP through the bus mask and A20 (`compiled.rs`). The smc-page hint still
+   uses the dispatcher's form; that is cost only.
+8. **Demotion trigger.** A drop is counted when a turn's drain dropped shared units, for the
+   page of the EIP the vCPU then fetches from (the page the compiled key names, through the
+   bus mask). It approximates "a code write dropped a compiled unit of this page", and affects
+   cost only.
+9. **Counters.** The hot-path counters (entries, continues, compiled-retired) exist only in
+   test and test-hooks builds.
+10. **Admission (§2 items 2-3).** Sparse backing never compiles (spec §4.1, as Application
+    already enforces), nor does a backend whose code space is exhausted. This holds in the
+    Forced and Delayed test modes too; Scripted runs no generated code.
+11. **Retry.** A slot waiting for a unit asks again every threshold's turns as well as after a
+    publication, so a refused or rejected request does not stall it.
+12. **Interpreter cost with compilation off.** Every Machine check on the shared cache's
+    code-write paths (coverage, victims, unit tests, absorb, tag release) is behind one flag
+    that is set by the first Machine request, and its bodies are out of line. The Machine
+    map and spans are boxed, so the Application fields keep their layout. The Machine
+    dispatcher decides compilation once per run with two tests, and reads `ctx.ret_stack`
+    in place of a flag inside its loop.
+13. **The compiled-fallibility rule.** The lockstep's commit-before-fault programs (POP to
+    MMIO and ROM, LEAVE from MMIO, RCL and ADC on ROM) stay exact with the rule disabled.
+    The lifter defers flag writes past an instruction's store and writes ESP last, so no
+    lifted Flat32 instruction is known to reach the rule. A unit test witnesses it on the
+    shapes it refuses.
+
+**Turn census (§6 item 4), MEASURED.** `machine32_loops`, release, ARM64, host instructions
+per guest step (one process per cell):
+
+| Path | register | memory | callret |
+|---|---:|---:|---:|
+| interpreted | 421.6 | 563.2 | 1039.8 |
+| J1 forced (2816c7c2) | 176.8 | 284.8 | 1112.8 |
+| J2 forced (test-hooks) | 124.8 | 140.3 | 375.7 |
+| J2 background, T1 = 50 (production build) | 124.5 | 138.5 | 370.3 |
+| Compat32 JIT | 18.4 | 41.8 | 68.8 |
+
+A linked compiled turn cost about 790 host instructions in J1 and about 530 now. The CPU
+Profiler (34,000 samples, forced register loop) puts the remainder in the dispatcher's turn
+body (about 30 % of all samples), `machine_progress` (about 25 %: eligibility, memo,
+participation, call and merge), `follow_link` (about 12 %), the block's `Arc` reference taken
+by each linked turn (about 6 %), the SMC poll (about 5 %) and the generated code (about 8 %).
+No single item is larger than about a tenth of the turn. Keeping the previous turn's
+reference across turns to skip the `Arc` count measured no change. The turn stays above 400,
+so Q8's trigger for J2b holds: the remaining gap to done-when 2 (register ≤ 102, callret
+≤ 326) is per-turn overhead that only chaining removes. Memory is at 138, next to its gate.

@@ -10,6 +10,8 @@
 //! that spans two pages.
 #![cfg(unix)]
 
+#[path = "../support/machine_compile.rs"]
+mod machine_compile;
 use std::os::fd::{AsRawFd, FromRawFd};
 use x86jit_core::{
     CpuMode, CpuModel, Exit, Prot, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig,
@@ -137,11 +139,12 @@ fn views_vm(path: Path, views: &[u32], pairs: &[(usize, usize)]) -> Vm {
     let mut vm = x86jit_core::with_barrier_success(|| {
         Vm::with_backend_host_ram(
             VmConfig::reserved(LEN as u64),
-            Box::new(x86jit_core::InterpreterBackend),
+            machine_compile::backend(Box::new(x86jit_core::InterpreterBackend)),
             ram,
         )
     })
     .unwrap();
+    machine_compile::configure(&mut vm);
     match model(path) {
         Some(model) => vm.set_cpu_model(model),
         None => vm.set_cpu_mode(CpuMode::Real16),

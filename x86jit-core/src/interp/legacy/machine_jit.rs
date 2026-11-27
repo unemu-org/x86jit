@@ -4,20 +4,31 @@
 //! a compiled block deferred one.
 use super::*;
 
-/// An op a J1 compiled block lowers itself (decision-29 §4, condition 1). None
-/// of them sets an [`Outcome`] field in the interpreter (`plain_outcome`
-/// below, asserted in the walk), so an instruction made only of these ops
-/// completes with the default outcome in both tiers.
+/// An op a compiled Machine block lowers itself (decision-29 §4 condition 1,
+/// widened by decision-30 §3). None of them sets an [`Outcome`] field in the
+/// interpreter (`plain_outcome` below, asserted in the walk), so an
+/// instruction made only of these ops completes with the default outcome in
+/// both tiers.
 pub(crate) fn lowered_op(op: &IrOp) -> bool {
     let gpr = |reg: &crate::Reg| reg.gpr_slot().is_some();
     let width = |size: &u8| matches!(size, 1 | 2 | 4);
     match op {
-        IrOp::ReadReg { reg, .. } | IrOp::WriteReg { reg, .. } => gpr(reg),
+        IrOp::ReadReg { reg, .. } => {
+            gpr(reg)
+                || matches!(
+                    reg,
+                    crate::Reg::Cs | crate::Reg::Ds | crate::Reg::Es | crate::Reg::Ss
+                )
+        }
+        IrOp::WriteReg { reg, .. } => gpr(reg),
+        // MOV r/m, Sreg: the selector, read live (decision-30 §3).
+        IrOp::ReadSelector { .. } => true,
         IrOp::Load { size, .. } | IrOp::Store { size, .. } => width(size),
         // A 16-bit SHLD/SHRD count above 16 leaves the result undefined (SDM
         // Vol 2B SHRD, "Operation"); the shared lowering's answer differs from
         // the interpreter's, found by the J1 lockstep, so it stays interpreted.
         IrOp::DoubleShift { size, .. } => *size == 4,
+        IrOp::Div { size, .. } => width(size),
         IrOp::Add { .. }
         | IrOp::Adc { .. }
         | IrOp::Sub { .. }
@@ -44,30 +55,86 @@ pub(crate) fn lowered_op(op: &IrOp) -> bool {
         | IrOp::Sahf
         | IrOp::Jump { .. }
         | IrOp::Branch { .. } => true,
-        IrOp::Legacy(L::Flat32Address { .. }) => true,
+        IrOp::Legacy(
+            L::Flat32Address { .. }
+            | L::Checkpoint
+            | L::LiveField { .. }
+            | L::ReadSelector { .. }
+            | L::Loop { .. },
+        ) => true,
         _ => false,
     }
 }
 
-/// Whether a J1 compiled block completes this instruction itself, given its ops
-/// after the `InsnStart` marker (decision-29 §4): every op lowered, no
-/// `Checkpoint` (implied: it is not lowered), and at most one memory write with
-/// no fallible op after it. A deferred instruction has then committed nothing
-/// when the interpreter re-executes it.
+/// Whether a lowered op can end its instruction with a defer in compiled code
+/// (decision-30 §3): an access, the 4 GiB operand check, a divide error. A
+/// Flat32 jump, branch or loop cannot fail: its target is masked to the
+/// operand size and CS's limit is 0xFFFFFFFF.
+fn fallible(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::Load { .. }
+            | IrOp::Store { .. }
+            | IrOp::Div { .. }
+            | IrOp::Legacy(L::Flat32Address { .. })
+    )
+}
+
+/// Whether a lowered op changes architectural state: registers, flags,
+/// memory or RIP. The rest write temporaries only.
+fn commits(op: &IrOp) -> bool {
+    use crate::ir::FlagMask;
+    match op {
+        IrOp::ReadReg { .. }
+        | IrOp::ReadSelector { .. }
+        | IrOp::Load { .. }
+        | IrOp::Div { .. }
+        | IrOp::Sext { .. }
+        | IrOp::GetCond { .. }
+        | IrOp::Bswap { .. }
+        | IrOp::Legacy(
+            L::Flat32Address { .. } | L::Checkpoint | L::LiveField { .. } | L::ReadSelector { .. },
+        ) => false,
+        IrOp::Add { set_flags, .. }
+        | IrOp::Adc { set_flags, .. }
+        | IrOp::Sub { set_flags, .. }
+        | IrOp::Sbb { set_flags, .. }
+        | IrOp::And { set_flags, .. }
+        | IrOp::Or { set_flags, .. }
+        | IrOp::Xor { set_flags, .. }
+        | IrOp::Shl { set_flags, .. }
+        | IrOp::Shr { set_flags, .. }
+        | IrOp::Sar { set_flags, .. }
+        | IrOp::Rol { set_flags, .. }
+        | IrOp::Ror { set_flags, .. }
+        | IrOp::Rcl { set_flags, .. }
+        | IrOp::Rcr { set_flags, .. }
+        | IrOp::DoubleShift { set_flags, .. }
+        | IrOp::Mul { set_flags, .. } => *set_flags != FlagMask::NONE,
+        _ => true,
+    }
+}
+
+/// Whether a compiled block completes this instruction itself, given its ops
+/// after the `InsnStart` marker (decision-30 §3, the compiled-fallibility
+/// rule): every op lowered, no commit before an op that can defer, and at
+/// most one store. A deferred instruction has then committed nothing when
+/// the interpreter re-executes it, so its `Checkpoint`, if any, is not
+/// needed by the compiled code.
 pub(crate) fn lowered_instruction(ops: &[IrOp]) -> bool {
+    let mut committed = false;
     let mut stored = false;
     for op in ops {
-        if !lowered_op(op) {
+        if !lowered_op(op) || (committed && fallible(op)) {
             return false;
         }
-        let fallible = matches!(
-            op,
-            IrOp::Load { .. } | IrOp::Store { .. } | IrOp::Legacy(L::Flat32Address { .. })
-        );
-        if stored && fallible {
-            return false;
+        if matches!(op, IrOp::Store { .. }) {
+            if stored {
+                return false;
+            }
+            stored = true;
         }
-        stored |= matches!(op, IrOp::Store { .. });
+        committed |= commits(op);
     }
     true
 }
@@ -101,6 +168,7 @@ pub(crate) enum Access {
 /// exit, the retry ledger and the fault itself, and a deferred instruction
 /// has written nothing.
 ///
+/// `ip` is the instruction's own IP, which the in-block device path reports.
 /// The helper runs with `cpu.rip` at the block's start, not at the
 /// instruction: the walk's `read`/`write` key their MMIO retry ledger by RIP,
 /// so the entry contract (E5) guarantees there is no ledger to consult.
@@ -114,6 +182,7 @@ pub(crate) fn access(
     addr: u64,
     size: u8,
     store: Option<u64>,
+    ip: u64,
 ) -> Access {
     debug_assert!(
         !cpu.mmio_retry_active
@@ -130,6 +199,22 @@ pub(crate) fn access(
     };
     let (physical, part) = legacy::physical_span(cpu, mask, addr, size);
     if !ok(physical, part) {
+        // Decision-30 §4: a whole transfer to a device served in process
+        // completes here when the decision-28 in-block contract allows it;
+        // any other result stays in the run's ledger, and the defer's
+        // re-execution settles it without calling the handler again.
+        if part == size && !routed {
+            if let Some(value) = crate::vm::device::in_block_access(
+                std::ptr::null(),
+                ip,
+                store.is_some(),
+                physical,
+                size,
+                store.unwrap_or(0),
+            ) {
+                return Access::Done(value);
+            }
+        }
         return Access::Defer;
     }
     // A store in a VM with host-fault recovery could fault part-way through
@@ -246,5 +331,86 @@ pub(crate) fn suffix_kind(progress: &Progress) -> usize {
         Some(Err(Exit::MmioRead { .. } | Exit::MmioWrite { .. })) => 2,
         Some(Err(Exit::Exception { .. })) => 3,
         Some(Err(_)) => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{FlagMask, MemOrder, MemoryAccess, Val};
+
+    fn store() -> IrOp {
+        IrOp::Store {
+            fault: MemoryAccess::new(4, false, false),
+            addr: Val::Temp(0),
+            src: Val::Temp(1),
+            size: 4,
+            order: MemOrder::None,
+        }
+    }
+
+    fn load() -> IrOp {
+        IrOp::Load {
+            fault: MemoryAccess::new(4, false, false),
+            dst: 1,
+            addr: Val::Temp(0),
+            size: 4,
+        }
+    }
+
+    fn add(set_flags: FlagMask) -> IrOp {
+        IrOp::Add {
+            dst: 2,
+            a: Val::Temp(1),
+            b: Val::Imm(1),
+            size: 4,
+            set_flags,
+        }
+    }
+
+    fn write_eax() -> IrOp {
+        IrOp::WriteReg {
+            reg: crate::Reg::Rax,
+            src: Val::Temp(2),
+            size: 4,
+        }
+    }
+
+    /// Decision-30 §3, the compiled-fallibility rule, on the shapes it
+    /// refuses: a register or flag commit before an access, a second store.
+    /// The lockstep's commit-before-fault programs (POP to MMIO and ROM,
+    /// LEAVE from MMIO, RCL and ADC on ROM) lift without these shapes: the
+    /// lifter defers flag writes past an instruction's store and writes ESP
+    /// last. The rule keeps a lift that has one exact.
+    #[test]
+    fn a_commit_before_an_op_that_can_defer_stays_interpreted() {
+        assert!(lowered_instruction(&[
+            load(),
+            add(FlagMask::NONE),
+            store(),
+            write_eax()
+        ]));
+        assert!(lowered_instruction(&[
+            IrOp::Legacy(L::Checkpoint),
+            load(),
+            add(FlagMask::NONE),
+            store(),
+            write_eax(),
+        ]));
+        assert!(!lowered_instruction(&[write_eax(), store()]));
+        assert!(!lowered_instruction(&[write_eax(), load()]));
+        assert!(!lowered_instruction(&[load(), add(FlagMask::ALL), store()]));
+        assert!(!lowered_instruction(&[store(), load()]));
+        assert!(!lowered_instruction(&[store(), store()]));
+        assert!(!lowered_instruction(&[
+            IrOp::SetCf { value: Some(true) },
+            IrOp::Legacy(L::Flat32Address {
+                dst: 0,
+                segment: crate::legacy::SegmentId::Ds,
+                offset: Val::Imm(0),
+                bytes: 4,
+                access: crate::AccessKind::Read,
+            }),
+        ]));
     }
 }

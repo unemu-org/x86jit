@@ -71,8 +71,8 @@ CORE_SRC = "x86jit-core/src/"
 #   lib.rs, ir/verify.rs: declarations and public re-exports (legacy_probes is
 #     compiled for unit tests only).
 REVIEWED_ENTRY_POINTS = {
-    # Decision-29 (J1): the compiled Machine helpers and classifier, called only
-    # from Machine compiled blocks (test-only admission).
+    # Decisions 29-30 (J1, J2): the compiled Machine helpers and classifier,
+    # called only from compiled Machine blocks.
     "x86jit-core/src/jit_abi/machine.rs": {"interp::legacy::machine_jit"},
     # Decision-29 (J1): the Machine turn's compiled-unit path, reached only
     # from the Machine dispatcher.

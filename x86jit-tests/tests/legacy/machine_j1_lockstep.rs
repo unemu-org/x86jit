@@ -32,9 +32,23 @@ const ROM: u64 = 0xa000;
 /// All RAM and ROM: everything but the MMIO page.
 const SPANS: [(u64, u64); 3] = [(0, MMIO), (ROM, ROM + 0x1000), (ROM + 0x1000, SIZE)];
 
+/// How the subject machine compiles: a test-only mode, or the production
+/// configuration of decision-30 §2 (hotness-gated background tier-up at T1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Subject {
+    Mode(MachineJitMode),
+    Background(u32),
+}
+
 #[derive(Clone, Copy, Default)]
 struct Setup {
     a20_off: bool,
+    /// Sparse backing (`Vm::with_backend_sparse`): spec §4.1 keeps it on the
+    /// checked interpreter, so no unit is ever entered.
+    sparse: bool,
+    /// Watched data pages (`Vm::watch_range`): every compiled store then
+    /// calls the store barrier, so the code-tag gate is tested without it.
+    watch: bool,
     mxcsr_mode: bool,
     rf: bool,
     tf: bool,
@@ -44,11 +58,15 @@ fn machine(
     backend: JitBackend,
     model: CpuModel,
     code: &[u8],
-    mode: MachineJitMode,
+    subject: Subject,
     setup: Setup,
     seed: u64,
 ) -> (Vm, Vcpu) {
-    let mut vm = Vm::with_backend(VmConfig::flat(SIZE), Box::new(backend));
+    let mut vm = if setup.sparse {
+        Vm::with_backend_sparse(VmConfig::flat(SIZE), Box::new(backend)).unwrap()
+    } else {
+        Vm::with_backend(VmConfig::flat(SIZE), Box::new(backend))
+    };
     vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
         .unwrap();
     vm.map(MMIO, 0x1000, Prot::RW, RegionKind::Trap).unwrap();
@@ -62,7 +80,18 @@ fn machine(
     .unwrap();
     vm.set_cpu_model(model);
     vm.set_exception_delivery(ExceptionDelivery::Outward);
-    vm.set_machine_jit_for_test(mode);
+    match subject {
+        Subject::Mode(mode) => vm.set_machine_jit_for_test(mode),
+        Subject::Background(t1) => {
+            vm.set_machine_jit_for_test(MachineJitMode::Off);
+            vm.set_tier_up_after(Some(t1));
+            vm.set_tier_up_background(true);
+        }
+    }
+    // Stores the programs make into watched pages are reported in both tiers.
+    if setup.watch {
+        vm.watch_range(0x6000, 0x2000);
+    }
     let rom: Vec<u8> = (0..0x1000u32).map(|i| (i * 7 + 3) as u8).collect();
     vm.write_bytes(ROM, &rom).unwrap();
     vm.write_bytes(0x1000, code).unwrap();
@@ -179,15 +208,27 @@ fn lockstep(
     budgets: &mut dyn FnMut(usize) -> u64,
     what: &str,
 ) -> MachineJitCounters {
+    lockstep_subject(model, code, Subject::Mode(mode), setup, seed, budgets, what)
+}
+
+fn lockstep_subject(
+    model: CpuModel,
+    code: &[u8],
+    subject: Subject,
+    setup: Setup,
+    seed: u64,
+    budgets: &mut dyn FnMut(usize) -> u64,
+    what: &str,
+) -> MachineJitCounters {
     let (bvm, mut b) = machine(
         JitBackend::new(),
         model,
         code,
-        MachineJitMode::Off,
+        Subject::Mode(MachineJitMode::Off),
         setup,
         seed,
     );
-    let (avm, mut a) = machine(JitBackend::new(), model, code, mode, setup, seed);
+    let (avm, mut a) = machine(JitBackend::new(), model, code, subject, setup, seed);
     for call in 0..4000 {
         let budget = budgets(call);
         let ar = a.run_steps(&avm, budget, StepOptions::default()).unwrap();
@@ -197,6 +238,11 @@ fn lockstep(
         same(&a, &b, &at);
         // The pages the programs write, at each call; all RAM at the end.
         same_memory(&avm, &bvm, &[(0, MMIO), (0x100000, 0x101000)], &at);
+        assert_eq!(
+            avm.take_dirty_ranges(),
+            bvm.take_dirty_ranges(),
+            "{at}: watched ranges"
+        );
         let go = answer(&mut a, ar.stop());
         answer(&mut b, br.stop());
         same(&a, &b, &at);
@@ -369,6 +415,97 @@ fn families(model: CpuModel) -> Vec<(&'static str, Vec<u8>)> {
                 a.add(ecx, eax).unwrap();
             }),
         ),
+        // Decision-30 §3: near CALL and RET (direct, register- and
+        // memory-indirect, RET imm16), PUSH and POP with memory operands.
+        ("call-ret", {
+            let mut code = asm(|a| {
+                let mut top = a.create_label();
+                a.mov(ebp, 6u32).unwrap();
+                a.set_label(&mut top).unwrap();
+                a.mov(esi, 0x6000u32).unwrap();
+                a.mov(dword_ptr(esi + 0x40), 0x1810u32).unwrap();
+                a.call(0x1800u64).unwrap();
+                a.mov(ebx, 0x1810u32).unwrap();
+                a.call(ebx).unwrap();
+                a.call(dword_ptr(esi + 0x40)).unwrap();
+                a.push(eax).unwrap();
+                a.call(0x1820u64).unwrap();
+                a.push(dword_ptr(esi)).unwrap();
+                a.pop(dword_ptr(esi + 8)).unwrap();
+                a.push(0x1234u32).unwrap();
+                a.pop(ecx).unwrap();
+                a.dec(ebp).unwrap();
+                a.jne(top).unwrap();
+                a.hlt().unwrap();
+            });
+            code.resize(0x800, 0xf4);
+            // 1800h: inc eax; add ebx, eax; ret
+            code.extend(b"\x40\x01\xc3\xc3");
+            code.resize(0x810, 0xf4);
+            // 1810h: push ecx; inc ecx; pop ecx; ret
+            code.extend(b"\x51\x41\x59\xc3");
+            code.resize(0x820, 0xf4);
+            // 1820h: add eax, [esp+4]; ret 4
+            code.extend(b"\x03\x44\x24\x04\xc2\x04\x00");
+            code
+        }),
+        (
+            "loop",
+            looped(|a| {
+                let mut count = a.create_label();
+                let mut equal = a.create_label();
+                let mut skip = a.create_label();
+                a.mov(ecx, 5u32).unwrap();
+                a.set_label(&mut count).unwrap();
+                a.inc(eax).unwrap();
+                a.loop_(count).unwrap();
+                a.mov(ecx, 4u32).unwrap();
+                a.set_label(&mut equal).unwrap();
+                a.inc(edx).unwrap();
+                a.test(edx, 1).unwrap();
+                a.loopne(equal).unwrap();
+                a.mov(ecx, 3u32).unwrap();
+                a.cmp(eax, eax).unwrap();
+                a.loope(skip).unwrap();
+                a.set_label(&mut skip).unwrap();
+                a.xor(ecx, ecx).unwrap();
+                a.jecxz(skip).unwrap();
+            }),
+        ),
+        (
+            "divide",
+            looped(|a| {
+                a.xor(edx, edx).unwrap();
+                a.mov(ecx, ebx).unwrap();
+                a.or(ecx, 1).unwrap();
+                a.div(ecx).unwrap();
+                a.mov(eax, ebx).unwrap();
+                a.cdq().unwrap();
+                a.and(ecx, 0x7fff).unwrap();
+                a.or(ecx, 3).unwrap();
+                a.idiv(ecx).unwrap();
+                a.add(ebx, eax).unwrap();
+                a.mov(ax, 0x1234).unwrap();
+                a.mov(cl, 0x56).unwrap();
+                a.div(cl).unwrap();
+                a.mov(ax, 0x7654).unwrap();
+                a.cwd().unwrap();
+                a.mov(cx, 0x0103).unwrap();
+                a.idiv(cx).unwrap();
+                a.add(esi, eax).unwrap();
+                a.add(ebx, 0x1357_9bdf).unwrap();
+            }),
+        ),
+        (
+            "selector",
+            looped(|a| {
+                a.mov(ax, ds).unwrap();
+                a.mov(bx, ss).unwrap();
+                a.mov(cx, cs).unwrap();
+                a.mov(word_ptr(0x6010), es).unwrap();
+                a.add(edx, eax).unwrap();
+            }),
+        ),
         // Non-idempotent stores: a defer after a committed write repeats it.
         (
             "read-modify-write",
@@ -509,7 +646,102 @@ fn programs(model: CpuModel) -> Vec<(String, Vec<u8>, Setup)> {
             out.push((format!("{name}@{ordinal}"), code, plain));
         }
     }
+    // Decision-30 §3: instructions that commit before an op that can defer
+    // must stay interpreted. POP to MMIO or ROM writes ESP before its store;
+    // LEAVE writes ESP before it loads from an MMIO page; RCL and ADC on ROM
+    // read CF, so a repeated flag commit would show.
+    out.push((
+        "commit-before-fault".to_string(),
+        asm(|a| {
+            a.push(0x11u32).unwrap();
+            a.push(0x22u32).unwrap();
+            a.pop(dword_ptr(0x9010)).unwrap();
+            a.pop(dword_ptr(0xa010)).unwrap();
+            a.mov(ebp, 0x9020u32).unwrap();
+            a.leave().unwrap();
+            a.mov(esp, 0x8000u32).unwrap();
+            a.stc().unwrap();
+            a.rcl(dword_ptr(0xa020), 1).unwrap();
+            a.adc(dword_ptr(0xa024), 1).unwrap();
+            a.rcr(byte_ptr(0x9030), 1).unwrap();
+            a.adc(eax, ebx).unwrap();
+            a.hlt().unwrap();
+        }),
+        plain,
+    ));
+    // A near CALL whose push lands in MMIO, in ROM and in the code page.
+    out.push((
+        "call-push-devices".to_string(),
+        {
+            let mut code = asm(|a| {
+                a.mov(esp, 0x9100u32).unwrap();
+                a.call(0x1100u64).unwrap();
+                a.hlt().unwrap();
+            });
+            code.resize(0x100, 0xf4);
+            // 1100h: mov esp, A100h; call 1110h
+            code.extend(b"\xbc\x00\xa1\x00\x00\xe8\x06\x00\x00\x00");
+            code.resize(0x110, 0xf4);
+            // 1110h: mov esp, 1FF0h; call 1120h (the push writes the code page)
+            code.extend(b"\xbc\xf0\x1f\x00\x00\xe8\x06\x00\x00\x00");
+            code.resize(0x120, 0xf4);
+            // 1120h: mov esp, 8000h; inc eax; hlt
+            code.extend(b"\xbc\x00\x80\x00\x00\x40\xf4");
+            code
+        },
+        plain,
+    ));
+    // #SS from a push whose dword passes FFFFFFFFh; ESP 0 pushes legally.
+    for start in [0u32, 1, 2, 3] {
+        out.push((
+            format!("push-at-esp-{start}"),
+            asm(|a| {
+                a.inc(ebx).unwrap();
+                a.mov(esp, start).unwrap();
+                a.push(eax).unwrap();
+                a.inc(eax).unwrap();
+                a.hlt().unwrap();
+            }),
+            plain,
+        ));
+    }
+    // LOOP and JCXZ with a 16-bit count (address-size prefix): mov ecx,
+    // 10003h; L: inc eax; loop L (CX); jcxz +1 (CX); inc eax; inc ebx; hlt.
+    out.push((
+        "loop-count16".to_string(),
+        b"\xb9\x03\x00\x01\x00\x40\x67\xe2\xfc\x67\xe3\x01\x40\x43\xf4".to_vec(),
+        plain,
+    ));
+    // More data pages than the compiled TLB view has slots, twice.
+    out.push((
+        "many-pages".to_string(),
+        asm(|a| {
+            let mut outer = a.create_label();
+            let mut inner = a.create_label();
+            a.mov(edx, 2u32).unwrap();
+            a.set_label(&mut outer).unwrap();
+            a.mov(esi, 0x10000u32).unwrap();
+            a.mov(ecx, 270u32).unwrap();
+            a.set_label(&mut inner).unwrap();
+            a.add(eax, dword_ptr(esi + 8)).unwrap();
+            a.add(dword_ptr(esi + 12), eax).unwrap();
+            a.add(esi, 0x1000).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(inner).unwrap();
+            a.dec(edx).unwrap();
+            a.jne(outer).unwrap();
+            a.hlt().unwrap();
+        }),
+        plain,
+    ));
+    let watched = Setup {
+        watch: true,
+        ..plain
+    };
     for (name, code) in families(model) {
+        if matches!(name, "memory-widths" | "read-modify-write") {
+            out.push((format!("{name}-watched"), code.clone(), watched));
+        }
         out.push((name.to_string(), code, plain));
     }
     out
@@ -674,14 +906,13 @@ fn entry_refusals_keep_blocks_interpreted() {
     }
 }
 
-/// Decision-29 §8: compiled units are owned by their vCPU and retired when
-/// their block is released and when the vCPU is dropped. No unit outlives it.
+/// Decision-30 §2: compiled units belong to the VM's translation cache and
+/// code lifetime, shared by its vCPUs: a second vCPU running the same code
+/// compiles nothing, a dropped vCPU leaves them, a dropped VM retires them.
 #[test]
-fn compiled_units_are_retired_and_none_leaks() {
-    // 700 blocks of INC EAX; JMP $+2, then HLT: the proof map holds 64 at a
-    // time, so most blocks are released while the run goes on.
+fn compiled_units_are_shared_and_none_outlives_the_vm() {
     let chain = asm(|a| {
-        for _ in 0..700 {
+        for _ in 0..300 {
             let mut next = a.create_label();
             a.inc(eax).unwrap();
             a.jmp(next).unwrap();
@@ -689,32 +920,309 @@ fn compiled_units_are_retired_and_none_leaks() {
         }
         a.hlt().unwrap();
     });
-    let patching = programs(CpuModel::I80386)
-        .into_iter()
-        .find(|(name, ..)| name == "patch-other-block")
-        .unwrap()
-        .1;
-    for (code, released) in [(chain, true), (patching, false)] {
-        let backend = JitBackend::new();
-        let lifetime = backend.code_lifetime().unwrap();
-        let (vm, mut cpu) = machine(
-            backend,
+    let backend = JitBackend::new();
+    let lifetime = backend.code_lifetime().unwrap();
+    let (vm, mut cpu) = machine(
+        backend,
+        CpuModel::I80386,
+        &chain,
+        Subject::Mode(MachineJitMode::Forced),
+        Setup::default(),
+        1,
+    );
+    let template = cpu.cpu.clone();
+    let run = cpu.run_steps(&vm, 100_000, StepOptions::default()).unwrap();
+    assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)), "{run:?}");
+    let c = cpu.machine_jit_counters_for_test();
+    assert!(c.compiled >= 300, "{c:?}");
+    let live = lifetime.live_units().len();
+    assert!(live as u64 >= c.compiled, "{live} live: {c:?}");
+    drop(cpu);
+    assert_eq!(
+        lifetime.live_units().len(),
+        live,
+        "a dropped vCPU retired shared units"
+    );
+    let mut second = vm.new_vcpu();
+    second.cpu = template;
+    let run = second
+        .run_steps(&vm, 100_000, StepOptions::default())
+        .unwrap();
+    assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)), "{run:?}");
+    let c = second.machine_jit_counters_for_test();
+    assert_eq!(c.compiled, 0, "{c:?}");
+    assert!(c.entries >= 300, "{c:?}");
+    drop(second);
+    drop(vm);
+    assert_eq!(lifetime.live_units().len(), 0, "a unit outlived its VM");
+}
+
+/// Decision-30 §10: the production configuration, background compilation
+/// at T1 = 1 and 3, equals the interpreter at every call whatever the
+/// worker's timing, and enters compiled code.
+#[test]
+fn background_tier_up_equals_the_interpreter() {
+    for model in MODELS {
+        let mut entries = 0;
+        for (name, code, setup) in programs(model) {
+            for t1 in [1, 3] {
+                for constant in [1u64, 7, 64] {
+                    let what = format!("{name} {model:?} background t1={t1} budget={constant}");
+                    let c = lockstep_subject(
+                        model,
+                        &code,
+                        Subject::Background(t1),
+                        setup,
+                        3,
+                        &mut |_| constant,
+                        &what,
+                    );
+                    entries += c.entries;
+                }
+            }
+        }
+        // A loop long enough for the worker's publication to land mid-run.
+        let long = asm(|a| {
+            let mut top = a.create_label();
+            a.mov(edi, 2_000_000u32).unwrap();
+            a.mov(esi, 0x6000u32).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.inc(eax).unwrap();
+            a.add(dword_ptr(esi), eax).unwrap();
+            a.dec(edi).unwrap();
+            a.jne(top).unwrap();
+            a.hlt().unwrap();
+        });
+        let c = lockstep_subject(
+            model,
+            &long,
+            Subject::Background(50),
+            Setup::default(),
+            3,
+            &mut |_| 50_000,
+            "long background",
+        );
+        entries += c.entries;
+        assert!(
+            entries > 0,
+            "{model:?}: background compilation never entered"
+        );
+    }
+}
+
+/// Spec §4.1, decision-30 §2: sparse backing executes through the checked
+/// interpreter, even with a compiling backend, in every compile mode.
+#[test]
+fn sparse_backing_stays_interpreted() {
+    let (_, register, _) = programs(CpuModel::I80386).remove(0);
+    let sparse = Setup {
+        sparse: true,
+        ..Setup::default()
+    };
+    for subject in [
+        Subject::Mode(MachineJitMode::Forced),
+        Subject::Mode(MachineJitMode::Delayed(1)),
+        Subject::Background(1),
+    ] {
+        let c = lockstep_subject(
+            CpuModel::I80386,
+            &register,
+            subject,
+            sparse,
+            4,
+            &mut |_| 64,
+            "sparse",
+        );
+        assert_eq!(c.entries, 0, "{subject:?}: {c:?}");
+        assert_eq!(c.compiled, 0, "{subject:?}: {c:?}");
+    }
+}
+
+/// `mov edi, N; L: xor byte [5000h], 1; call 5000h; dec edi; jnz L; hlt`,
+/// with `5000h: inc eax (or inc ecx); ret`: every iteration rewrites the
+/// called block's opcode through a store in another page.
+fn patch_called(iterations: u32) -> Vec<u8> {
+    let mut code = asm(|a| {
+        let mut top = a.create_label();
+        a.mov(edi, iterations).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.xor(byte_ptr(0x5000), 1).unwrap();
+        a.call(0x5000u64).unwrap();
+        a.dec(edi).unwrap();
+        a.jne(top).unwrap();
+        a.hlt().unwrap();
+    });
+    code.resize(0x4000, 0xf4);
+    code.extend(b"\x40\xc3");
+    code
+}
+
+/// Decision-30 §4, §10: the production configuration's compiled stores
+/// find code pages through the inline code-tag bit. A long loop whose
+/// compiled store rewrites another block equals the interpreter at every
+/// call once the worker's publication has landed, and stops after the store.
+#[test]
+fn background_compiled_stores_into_code_equal_the_interpreter() {
+    for model in MODELS {
+        // Every attempt must equal the interpreter. A longer one follows only
+        // when the worker published too late for a compiled store to run:
+        // its timing is the host's, never the result's.
+        let mut c = MachineJitCounters::default();
+        for iterations in [100_000, 400_000, 1_600_000] {
+            c = lockstep_subject(
+                model,
+                &patch_called(iterations),
+                Subject::Background(20),
+                Setup::default(),
+                6,
+                &mut |_| 20_000,
+                "background patch",
+            );
+            if c.stops > 0 {
+                break;
+            }
+        }
+        assert!(c.entries > 0, "{model:?}: {c:?}");
+        assert!(c.stops > 0, "{model:?}: no compiled store stopped: {c:?}");
+    }
+}
+
+/// Decision-27 §2.5: a page whose code writes keep dropping compiled units
+/// stops compiling; its blocks run interpreted with the same results.
+#[test]
+fn a_page_whose_units_keep_dropping_is_demoted() {
+    // mov ebp, 60; L: xor byte [1040h], 1; call 1040h; dec ebp; jnz L; hlt
+    // ... 1040h: inc eax (or inc ecx); ret. Both blocks share one page.
+    let mut code = asm(|a| {
+        let mut top = a.create_label();
+        a.mov(ebp, 60u32).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.xor(byte_ptr(0x1040), 1).unwrap();
+        a.call(0x1040u64).unwrap();
+        a.dec(ebp).unwrap();
+        a.jne(top).unwrap();
+        a.hlt().unwrap();
+    });
+    code.resize(0x40, 0xf4);
+    code.extend(b"\x40\xc3");
+    let c = lockstep(
+        CpuModel::I80386,
+        &code,
+        MachineJitMode::Forced,
+        Setup::default(),
+        2,
+        &mut |_| 64,
+        "demotion",
+    );
+    assert!(c.entries > 0, "{c:?}");
+    assert!(c.compiled < 15, "the patched page kept compiling: {c:?}");
+}
+
+/// Decision-30 §4: a region change between runs empties the compiled TLB
+/// view: a page remapped from RAM to ROM discards the stores it then gets,
+/// and a region of the interpreter's only gets the same answers.
+#[test]
+fn a_remap_between_runs_empties_the_view() {
+    let code = asm(|a| {
+        let mut top = a.create_label();
+        a.mov(edi, 4000u32).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.add(dword_ptr(0xb000), 1).unwrap();
+        a.dec(edi).unwrap();
+        a.jne(top).unwrap();
+        a.hlt().unwrap();
+    });
+    let (mut avm, mut a) = machine(
+        JitBackend::new(),
+        CpuModel::I80386,
+        &code,
+        Subject::Mode(MachineJitMode::Forced),
+        Setup::default(),
+        1,
+    );
+    let (mut bvm, mut b) = machine(
+        JitBackend::new(),
+        CpuModel::I80386,
+        &code,
+        Subject::Mode(MachineJitMode::Off),
+        Setup::default(),
+        1,
+    );
+    for call in 0..200 {
+        if call == 20 {
+            // The RAM region above the ROM page becomes ROM, then RAM.
+            for vm in [&mut avm, &mut bvm] {
+                vm.unmap(ROM + 0x1000, (SIZE - ROM - 0x1000) as usize)
+                    .unwrap();
+                vm.map(0xb000, 0x1000, Prot::RX, RegionKind::Rom).unwrap();
+                vm.map(0xc000, (SIZE - 0xc000) as usize, Prot::RWX, RegionKind::Ram)
+                    .unwrap();
+            }
+        }
+        let ar = a.run_steps(&avm, 64, StepOptions::default()).unwrap();
+        let br = b.run_steps(&bvm, 64, StepOptions::default()).unwrap();
+        let at = format!("remap call {call}");
+        assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{at}");
+        same(&a, &b, &at);
+        same_memory(&avm, &bvm, &[(0, MMIO), (0xb000, 0xc000)], &at);
+        if matches!(ar.stop(), StepStop::Exit(Exit::Hlt)) {
+            break;
+        }
+    }
+    assert!(a.machine_jit_counters_for_test().entries > 0);
+}
+
+/// Decision-30 §10: a compiled store by one vCPU into code another vCPU runs
+/// compiled is seen at that vCPU's next turn (SDM Vol 3A §11.1.3 leaves the
+/// exact instruction model-specific): the looping vCPU reaches the HLT the
+/// store writes over its loop.
+#[test]
+fn a_compiled_store_from_another_vcpu_reaches_running_compiled_code() {
+    // 1000h: L: inc eax; jmp L. 7000h: mov byte [1000h], F4h; hlt.
+    let mut code = vec![0x40, 0xeb, 0xfd];
+    code.resize(0x6000, 0xf4);
+    code.extend(b"\xc6\x05\x00\x10\x00\x00\xf4\xf4");
+    for subject in [
+        Subject::Mode(MachineJitMode::Forced),
+        Subject::Background(10),
+    ] {
+        let (vm, mut looping) = machine(
+            JitBackend::new(),
             CpuModel::I80386,
             &code,
-            MachineJitMode::Forced,
+            subject,
             Setup::default(),
             1,
         );
-        let run = cpu.run_steps(&vm, 100_000, StepOptions::default()).unwrap();
-        assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)), "{run:?}");
-        let c = cpu.machine_jit_counters_for_test();
-        assert!(c.compiled > 0, "{c:?}");
-        assert!(!released || c.retired > 0, "{c:?}");
-        let live = lifetime.live_units().len() as u64;
-        assert_eq!(live, c.compiled - c.retired, "{c:?}");
-        assert!(live <= 512, "{live} live units: {c:?}");
-        drop(cpu);
-        assert_eq!(lifetime.live_units().len(), 0, "a unit outlived its vCPU");
-        drop(vm);
+        let mut patcher = vm.new_vcpu();
+        patcher.cpu = looping.cpu.clone();
+        patcher.cpu.rip = 0x7000;
+        let started = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !started.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let run = patcher.run_steps(&vm, 100, StepOptions::default()).unwrap();
+                assert!(matches!(run.stop(), StepStop::Exit(Exit::Hlt)), "{run:?}");
+            });
+            let mut stopped = false;
+            for _ in 0..100_000 {
+                let run = looping
+                    .run_steps(&vm, 100_000, StepOptions::default())
+                    .unwrap();
+                started.store(true, std::sync::atomic::Ordering::Release);
+                if matches!(run.stop(), StepStop::Exit(Exit::Hlt)) {
+                    stopped = true;
+                    break;
+                }
+            }
+            assert!(stopped, "{subject:?}: the patch was never seen");
+        });
+        assert!(
+            looping.machine_jit_counters_for_test().entries > 0,
+            "{subject:?}"
+        );
     }
 }

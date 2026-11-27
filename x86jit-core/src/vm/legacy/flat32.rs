@@ -87,6 +87,11 @@ pub(super) struct State {
 impl State {
     /// Advances whenever the map may drop or replace a proof, and with it
     /// its registration; successor links (`links.rs`) name it.
+    /// The proof generation the proofs were last reconciled to.
+    pub(super) fn generation(&self) -> u64 {
+        self.blocks.generation()
+    }
+
     pub(super) fn version(&self) -> u64 {
         self.blocks.version()
     }

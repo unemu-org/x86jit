@@ -4339,6 +4339,39 @@ impl Shared {
         consistency: MemConsistency,
         access_config: u64,
     ) -> Result<CompiledPtr, CompileError> {
+        self.compile_machine_with(
+            ir,
+            consistency,
+            access_config,
+            self.foreground_publication(),
+        )
+    }
+
+    /// Decision-30 §2: whether a background request carries Machine IR, and
+    /// the access configuration its helpers take. Only the unpaged Flat32
+    /// class is admitted; any other Machine IR fails deterministically.
+    fn machine_request_config(req: &TierUpRequest) -> Option<u64> {
+        let TierUpUnit::Block(ir) = &req.unit else {
+            return None;
+        };
+        let context = ir.legacy_context?;
+        let order = match req.consistency {
+            MemConsistency::Fast => 0,
+            MemConsistency::AcqRel => 1,
+            MemConsistency::FullTso => 2,
+        };
+        Some(x86jit_core::jit_abi::machine::request_config(
+            &context, order,
+        ))
+    }
+
+    fn compile_machine_with<T>(
+        &self,
+        ir: &IrBlock,
+        consistency: MemConsistency,
+        access_config: u64,
+        finish: impl FnOnce(&Self, &mut Jit, PendingCode) -> Publication<T>,
+    ) -> Result<T, CompileError> {
         if ir
             .legacy_context
             .is_none_or(|c| c.segment_class != x86jit_core::SegmentClass::Flat32)
@@ -4362,7 +4395,7 @@ impl Shared {
                     access_config,
                 )
             },
-            self.foreground_publication(),
+            finish,
         )
     }
 
@@ -4461,6 +4494,7 @@ impl Shared {
         let cas_pair_sig = params(6, true);
         let machine_load_sig = params(5, true); // (cpu, mem, addr, size, config) -> status
         let machine_store_sig = params(6, true); // (cpu, mem, addr, size, value, config) -> status
+        let machine_note_sig = params(4, true); // (cpu, mem, physical, size) -> status
         let str_sig = params(8, true); // string(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base) -> i64
         let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> status + private FDP policy
         let xstate_sig = params(6, true);
@@ -4648,6 +4682,11 @@ impl Shared {
                 machine_store: helper!(
                     machine_store_sig,
                     x86jit_core::jit_abi::machine::machine_store,
+                    NeedsDefault
+                ),
+                machine_note: helper!(
+                    machine_note_sig,
+                    x86jit_core::jit_abi::machine::machine_note,
                     NeedsDefault
                 ),
                 cpuid: helper!(cpuid_sig, cpuid_helper, IntegerOnly),
@@ -5086,6 +5125,11 @@ impl Shared {
             )));
         }
         let defer = |_: &Self, _: &mut Jit, code| Ok((code, None));
+        if let (Some(config), TierUpUnit::Block(ir)) =
+            (Self::machine_request_config(req), &req.unit)
+        {
+            return self.compile_machine_with(ir, req.consistency, config, defer);
+        }
         match &req.unit {
             TierUpUnit::Block(ir) => self.compile_block_with(
                 ir,
@@ -5351,6 +5395,10 @@ impl Default for JitBackend {
 }
 
 impl Backend for JitBackend {
+    fn compiles_machine(&self) -> bool {
+        true
+    }
+
     fn materialize_machine(
         &self,
         ir: &IrBlock,

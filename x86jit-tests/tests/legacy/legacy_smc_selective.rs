@@ -5,6 +5,8 @@
 //! bytes it changed (spec.md §10), on Flat32, Segmented and paged 32-bit code
 //! and in real mode, for every budget slicing. The unwritten blocks stay
 //! proved: the loop lifts a bounded number of blocks per iteration.
+#[path = "../support/machine_compile.rs"]
+mod machine_compile;
 use x86jit_core::{CpuModel, Exit, Prot, RegionKind, StepOptions, StepStop, Vcpu, Vm, VmConfig};
 
 const SIZE: u64 = 0x20000;
@@ -54,7 +56,11 @@ fn code(org: u64, bits: u32) -> Vec<u8> {
 }
 
 fn setup(path: Path, model: CpuModel) -> (Vm, Vcpu) {
-    let mut vm = Vm::new(VmConfig::flat(SIZE));
+    let mut vm = Vm::with_backend(
+        VmConfig::flat(SIZE),
+        machine_compile::backend(Box::new(x86jit_core::InterpreterBackend)),
+    );
+    machine_compile::configure(&mut vm);
     vm.set_cpu_model(model);
     vm.map(0, SIZE as usize, Prot::RWX, RegionKind::Ram)
         .unwrap();

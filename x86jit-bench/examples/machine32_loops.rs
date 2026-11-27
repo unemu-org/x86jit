@@ -47,7 +47,7 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 17] = [
+const PATHS: [&str; 18] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
@@ -67,6 +67,9 @@ const PATHS: [&str; 17] = [
     // Decision-29 (J1): compiled Machine blocks, test-only admission
     // (`--features test-hooks`); interpreted without it.
     "machine-protected32-jit",
+    // Decision-30 (J2): the production configuration, hotness-gated
+    // background tier-up at T1 = 50.
+    "machine-protected32-bg",
 ];
 const WORKS: [&str; 6] = [
     "register", "memory", "callret", "farseg", "farcall", "segmix",
@@ -129,6 +132,14 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         );
         #[cfg(feature = "test-hooks")]
         vm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Forced);
+        vm
+    } else if path == "machine-protected32-bg" {
+        let mut vm = Vm::with_backend(
+            VmConfig::flat(memory_size),
+            Box::new(JitBackend::with_opt_level(OptLevel::Speed)),
+        );
+        vm.set_tier_up_after(Some(50));
+        vm.set_tier_up_background(true);
         vm
     } else {
         Vm::new(VmConfig::flat(memory_size))

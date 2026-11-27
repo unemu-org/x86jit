@@ -105,6 +105,12 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.proofs.len()
     }
 
+    /// The proof generation the map last reconciled to: its proofs hold
+    /// every byte as of it (decision-27 §2.4).
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(super) fn version(&self) -> u64 {
         self.version
     }

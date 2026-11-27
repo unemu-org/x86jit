@@ -396,6 +396,15 @@ pub trait Backend: Send + Sync {
     /// its start, and loads and stores call the `jit_abi::machine` helpers with
     /// `access_config`. The unit is not published to the shared cache. The
     /// default declines, and the block stays interpreted.
+    /// Whether [`tier_up_async`](Backend::tier_up_async) accepts Machine IR
+    /// (decision-30 §2): a [`TierUpUnit::Block`] whose `legacy_context` is an
+    /// admitted compiled Machine class, compiled as a Machine block. The
+    /// default is `false`, so a backend that does not know Machine IR is never
+    /// handed it, and Machine code stays interpreted.
+    fn compiles_machine(&self) -> bool {
+        false
+    }
+
     #[doc(hidden)]
     fn materialize_machine(
         &self,

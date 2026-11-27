@@ -87,56 +87,168 @@ pub struct MachineJitCounters {
     pub retired: u64,
 }
 
-pub(super) struct Unit {
-    // Keeps the block's address from being reused while it names this unit.
-    _ir: Arc<IrBlock>,
+/// A compiled walk result (decision-30 §6): either `count` lowered
+/// instructions completed with the default outcome, which the dispatcher
+/// charges on its fast arm, or the walk result of a deferred suffix.
+pub(super) enum Compiled {
+    /// `RET_CONTINUE` (`stop` false, `count` the block's) or `RET_MACHINE_STOP`.
+    Done { count: u64, stop: bool },
+    /// A `RET_MACHINE_DEFER`, merged with the interpreted suffix, or the
+    /// interpreter's own result for a scripted prefix.
+    Walk(Progress),
+}
+
+/// The walk result of `count` completed compiled instructions.
+pub(super) fn completed(count: u64) -> Progress {
+    machine_jit::completed(count)
+}
+
+/// Where a block's compiled unit stands, for one vCPU.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// Not requested: counting toward the tier-up threshold.
+    None,
+    /// Requested or published elsewhere: look the unit up again when the
+    /// cache's Machine publication count moves past this value.
+    Waiting(u64),
+    /// The unit cannot be compiled (a deterministic failure, an unsupported
+    /// backend): the block stays interpreted while this slot lives.
+    Failed,
+}
+
+/// A block's compiled entry as this vCPU caches it: the slot a proof or a
+/// link reaches through the block it returns (decision-30 §2, §6).
+pub(super) struct Slot {
+    // Keeps the block's address from being reused while it names this slot.
+    ir: Arc<IrBlock>,
     entry: Option<(crate::CompiledPtr, u64)>,
-    failed: bool,
+    hot: u32,
+    request: Request,
     delay: u32,
     runs: u64,
 }
 
-/// The compiled Machine units of one vCPU (decision-29 §8, "J1 units are per
-/// vCPU"). Each unit is registered with the backend's code lifetime and owned
-/// here: it is retired when its block is gone, when the map is cleared, when
-/// the VM's code lifetime changes, and when the vCPU is dropped. Every call
-/// runs inside this vCPU's execution participation, so retired code is not
-/// reclaimed while it runs (spec §9.1; decision-17).
-#[derive(Default)]
+/// Slots of the per-vCPU memo: a direct-mapped table keyed by the block a
+/// proof or a link returned (decision-30 §6: no units lookup). A conflict
+/// only costs a recount and a cold lookup of the shared unit.
+const MEMO: usize = 256;
+
+#[inline(always)]
+fn memo_index(ir: &Arc<IrBlock>) -> usize {
+    let address = Arc::as_ptr(ir) as usize as u64;
+    (address.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - MEMO.trailing_zeros())) as usize
+}
+
+/// One vCPU's view of the shared compiled Machine units (decision-30 §2).
+/// The units belong to the VM's translation cache and its code lifetime; this
+/// state caches their entries and holds the vCPU's execution participation,
+/// entered around every call, so retired code is not reclaimed while it runs
+/// (spec §9.1; decision-17).
+/// A page where code writes dropped compiled units (decision-27 §2.5).
+#[derive(Clone, Copy, Default)]
+struct HotPage {
+    page: u64,
+    drops: u32,
+    first: u64,
+    last: u64,
+    demoted: bool,
+}
+
+/// Demotion window, in this vCPU's retired instructions: two drops within it
+/// stop compiling the page until it passes with no further drop. Retired
+/// instructions keep the policy deterministic; it affects cost only.
+const DEMOTION_WINDOW: u64 = 1 << 20;
+
 pub(super) struct State {
-    units: EngineMap<usize, Unit>,
+    memo: Box<[Option<Slot>]>,
+    hot_pages: [HotPage; 16],
+    /// The compiled view of the TLB (decision-30 §4), at a stable address
+    /// for `MemCtx::ret_stack` (its Machine meaning), and the mapping its entries were filled from.
+    pub(super) tlb: Box<crate::jit_abi::machine::MachineTlb>,
+    mapping: Option<Arc<()>>,
     lifetime: Option<Arc<crate::code_lifetime::CodeLifetime>>,
     participant: Option<crate::code_lifetime::ExecutionParticipant>,
-    inserted: u64,
     pub(super) counters: MachineJitCounters,
 }
 
-/// The map's bound and how often it drops the units of released blocks.
-const UNITS: usize = 512;
-const SWEEP: u64 = 64;
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            memo: (0..MEMO).map(|_| None).collect(),
+            hot_pages: [HotPage::default(); 16],
+            tlb: Box::default(),
+            mapping: None,
+            lifetime: None,
+            participant: None,
+            counters: MachineJitCounters::default(),
+        }
+    }
+}
 
 impl State {
-    /// Retire the units `keep` rejects, in one retirement.
-    fn retire_where(&mut self, keep: impl Fn(&Unit) -> bool) {
-        let mut retired = Vec::new();
-        self.units.retain(|_, unit| {
-            if keep(unit) {
-                return true;
-            }
-            if let Some((entry, _)) = unit.entry {
-                retired.push(crate::CachedBlock::Compiled { entry });
-            }
-            false
-        });
-        if let Some(lifetime) = &self.lifetime {
-            lifetime.discard_many(&retired);
+    /// A drained code write dropped compiled units while this vCPU ran the
+    /// code page `page` (decision-27 §2.5).
+    #[cold]
+    pub(super) fn note_code_drop(&mut self, page: u64, retired: u64) {
+        let index = self
+            .hot_pages
+            .iter()
+            .position(|p| p.drops != 0 && p.page == page)
+            .unwrap_or_else(|| {
+                (0..self.hot_pages.len())
+                    .min_by_key(|&i| (self.hot_pages[i].drops != 0, self.hot_pages[i].last))
+                    .unwrap()
+            });
+        let hot = &mut self.hot_pages[index];
+        if hot.drops == 0
+            || hot.page != page
+            || retired.saturating_sub(hot.first) >= DEMOTION_WINDOW
+        {
+            *hot = HotPage {
+                page,
+                drops: 0,
+                first: retired,
+                last: retired,
+                demoted: hot.page == page && hot.demoted,
+            };
         }
-        self.counters.retired += retired.len() as u64;
+        hot.drops += 1;
+        hot.last = retired;
+        hot.demoted |= hot.drops >= 2;
     }
 
-    /// At run entry: follow the VM's code lifetime, retiring every unit of a
-    /// previous one, and hold a participation in it.
-    pub(super) fn begin_run(&mut self, lifetime: Arc<crate::code_lifetime::CodeLifetime>) {
+    /// Whether `page` is demoted: it stays interpreted.
+    fn demoted(&mut self, page: u64, retired: u64) -> bool {
+        let Some(hot) = self
+            .hot_pages
+            .iter_mut()
+            .find(|p| p.demoted && p.page == page)
+        else {
+            return false;
+        };
+        if retired.saturating_sub(hot.last) < DEMOTION_WINDOW {
+            return true;
+        }
+        *hot = HotPage::default();
+        false
+    }
+
+    /// At run entry: follow the VM's code lifetime, forgetting every entry of
+    /// a previous one, and hold a participation in it.
+    pub(super) fn begin_run(
+        &mut self,
+        lifetime: Arc<crate::code_lifetime::CodeLifetime>,
+        mapping: Arc<()>,
+    ) {
+        // Regions change only between runs (`Vm::map` takes `&mut Vm`).
+        if self
+            .mapping
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &mapping))
+        {
+            self.tlb.flush();
+            self.mapping = Some(mapping);
+        }
         if self
             .lifetime
             .as_ref()
@@ -144,15 +256,131 @@ impl State {
         {
             return;
         }
-        self.retire_where(|_| false);
+        self.memo.iter_mut().for_each(|slot| *slot = None);
         self.participant = Some(lifetime.participant());
         self.lifetime = Some(lifetime);
     }
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        self.retire_where(|_| false);
+/// Whether a VM compiles its Flat32 blocks in production (decision-30 §2,
+/// items 1-3): hotness-gated background tier-up and [`admits`].
+pub(super) fn production(vm: &Vm) -> bool {
+    vm.tier_up_after.is_some() && vm.tier_up_background && admits(vm)
+}
+
+/// Whether this run of a Machine VM compiles: in production, or under a test
+/// mode. Scripted units run no generated code, so they need no admission.
+#[cold]
+#[inline(never)]
+pub(super) fn compiles(vm: &Vm) -> bool {
+    production(vm)
+        || match vm.machine_jit {
+            MachineJitMode::Off => false,
+            MachineJitMode::Scripted(_) => true,
+            _ => admits(vm),
+        }
+}
+
+/// Whether a VM may run compiled Machine code at all, in production or in
+/// a test mode: a backend that compiles Machine IR and has code space left,
+/// and memory that is neither sparse (spec §4.1: sparse backing executes
+/// through the checked interpreter, even with a JIT backend) nor recovering
+/// host faults (decision-30 Q7).
+pub(super) fn admits(vm: &Vm) -> bool {
+    !vm.mem.is_sparse()
+        && !vm.mem.host_fault_recovery()
+        && vm.backend.compiles_machine()
+        && !vm.backend.code_space_exhausted()
+}
+
+/// The compiled identity of a Flat32 block (decision-27 §1, decision-30 §2):
+/// everything its lift and lowering read besides its bytes.
+fn machine_key(
+    ir: &IrBlock,
+    physical: u64,
+    context: MachineContext,
+    cpu: &CpuState,
+    model_semantics_id: u64,
+) -> crate::cache::MachineBlockKey {
+    let wide = |bits: u8| u32::from(bits == 32);
+    let flags = (context.regime as u32)
+        | wide(context.default_operand_bits) << 2
+        | wide(context.default_address_bits) << 3
+        | wide(context.stack_address_bits) << 4
+        | (context.segment_class as u32) << 5
+        | u32::from(context.cpl) << 9
+        | u32::from(context.paging_enabled) << 11
+        | u32::from(cpu.legacy.a20_enabled != 0) << 12
+        | u32::from(cpu.legacy.cr0 & (1 << 18) != 0) << 13;
+    crate::cache::MachineBlockKey {
+        physical_pc: physical,
+        decode_ip: ir.guest_start as u32,
+        model_semantics_id,
+        flags,
+        mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
+    }
+}
+
+/// The bytes a compiled unit of `ir` depends on: its bus span minus the live
+/// fields it reads live (decision-27 §3.1), so a store absorbed by a field
+/// keeps the unit.
+fn unit_sources(ir: &IrBlock, physical: u64) -> Vec<(u64, u32)> {
+    let mut sources = vec![(physical, ir.guest_len)];
+    for op in &ir.ops {
+        if let IrOp::Legacy(crate::legacy::LegacyOp::LiveField { bus, bytes, .. }) = op {
+            let (lo, hi) = (*bus, *bus + u64::from(*bytes));
+            sources = sources
+                .into_iter()
+                .flat_map(|(start, len)| {
+                    let end = start + u64::from(len);
+                    if hi <= start || end <= lo {
+                        return vec![(start, len)];
+                    }
+                    let mut parts = Vec::new();
+                    if start < lo {
+                        parts.push((start, (lo - start) as u32));
+                    }
+                    if hi < end {
+                        parts.push((hi, (end - hi) as u32));
+                    }
+                    parts
+                })
+                .collect();
+        }
+    }
+    sources
+}
+
+/// Publish the Machine compiles the worker finished (decision-30 §2), at the
+/// top of a turn, as `drain_tier_up` does for Application.
+#[cold]
+#[inline(never)]
+pub(super) fn drain(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) {
+    use crate::interruption::{CriticalSectionKind, EngineSection};
+    let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::TierUpWait);
+    for fin in vm.backend.tier_up_finished() {
+        vm.handle_smc(exit_word);
+        vm.cache.record_tier_bg_completed();
+        let Some(key) = vm.cache.machine_request(fin.epoch) else {
+            super::super::discard_materialized(vm, &fin.block);
+            continue;
+        };
+        let _publish = EngineSection::enter(exit_word, sections, CriticalSectionKind::Publish);
+        let published = vm.cache.publish_machine(
+            key,
+            fin.block.clone(),
+            fin.compile_failure,
+            fin.epoch,
+            |sp| {
+                for &(start, len) in sp {
+                    vm.mem.mark_code(start, len);
+                }
+            },
+        );
+        if !published {
+            vm.cache.release_source_tags(&vm.mem, &fin.spans);
+            super::super::discard_materialized(vm, &fin.block);
+        }
     }
 }
 
@@ -167,8 +395,7 @@ impl Vcpu {
     }
 
     /// Decision-29 §2: the walk result of this turn's block from a compiled
-    /// unit, or `None` for the interpreted walk. The second value is a STOP,
-    /// whose turn must not link its successor.
+    /// unit, or `None` for the interpreted walk.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn machine_progress<const ROUTED: bool, const ORDER: u8>(
@@ -181,7 +408,7 @@ impl Vcpu {
         boundary: &MachineBoundary,
         ctx: &mut MemCtx,
         exit_word: &AtomicU64,
-    ) -> Option<(Progress, bool)> {
+    ) -> Option<Compiled> {
         let n = u64::from(ir.icount);
         let execution = self.legacy_execution.as_mut().unwrap();
         // E2: the admitted class. E3-E5: no boundary is due inside the block.
@@ -206,77 +433,140 @@ impl Vcpu {
             && vm.mem.fetch_policy.is_none()
             && self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0
             && self.cpu.rflags_system & (1 << 16) == 0;
-        let state = &mut execution.machine_jit;
         if !eligible {
-            state.counters.refused += 1;
+            execution.machine_jit.counters.refused += 1;
             return None;
         }
-        let key = Arc::as_ptr(ir) as usize;
-        if !state.units.contains_key(&key) {
-            state.inserted += 1;
-            if state.units.len() >= UNITS {
-                state.retire_where(|_| false);
-            } else if state.inserted.is_multiple_of(SWEEP) {
-                // A unit whose block only this map still holds is never
-                // resolved again: its proof and links are gone.
-                state.retire_where(|unit| Arc::strong_count(&unit._ir) > 1);
+        let index = memo_index(ir);
+        {
+            let state = &mut *execution.machine_jit;
+            state.tlb.reconcile(
+                self.cpu.legacy.a20_enabled != 0,
+                crate::legacy::physical_mask(context.generation),
+            );
+            if !state.memo[index]
+                .as_ref()
+                .is_some_and(|slot| Arc::ptr_eq(&slot.ir, ir))
+            {
+                state.memo[index] = Some(Slot {
+                    ir: ir.clone(),
+                    entry: None,
+                    hot: 0,
+                    request: Request::None,
+                    delay: match vm.machine_jit {
+                        MachineJitMode::Delayed(k) => k,
+                        _ => 0,
+                    },
+                    runs: 0,
+                });
+            }
+            let slot = state.memo[index].as_mut().unwrap();
+            slot.runs += 1;
+            if let MachineJitMode::Scripted(seed) = vm.machine_jit {
+                let runs = slot.runs;
+                return Some(
+                    self.scripted::<ROUTED, ORDER>(vm, ir, remaining, seed, runs, exit_word),
+                );
             }
         }
-        let delay = match vm.machine_jit {
-            MachineJitMode::Delayed(k) => k,
-            _ => 0,
+        let generation = execution.flat32.generation();
+        // The block's bus address: a Flat32 linear address is its EIP.
+        let physical = || {
+            crate::legacy::physical_span(
+                &self.cpu,
+                crate::legacy::physical_mask(context.generation),
+                ir.guest_start & 0xffff_ffff,
+                1,
+            )
+            .0
         };
-        let unit = state.units.entry(key).or_insert_with(|| Unit {
-            _ir: ir.clone(),
-            entry: None,
-            failed: false,
-            delay,
-            runs: 0,
-        });
-        unit.runs += 1;
-        let runs = unit.runs;
-        if let MachineJitMode::Scripted(seed) = vm.machine_jit {
-            return Some(self.scripted::<ROUTED, ORDER>(vm, ir, remaining, seed, runs, exit_word));
+        let model = self.legacy_model.map_or(0, |m| m.model_semantics_id);
+        let retired = self.retired;
+        let state = &mut *execution.machine_jit;
+        let cold = state.memo[index]
+            .as_ref()
+            .is_some_and(|slot| slot.entry.is_none() && slot.request == Request::None)
+            && state.demoted(physical() >> crate::memory::CODE_PAGE_BITS, retired);
+        if cold {
+            return None;
         }
+        let State {
+            memo,
+            participant,
+            counters,
+            ..
+        } = state;
+        let slot = memo[index].as_mut().unwrap();
         // Participation precedes probing or calling any executable pointer
         // (`code_lifetime::ExecutionParticipant`); it lasts through the call.
-        let mut participant = state.participant.take().expect("a Machine run participant");
-        let guard = participant.enter();
-        if let Some((entry, at)) = unit.entry {
-            if at != guard.epoch() {
-                // Another unit's retirement advanced the epoch; this one may
-                // still be live. A retired one is dropped, never called.
-                unit.entry = guard.admits(entry).then_some((entry, guard.epoch()));
-            }
-        }
-        if unit.entry.is_none() && !unit.failed {
-            let config = crate::jit_abi::machine::access_config(
-                crate::legacy::physical_mask(context.generation),
-                ROUTED,
-                ORDER,
-            );
-            match vm.backend.materialize_machine(ir, vm.consistency, config) {
-                // A unit compiled under an older epoch is checked as above
-                // at its next entry.
-                Some(entry) => {
-                    unit.entry = Some((entry, guard.epoch()));
-                    state.counters.compiled += 1;
+        let guard = participant
+            .as_mut()
+            .expect("a Machine run participant")
+            .enter();
+        let epoch = guard.epoch();
+        let entry = match slot.entry {
+            Some((entry, at)) if at == epoch => Some(entry),
+            Some((entry, _)) => {
+                // A unit's retirement advanced the epoch; this one may still
+                // be live. A retired one is dropped, never called.
+                let live = guard.admits(entry);
+                slot.entry = live.then_some((entry, epoch));
+                if !live {
+                    slot.request = Request::None;
                 }
-                None => unit.failed = true,
+                live.then_some(entry)
             }
-        }
-        let entry = match unit.entry {
-            Some((entry, at)) if at == guard.epoch() && unit.delay == 0 => entry,
-            _ => {
-                if unit.entry.is_some() && unit.delay != 0 {
-                    unit.delay -= 1;
-                }
-                drop(guard);
-                state.participant = Some(participant);
+            None => None,
+        };
+        let entry = match entry {
+            Some(entry) if slot.delay == 0 => entry,
+            Some(_) => {
+                slot.delay -= 1;
                 return None;
             }
+            None => {
+                let ready = match slot.request {
+                    Request::None => {
+                        slot.hot += 1;
+                        vm.machine_jit != MachineJitMode::Off
+                            || slot.hot >= vm.tier_up_after.unwrap_or(1)
+                    }
+                    // Look again after a publication, and retry a request
+                    // that was refused or rejected every threshold's turns.
+                    Request::Waiting(seen) => {
+                        slot.hot += 1;
+                        vm.cache.machine_published() != seen
+                            || slot.hot >= vm.tier_up_after.unwrap_or(1)
+                    }
+                    Request::Failed => false,
+                };
+                if !ready {
+                    return None;
+                }
+                let physical = physical();
+                let key = machine_key(ir, physical, context, &self.cpu, model);
+                let config = crate::jit_abi::machine::access_config(
+                    crate::legacy::physical_mask(context.generation),
+                    ROUTED,
+                    ORDER,
+                );
+                let (found, compiled) =
+                    tier_up(vm, ir, key, physical, generation, config, slot, exit_word)?;
+                counters.compiled += u64::from(compiled);
+                slot.entry = Some((found, epoch));
+                if slot.delay != 0 {
+                    return None;
+                }
+                found
+            }
         };
-        state.counters.entries += 1;
+        // The hot path's counters exist for the witnesses only.
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            counters.entries += 1;
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = counters;
         ctx.machine_ordinal = 0;
         if vm.time_enabled {
             crate::time_stats::compiled();
@@ -285,41 +575,40 @@ impl Vcpu {
         // the guard's epoch, which this vCPU announces until the call returns.
         let code = unsafe { crate::jit_abi::call_block_in_mode(entry, &mut self.cpu, ctx) };
         drop(guard);
-        self.legacy_execution
-            .as_mut()
-            .unwrap()
-            .machine_jit
-            .participant = Some(participant);
         if vm.time_enabled {
             crate::time_stats::interpreted();
         }
         let ordinal = ctx.machine_ordinal;
+        let counters = &mut self.legacy_execution.as_mut().unwrap().machine_jit.counters;
         Some(match code {
             RET_CONTINUE => {
-                let counters = &mut self.legacy_execution.as_mut().unwrap().machine_jit.counters;
-                counters.continues += 1;
-                counters.compiled_retired += n;
-                (machine_jit::completed(n), false)
+                #[cfg(any(test, feature = "test-hooks"))]
+                {
+                    counters.continues += 1;
+                    counters.compiled_retired += n;
+                }
+                Compiled::Done {
+                    count: n,
+                    stop: false,
+                }
             }
             RET_MACHINE_STOP => {
-                let counters = &mut self.legacy_execution.as_mut().unwrap().machine_jit.counters;
                 counters.stops += 1;
                 counters.compiled_retired += ordinal;
                 debug_assert!(ordinal != 0 && ordinal < n, "a STOP inside its block");
-                (machine_jit::completed(ordinal), true)
+                Compiled::Done {
+                    count: ordinal,
+                    stop: true,
+                }
             }
             RET_MACHINE_DEFER => {
                 let c = ordinal & !HELPER_DEFER;
-                let counters = &mut self.legacy_execution.as_mut().unwrap().machine_jit.counters;
                 if ordinal & HELPER_DEFER != 0 {
                     counters.helper_defers += 1;
                 } else {
                     counters.unconditional_defers += 1;
                 }
-                (
-                    self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word),
-                    false,
-                )
+                Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word))
             }
             other => panic!("compiled Machine block returned invalid ABI code {other}"),
         })
@@ -344,6 +633,10 @@ impl Vcpu {
             },
             "a DEFER leaves RIP at its instruction"
         );
+        // A device transfer the suffix serves in its pass is counted from c.
+        if c != 0 {
+            crate::vm::device::advance_armed(c);
+        }
         let execution = self.legacy_execution.as_mut().unwrap();
         let suffix = machine_jit::execute_suffix::<ROUTED, ORDER>(
             ir,
@@ -377,7 +670,7 @@ impl Vcpu {
         seed: u64,
         runs: u64,
         exit_word: &AtomicU64,
-    ) -> (Progress, bool) {
+    ) -> Compiled {
         let n = u64::from(ir.icount);
         // SplitMix64 over the seed, the block and its run count.
         let mut z = seed
@@ -406,12 +699,15 @@ impl Vcpu {
         let counters = &mut execution.machine_jit.counters;
         if !machine_jit::is_completed(&prefix, c) {
             // The interpreter itself ended the prefix: its result is the walk's.
-            return (prefix, false);
+            return Compiled::Walk(prefix);
         }
         if c == n {
             counters.continues += 1;
             counters.compiled_retired += n;
-            return (prefix, false);
+            return Compiled::Done {
+                count: n,
+                stop: false,
+            };
         }
         // A compiled store that leaves the dispatch word set stops the block
         // after its instruction (`jit_abi::machine::ACCESS_STOP`); a prefix
@@ -420,12 +716,99 @@ impl Vcpu {
         if (kind == 0 || stop) && c != 0 {
             counters.stops += 1;
             counters.compiled_retired += c;
-            return (prefix, true);
+            return Compiled::Done {
+                count: c,
+                stop: true,
+            };
         }
         counters.unconditional_defers += 1;
-        (
-            self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word),
-            false,
-        )
+        Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word))
+    }
+}
+
+/// Find or start this block's shared unit (decision-30 §2). A published unit
+/// is returned, with whether this call compiled it; otherwise a request is made: background in production, a
+/// synchronous compile in the Forced and Delayed test modes (decision-29 §9).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn tier_up(
+    vm: &Vm,
+    ir: &Arc<IrBlock>,
+    key: crate::cache::MachineBlockKey,
+    physical: u64,
+    generation: u64,
+    config: u64,
+    slot: &mut Slot,
+    exit_word: &AtomicU64,
+) -> Option<(crate::CompiledPtr, bool)> {
+    let seen = vm.cache.machine_published();
+    if let Some(entry) = vm.cache.machine_unit(&key) {
+        return Some((entry, false));
+    }
+    let mark = |sp: &[(u64, u32)]| {
+        for &(start, len) in sp {
+            vm.mem.mark_code(start, len);
+        }
+    };
+    let sources = unit_sources(ir, physical);
+    let Some(id) = vm
+        .cache
+        .begin_machine_tier_up(key, generation, sources.clone(), mark)
+    else {
+        // In flight elsewhere, suppressed, or a code write moved the
+        // generation: look again after the next publication.
+        slot.hot = 0;
+        slot.request = Request::Waiting(seen);
+        return None;
+    };
+    if vm.machine_jit == MachineJitMode::Off {
+        let request = crate::TierUpRequest {
+            precise_split_stores: vm.precise_split_stores,
+            mxcsr_mode: key.mxcsr_mode,
+            pc: physical,
+            unit: crate::TierUpUnit::Block(ir.clone()),
+            consistency: vm.consistency,
+            mmio: None,
+            guest_base: vm.mem.guest_base(),
+            spans: sources.clone(),
+            epoch: id,
+        };
+        match vm.backend.tier_up_async(request) {
+            crate::TierUpSubmit::Queued => {
+                vm.cache.record_tier_bg_submitted();
+                slot.hot = 0;
+                slot.request = Request::Waiting(seen);
+            }
+            crate::TierUpSubmit::Busy => {
+                vm.cache.machine_request(id);
+                vm.cache.abandon_machine_tier_up(key, &vm.mem);
+                slot.hot = 0;
+            }
+            crate::TierUpSubmit::Unsupported => {
+                vm.cache.machine_request(id);
+                vm.cache.abandon_machine_tier_up(key, &vm.mem);
+                slot.request = Request::Failed;
+            }
+        }
+        return None;
+    }
+    let compiled = vm.backend.materialize_machine(ir, vm.consistency, config);
+    vm.cache.machine_request(id);
+    vm.handle_smc(exit_word);
+    let Some(entry) = compiled else {
+        vm.cache.abandon_machine_tier_up(key, &vm.mem);
+        slot.request = Request::Failed;
+        return None;
+    };
+    let block = crate::CachedBlock::Compiled { entry };
+    if vm.cache.publish_machine(key, block.clone(), None, id, mark) {
+        Some((entry, true))
+    } else {
+        vm.cache.release_source_tags(&vm.mem, &sources);
+        super::super::discard_materialized(vm, &block);
+        slot.hot = 0;
+        slot.request = Request::Waiting(seen);
+        None
     }
 }

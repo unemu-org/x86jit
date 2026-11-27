@@ -2367,6 +2367,37 @@ impl Memory {
         }
     }
 
+    /// Decision-30 §4: the live code-tag word and bit of page `p`, read by a
+    /// compiled Machine store after it writes RAM, or `None` outside the table.
+    pub(crate) fn code_tag_slot(&self, p: u64) -> Option<(*const AtomicU64, u32)> {
+        let (w, m) = word_bit(p.wrapping_sub(self.guest_base >> CODE_PAGE_BITS));
+        self.code_page
+            .get(w)
+            .map(|word| (word as *const AtomicU64, m.trailing_zeros()))
+    }
+
+    /// Decision-30 §4: the host address of the 4 KiB bus frame at `base` and
+    /// whether stores may go to it inline: `Some` only when the whole frame
+    /// lies in one RAM or ROM region of the backing (ROM read-only).
+    pub(crate) fn fast_frame(&self, base: u64) -> Option<(u64, bool)> {
+        if matches!(self.model, MemoryModel::SoftMmu) || base < self.guest_base {
+            return None;
+        }
+        let region = self.region_for(base, 1 << CODE_PAGE_BITS)?;
+        let writable = match region.kind {
+            RegionKind::Ram => true,
+            RegionKind::Rom => false,
+            RegionKind::Trap => return None,
+        };
+        if base - self.guest_base + (1 << CODE_PAGE_BITS) > self.size() {
+            return None;
+        }
+        Some((
+            (self.host_base() as u64).wrapping_add(base - self.guest_base),
+            writable,
+        ))
+    }
+
     /// Whether page `p` currently backs translated code — the precise test behind the
     /// inline watermark, for callers that already know the exact page.
     pub fn is_code_page(&self, p: u64) -> bool {
@@ -6181,8 +6212,15 @@ impl<const DEVICE: bool> RunningMemory<'_, DEVICE> {
     #[cold]
     #[inline(never)]
     fn device(&self, write: bool, addr: u64, size: u8, value: u64) -> Result<u64, ()> {
-        crate::vm::device::in_block_access(self.ir, self.current.get(), write, addr, size, value)
-            .ok_or(())
+        crate::vm::device::in_block_access(
+            std::ptr::from_ref(self.ir),
+            self.current.get(),
+            write,
+            addr,
+            size,
+            value,
+        )
+        .ok_or(())
     }
     #[cold]
     #[inline(never)]

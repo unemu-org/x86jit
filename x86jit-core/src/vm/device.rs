@@ -1157,6 +1157,9 @@ fn sole_access(ir: &crate::ir::IrBlock, ip: u64) -> Option<u64> {
             IrOp::Load { .. } | IrOp::Store { .. } if !accessed => accessed = true,
             // A segment limit check faults before the access, so before any call.
             IrOp::SegLimitCheck { .. } if !accessed => {}
+            // So does the Flat32 whole-operand check (decision-30 §4): a
+            // compiled Flat32 access reaches the device only past it.
+            IrOp::Legacy(L::Flat32Address { .. }) if !accessed => {}
             op if pure(op) => {}
             _ => return None,
         }
@@ -1184,10 +1187,11 @@ impl Drop for Disarmed<'_> {
 /// The armed hook of the walk of `ir`, its Run and its VM, when this walk may
 /// call its handler for a registered MMIO transfer of `size` bytes at
 /// physical `address`: armed for this very block, with a handler, no result
-/// already kept for the handoff, and a VM not poisoned.
+/// already kept for the handoff, and a VM not poisoned. A compiled Machine
+/// unit passes a null `ir`: it runs the block the dispatcher armed.
 #[inline(always)]
 fn armed<'h>(
-    ir: &crate::ir::IrBlock,
+    ir: *const crate::ir::IrBlock,
     address: u64,
     size: u8,
 ) -> Option<(
@@ -1218,7 +1222,9 @@ fn armed<'h>(
     }
     // SAFETY: as `run`: the dispatcher's block handle outlives the walk.
     let block = unsafe { &*hook.ir.get() };
-    if !std::ptr::eq(&**block, ir) {
+    // A compiled Machine unit (`ir` null) runs the block the dispatcher armed:
+    // a shared unit's own IR is another lift of the same bytes.
+    if !ir.is_null() && !std::ptr::eq(&**block, ir) {
         return None;
     }
     let run = unsafe { &mut *run };
@@ -1238,7 +1244,7 @@ fn armed<'h>(
 #[cold]
 #[inline(never)]
 pub(crate) fn in_block_access(
-    ir: &crate::ir::IrBlock,
+    ir: *const crate::ir::IrBlock,
     ip: u64,
     write: bool,
     address: u64,
@@ -1251,7 +1257,7 @@ pub(crate) fn in_block_access(
         match &*verdict {
             Some((cached, at, completed)) if Arc::ptr_eq(cached, block) && *at == ip => *completed,
             _ => {
-                let completed = sole_access(ir, ip);
+                let completed = sole_access(block, ip);
                 *verdict = Some((block.clone(), ip, completed));
                 completed
             }
@@ -1262,6 +1268,30 @@ pub(crate) fn in_block_access(
         steps: hook.steps.get() + completed,
     };
     serve(hook, run, vm, ip, position, write, address, size, value)
+}
+/// A compiled Machine unit deferred at ordinal `completed` of the block the
+/// hook is armed for (decision-30 §4): the interpreted pass that walks the
+/// rest of the block counts from there, so the armed position moves to it.
+/// The pass then serves its transfers at the positions the interpreted walk
+/// of the whole block reports.
+#[cold]
+#[inline(never)]
+pub(crate) fn advance_armed(completed: u64) {
+    if PUBLISHED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let hook = IN_BLOCK.with(|slot| slot.get());
+    if hook.is_null() {
+        return;
+    }
+    // SAFETY: as `armed`: a published hook outlives the dispatch call that
+    // owns it, which is running this compiled call.
+    let hook = unsafe { &*hook };
+    if hook.run.get().is_null() {
+        return;
+    }
+    hook.retired.set(hook.retired.get() + completed);
+    hook.steps.set(hook.steps.get() + completed);
 }
 /// Called by an unpaged block pass (`interp::legacy::BlockPass`) at the MMIO
 /// handoff of a whole Load or Store operand of the instruction at `ip`,
@@ -1284,7 +1314,7 @@ pub(crate) fn in_pass_access(
     size: u8,
     value: u64,
 ) -> Option<u64> {
-    let (hook, run, vm, _) = armed(ir, address, size)?;
+    let (hook, run, vm, _) = armed(std::ptr::from_ref(ir), address, size)?;
     let position = DevicePosition {
         retired_instructions: hook.retired.get() + retired,
         steps: hook.steps.get() + steps,
