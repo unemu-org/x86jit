@@ -23,7 +23,7 @@ use x86jit_core::{
 };
 use x86jit_cranelift::JitBackend;
 
-const NAMES: [&str; 9] = MachineJitCounters::CHAIN_END_NAMES;
+const NAMES: [&str; 10] = MachineJitCounters::CHAIN_END_NAMES;
 
 fn reason(name: &str) -> usize {
     NAMES.iter().position(|n| *n == name).unwrap()

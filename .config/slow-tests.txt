@@ -151,3 +151,7 @@ x86jit-tests::legacy legacy_string16::memory_strings_through_device_regions
 x86jit-tests::legacy legacy_string16::port_strings
 x86jit-tests::legacy legacy_string16::memory_strings_segmented_paged
 x86jit-tests::legacy legacy_string16::memory_strings_checked_paged
+x86jit-tests::legacy machine_j34_paged::paged_and_cpl3_programs_equal_the_interpreter_386
+x86jit-tests::legacy machine_j34_paged::paged_and_cpl3_programs_equal_the_interpreter_486
+x86jit-tests::legacy machine_j34_paged::every_lowered_family_runs_compiled_paged_at_cpl3
+x86jit-tests::legacy machine_j34_paged::paged_background_tier_up_equals_the_interpreter

@@ -6219,6 +6219,7 @@ impl<const DEVICE: bool> RunningMemory<'_, DEVICE> {
             addr,
             size,
             value,
+            None,
         )
         .ok_or(())
     }

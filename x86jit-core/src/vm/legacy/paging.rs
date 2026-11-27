@@ -201,6 +201,53 @@ impl State {
         self.last == Some((Arc::as_ptr(ir) as usize, self.blocks.version()))
     }
 
+    /// A successor link that names a held block stood in for this turn's
+    /// resolve (`Execution::follow_link`): the proof still holds it, as an
+    /// unchanged version shows, so it is the block the resolve returned.
+    #[inline(always)]
+    pub(super) fn linked(&mut self, ir: &Arc<IrBlock>) {
+        self.last = Some((Arc::as_ptr(ir) as usize, self.blocks.version()));
+    }
+
+    /// The instruction table of the ordinary block `ir` (`lanes`): the one
+    /// its proof keeps, or one built into the scratch buffer for a retained
+    /// retry slice, a snapshot run once unpublished, or a slot another block
+    /// took; with the operand transaction and the TLB its walk takes.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    pub(super) fn lanes_for(
+        &mut self,
+        ir: &Arc<IrBlock>,
+    ) -> (
+        &[Insn],
+        &mut Option<crate::interp::legacy::paging::Transaction>,
+        &std::cell::RefCell<crate::interp::legacy::paging::Tlb>,
+    ) {
+        let version = self.blocks.version();
+        let insns: &[Insn] = match self.lane_slots.get(lanes_slot(Arc::as_ptr(ir))) {
+            Some(Some(slot)) if slot.ir == Arc::as_ptr(ir) as usize && slot.version == version => {
+                &slot.insns
+            }
+            _ => {
+                crate::interp::legacy::paging::lanes_into(ir, &mut self.lane_scratch);
+                &self.lane_scratch
+            }
+        };
+        (insns, &mut self.transaction, &self.tlb)
+    }
+
+    /// The proof generation the paged proofs were last reconciled to.
+    pub(super) fn proof_generation(&self) -> u64 {
+        self.blocks.generation()
+    }
+
+    /// Decision-32 §2, E9: no operand transaction, event transaction or port
+    /// completion is outstanding, so a compiled block may run.
+    #[inline(always)]
+    pub(super) fn idle(&self) -> bool {
+        self.transaction.is_none() && self.event_transaction.is_none() && self.port_input.is_none()
+    }
+
     pub(super) fn invalidate(&mut self) {
         self.blocks.clear(why!(Paging));
         // Every slot names an older version now; drop the tables they keep.
@@ -1097,20 +1144,7 @@ impl Vcpu {
         if ordinary || ordinary_block(context, ir) {
             execution.rep_flags = None;
             let state = paging_state(&mut execution.paging);
-            let version = state.blocks.version();
-            let insns: &[Insn] = match state.lane_slots.get(lanes_slot(Arc::as_ptr(ir))) {
-                Some(Some(slot))
-                    if slot.ir == Arc::as_ptr(ir) as usize && slot.version == version =>
-                {
-                    &slot.insns
-                }
-                // A retained retry slice, a snapshot run once unpublished, or
-                // a slot another block took.
-                _ => {
-                    crate::interp::legacy::paging::lanes_into(ir, &mut state.lane_scratch);
-                    &state.lane_scratch
-                }
-            };
+            let (insns, transaction, tlb) = state.lanes_for(ir);
             let progress = crate::interp::legacy::paging::execute_flat32::<ROUTED, ORDER>(
                 ir,
                 insns,
@@ -1120,8 +1154,8 @@ impl Vcpu {
                 limit,
                 &self.exit_request.word,
                 &mut execution.task_switch,
-                &mut state.transaction,
-                &state.tlb,
+                transaction,
+                tlb,
             );
             // A walk that reloaded a data segment and then stopped with an
             // exit reports no context change (`BlockPass::reloaded`): the
@@ -1255,6 +1289,44 @@ impl Vcpu {
             ss_shadow: self.ss_shadow,
             outcome: Some(outcome),
         }
+    }
+
+    /// Decision-32 §3: the rest of a paged ordinary block after a compiled
+    /// unit deferred the instruction whose `InsnStart` is op `from`, on the
+    /// walk `execute_paged` gives the whole block, entered at that boundary.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn execute_paged_from<const ROUTED: bool, const ORDER: u8>(
+        &mut self,
+        vm: &Vm,
+        ir: &Arc<IrBlock>,
+        limit: u64,
+        from: usize,
+    ) -> crate::interp::legacy::Progress {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        execution.rep_flags = None;
+        let state = paging_state(&mut execution.paging);
+        // P1's per-proof instruction table, as `execute_paged` takes it: a
+        // compiled entry's block is held by its proof (E10), so its slot is
+        // normally filled.
+        let (insns, transaction, tlb) = state.lanes_for(ir);
+        let progress = crate::interp::legacy::paging::execute_flat32_from::<ROUTED, ORDER>(
+            ir,
+            insns,
+            &mut self.cpu,
+            &vm.mem,
+            &mut self.interp_scratch,
+            limit,
+            &self.exit_request.word,
+            &mut execution.task_switch,
+            transaction,
+            tlb,
+            from,
+        );
+        if progress.outcome.as_ref().is_some_and(|o| o.is_err()) {
+            execution.context_dirty();
+        }
+        progress
     }
 
     #[cold]

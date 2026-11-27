@@ -4348,8 +4348,9 @@ impl Shared {
     }
 
     /// Decision-30 §2: whether a background request carries Machine IR, and
-    /// the access configuration its helpers take. Only the unpaged Flat32
-    /// class is admitted; any other Machine IR fails deterministically.
+    /// the access configuration its helpers take. Only the Flat32 class is
+    /// admitted, paged or not, at CPL 0 or 3 (decision-32 §2); any other
+    /// Machine IR fails deterministically.
     fn machine_request_config(req: &TierUpRequest) -> Option<u64> {
         let TierUpUnit::Block(ir) = &req.unit else {
             return None;

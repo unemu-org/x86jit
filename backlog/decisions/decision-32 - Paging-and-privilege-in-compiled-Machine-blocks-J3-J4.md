@@ -455,3 +455,87 @@ no longer lets adjacent pages share a slot.
 The compiled view of §3 is a subset of the `Tlb` and is cleared on every `Tlb` mutation.
 Those flushes still empty the `Tlb`, so the view stays a subset and follows these rules
 unchanged; a compiled unit keyed by `physical_pc` is unaffected.
+
+## Implementation notes (2026-11-27, proposed record diff)
+
+Recorded while implementing J3+J4 (bead xj-to9.3), and brought onto the paged identity of the
+amendment above. None changes an answered question.
+
+1. **Where the view's clears happen (§3 rule 2, §7).** The `Tlb` holds no handle to the
+   view. Each `Tlb` mutation logs the pages it touches: `insert` the page it evicts and the one
+   it adds, `remove` (INVLPG's page-only removal included) and `dirty` their page; eight pages
+   fit, and more, or any flush (`invalidate`, a guest or task CR3 load, a context change in
+   `reconcile`), mark the whole view. Revalidation walks fill through `insert`; marking an
+   entry fetched changes no answer the view caches. Every compiled entry with paging on applies the log before
+   the call (`MachineTlb::sync`) and names the `Tlb` the miss helper fills from. The view is
+   read only inside compiled calls, and nothing in them mutates the `Tlb`, so the invariant
+   holds at every read, as clears at the mutation would make it. `sync` also reconciles the
+   `Tlb` with the CPU first (one compare of its CR3, CR0, A20 and model context), so write tags
+   granted under WP = 0 cannot survive a WP change on any entry path. `undo_lane` needs no
+   clear: the lane's own inserts and removes logged every page it changed. No pointer crosses
+   the two states, a new `Tlb` starts with a full clear, and an interpreter that never compiles
+   pays one store per mutation. A debug assertion after every paged fill checks the whole view
+   against the `Tlb`.
+2. **`FastEntry` (§3), append-only.** The supervisor pair keeps J2's `read_tag` and
+   `write_tag` at offsets 0 and 4 and every other J2 offset; the user pair is at 32 and 36. The
+   entry is 64 bytes and 64-byte aligned (`ENTRY_SHIFT` 6). Identity fills set both pairs.
+3. **The block's bus address (§4, §7).** `resolve` is unchanged. A paged block's
+   `physical_pc` is the frame of the `Tlb` entry its fetch used (`paging::fetched_bus`). E10
+   keeps it: a proof hit holds only after its code pages translated to the lifted frames under
+   the current generation (`pages_hold`, which leaves those entries in the `Tlb`), and a link
+   names that generation. With no such entry the block stays interpreted. A memo slot caches
+   the address for its block, which is the proof's lifted frame whenever the proof holds.
+4. **E10 for links.** A paged link that names a held block records it as the resolve's last
+   block (`paging::State::linked`), so one test (`holds`) serves proof hits and links. The
+   block must also lie in one linear page (the paged lift may end in one page-crossing
+   instruction).
+5. **Paged chains (decision-31 §3's rule for J3+J4).** A paged chain stays in its first block's
+   linear page and bus frame. The target descriptor's flags word grows into an edge key
+   (`MachineTarget::edge`, appended): the key flags and, with PG set in them, the block's linear
+   page and bus frame, so one 64-bit compare per edge, as J2b's flags compare, tests both; a
+   paged target elsewhere ends the chain with a tenth chain-end reason, `page`. A first cut
+   that tested the page separately cost the unpaged chained cells about three host
+   instructions per edge. The dispatcher's link or resolve then validates that page's
+   translation. Compiled code and its helpers change no `Tlb` entry, so the fetch translation
+   the first entry validated holds for the whole chain; the frame compare also covers a
+   shadow-ring prediction made under another CR3.
+6. **The miss helper's access.** After the `Tlb` hit, the rights for the live CPL and D for a
+   write (`paging::compiled_translation`), the helper runs J1's access on the physical address
+   with A20 as its only bus gate, as `fast_window` forms the bus address.
+7. **The 486 gate.** In the interpreter `I486Gate` is the ASSUMED conservative refusal of the
+   AM-and-AC regime (`UnsupportedSystemOperation::LegacyAlignmentCheck`), not an #AC delivery.
+   The compiled gate defers in that regime, so both tiers produce that refusal.
+8. **Q7 applies to every fresh memo slot**, paged or not: a memo conflict, a proof evicted by
+   the bound, or a relift after a remap also looks the map up once.
+9. **In-block devices.** A paged compiled access passes its linear address to
+   `in_block_access`, and `sole_access` accepts a live segment check (`Address`) and the gate
+   before the access: both refuse before any effect.
+10. **Scripted mode** stays in the J2 class (unpaged, CPL 0). A scripted unit STOPs at a
+    random ordinal, so the next turn starts inside its block and lifts a block there, and its
+    chains resolve, and may lift, the next block. The lift-count witnesses read those lifts as
+    lost proofs (`legacy_flat32`'s reduced identity, shared across IOPL) or as a working set
+    past its bound (`legacy_relift_diag`'s paged proof bound and TLB-turnover loop). Paged and
+    CPL-3 units and chains are witnessed in the Forced, Delayed and background modes.
+11. **Counters** (test and test-hooks builds): `defer_causes` (TLB miss, rights, clean write,
+    page crossing, device or hole, AC gate, segment, other), `compiled_retired_cpl3` and
+    `paged_entries`.
+
+12. **The memo holds its block weakly.** A memo slot kept an `Arc` of its block, and the proof
+    maps' bound eviction spares a proof whose block another holder keeps
+    (`Arc::strong_count`). A compiling vCPU's 256 slots then pinned up to 256 proofs, and a
+    working set above the paged map's bound (then 256 proofs) relifted almost every block
+    (`legacy_relift_diag`, 9,976 lifts against the interpreter's few hundred). The slot now holds
+    a `Weak`, which still keeps the block's address from being reused.
+13. **A CR3 load under the amendment.** The `Tlb` flush marks the whole view, so the next
+    compiled entry clears it, and data accesses miss into the interpreter's walk until they
+    refill it. The paged proofs, their memo slots and the Machine map are untouched: a proof's
+    next hit revalidates its code page under the new CR3, the block re-enters the unit its slot
+    holds without a lift or a lookup, and a page mapped to another frame under the new CR3
+    misses its proof (per-CR3 key) and gets its own unit. `cr3_loads_reuse_shared_units`
+    witnesses both: 40 loads compile and lift no more than 3.
+
+**Done-when 2, MEASURED** (performance.md, "Paged and CPL-3 compiled Machine blocks"):
+`machine-paged32-bg` 19.8 / 35.4 / 65.6 and `machine-paged32-cpl3-bg` 19.8 / 35.2 / 65.4 host
+instructions per step in both profiles, against 182 / 213 / 566; the unpaged
+`machine-protected32-bg` moved from 20.0 / 35.6 / 66.2 (base) to 19.8 / 35.4 / 65.6. §8's model assumed no
+chaining; J2b's chains carry over to paged code inside a page.

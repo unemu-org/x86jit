@@ -5179,3 +5179,41 @@ per 1000 retired): chained transfers 200 (register, memory: one per five-instruc
 HLT singleton (empty slot). Sliced register: 184.4 chained, 15.6 budget ends, one per slice. The
 test-hooks chain-off reference (`machine-protected32-bg-nochain`) costs 141.3 / 156.9 / 429.9
 against 33.0 / 48.6 / 105.2 chained in the same build.
+
+## Paged and CPL-3 compiled Machine blocks (J3+J4, xj-to9.3) — MEASURED 2026-11-27
+
+Decision-32 done-when 2. `machine32_loops`, ARM64, 2,000,000 iterations, host instructions per
+guest step, last of three rounds (one process per cell), production build (background tier-up,
+T1 = 50). The interpreted paged figures are the ceiling study's (decision-32 §1); base is
+e3a1526d (J2b) built from its own tree.
+
+| Path | register | memory | callret |
+|---|---:|---:|---:|
+| `machine-paged32` interpreted (ceiling study 2) | 593 | 881 | 1481 |
+| `machine-paged32-bg`, release | **19.8** | **35.4** | **65.6** |
+| `machine-paged32-bg`, perf | **19.8** | **35.4** | **65.6** |
+| `machine-paged32-cpl3-bg`, release | **19.8** | **35.2** | **65.4** |
+| `machine-paged32-cpl3-bg`, perf | **19.8** | **35.2** | **65.4** |
+| `machine-protected32-bg` (unpaged), release, base | 20.0 | 35.6 | 66.2 |
+| `machine-protected32-bg` (unpaged), release, J3+J4 | 19.8 | 35.4 | 65.6 |
+| Gate (decision-27 §5 paged range) | 182 | 213 | 566 |
+| Decision-32 §8 planning (no chaining) | 135-165 | 148-178 | 400-490 |
+
+J2b's chaining landed first, so the paged cells equal the unpaged ones: a paged chain stays in
+its page (`page` chain end), and these loops never leave it; the page and frame test rides in
+the edge's one key compare. A first cut that tested the page separately at each edge cost the
+unpaged chained cells +0.6 / +0.6 / +1.8 per step (about three host instructions per edge).
+
+`cr3switch` (the register loop with a test and a branch more, in two address spaces that share
+every page, a CR3 load every 1,000 iterations; 7 retired per iteration): 44.0 (release) /
+43.9 (perf), measured before decision-32's paged-identity amendment, when every CR3 load
+relifted each block and the fresh slot's one lookup (Q7) re-entered the existing unit. Since
+the amendment a CR3 load empties the TLB and the compiled view but keeps the proofs, which
+revalidate their code pages: the witness `cr3_loads_reuse_shared_units` shows 400 iterations
+with 40 loads compiling and lifting no more than 30 iterations with 3. On 09857cc0 the cell is
+28.9 (release).
+
+Two-profile interpreter gate (`scripts/perf-campaign.sh`, base e3a1526d, before the edge-key
+change, which touches only the compiled chain loop): DRIFT only, on `smc-rmw-64` of the
+twenty-bit models (I8086, I8088, V20, V30), −1.5 % release and +1.3 % perf; no cell over the
+gate in both profiles; the store gate passes.

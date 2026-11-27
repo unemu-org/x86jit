@@ -25,15 +25,18 @@ pub const ACCESS_DEFER: u64 = 1;
 /// (`BlockPass::commit`).
 pub const ACCESS_STOP: u64 = 2;
 
-/// One slot of a vCPU's compiled TLB view (decision-30 §4), `repr(C)`
-/// because compiled loads and stores read it inline. A tag is the linear
-/// page number plus one, so zero is invalid.
-#[repr(C)]
+/// One slot of a vCPU's compiled TLB view (decision-30 §4, decision-32 §3),
+/// `repr(C)` because compiled loads and stores read it inline. A tag is the
+/// linear page number plus one, so zero is invalid. The supervisor pair
+/// keeps J2's offsets; the user pair is appended (decision-32 Q4): a unit's
+/// key names its CPL, so its lowering picks the pair at compile time.
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct FastEntry {
-    /// Loads may go to this page inline (RAM or ROM).
+    /// Supervisor loads may go to this page inline (RAM or ROM).
     pub read_tag: u32,
-    /// Stores may go to this page inline (RAM with a code-tag word).
+    /// Supervisor stores may go to this page inline (RAM with a code-tag
+    /// word; with paging, a write right for CPL 0 and PTE.D set).
     pub write_tag: u32,
     /// Host address of the page's first byte minus its linear address.
     pub addend: u64,
@@ -43,6 +46,12 @@ pub struct FastEntry {
     pub frame: u32,
     /// The frame's bit in `tag_word`.
     pub tag_bit: u32,
+    /// CPL-3 loads may go to this page inline: with paging, U set in both
+    /// levels (80386 PRM §§6.4.1-6.4.2 Table 6-5; SDM Vol 3A §5.6.1).
+    pub user_read_tag: u32,
+    /// CPL-3 stores may go to this page inline: with paging, U and W set in
+    /// both levels and PTE.D set.
+    pub user_write_tag: u32,
 }
 
 /// Slots of the view: direct-mapped on the linear page's low bits.
@@ -54,15 +63,37 @@ pub const ENTRY_ADDEND: i32 = 8;
 pub const ENTRY_TAG_WORD: i32 = 16;
 pub const ENTRY_FRAME: i32 = 24;
 pub const ENTRY_TAG_BIT: i32 = 28;
+pub const ENTRY_USER_READ_TAG: i32 = 32;
+pub const ENTRY_USER_WRITE_TAG: i32 = 36;
 /// `log2(size_of::<FastEntry>())`.
-pub const ENTRY_SHIFT: i64 = 5;
+pub const ENTRY_SHIFT: i64 = 6;
 
-/// The compiled view of a vCPU's TLB (decision-30 §4). With paging off its
-/// entries are identity fills from the bus: the linear page's frame after
-/// the model's physical mask and A20. A fill reads the region map and the
-/// code-tag table, so the view is emptied whenever A20, the mapping or the
-/// physical mask it was filled under changes. Code-tag words are read live,
-/// so a page tagged after the fill is seen by the next store.
+/// The read and write tag offsets a unit compiled at `cpl` probes.
+pub fn tag_offsets(cpl: u8) -> (i32, i32) {
+    if cpl == 3 {
+        (ENTRY_USER_READ_TAG, ENTRY_USER_WRITE_TAG)
+    } else {
+        (ENTRY_READ_TAG, ENTRY_WRITE_TAG)
+    }
+}
+
+/// The compiled view of a vCPU's TLB (decision-30 §4, decision-32 §3).
+///
+/// With paging off its entries are identity fills from the bus: the linear
+/// page's frame after the model's physical mask and A20. A fill reads the
+/// region map and the code-tag table, so the view is emptied whenever A20,
+/// the mapping or the physical mask it was filled under changes.
+///
+/// With paging on it is a subset of the vCPU's interpreter TLB
+/// (`interp::legacy::paging::Tlb`): every valid entry equals a current entry
+/// there, with that entry's frame, rights and D bit. Only the miss helper
+/// fills it, and only from a TLB hit; compiled code never walks. The TLB
+/// logs the pages each of its mutations touches, and every compiled entry
+/// clears those slots before the call (`sync`), so the view never holds a
+/// translation the TLB has dropped while compiled code can read it.
+///
+/// Code-tag words are read live, so a page tagged after the fill is seen by
+/// the next store.
 ///
 /// The vCPU's shadow return ring for compiled Machine CALL and RET
 /// (decision-31 §2.1) follows the entries, at [`RING_OFFSET`]: Machine code
@@ -72,7 +103,12 @@ pub struct MachineTlb {
     pub entries: [FastEntry; TLB_SLOTS],
     pub ring: super::RetStack,
     a20: bool,
+    paged: bool,
     mask: u32,
+    /// With paging on, the TLB (`RefCell<Tlb>`) the view was last synced
+    /// with, for the miss helper; zero otherwise. An address, so the view
+    /// stays `Send` with its vCPU.
+    source: usize,
 }
 
 /// Byte offset of [`MachineTlb::ring`], for generated code.
@@ -84,20 +120,27 @@ impl Default for MachineTlb {
             entries: [FastEntry::default(); TLB_SLOTS],
             ring: super::RetStack::new(),
             a20: false,
+            paged: false,
             mask: 0,
+            source: 0,
         }
     }
 }
 
+type PagedTlb = std::cell::RefCell<crate::interp::legacy::paging::Tlb>;
+
 impl MachineTlb {
-    /// Empty the view unless it was filled under this A20 line and mask.
+    /// Empty the view unless it was filled under this A20 line, mask and
+    /// paging state: a PG change in either direction empties it.
     /// A mapping change empties it at run entry (`compiled::State::begin_run`).
     #[inline(always)]
-    pub(crate) fn reconcile(&mut self, a20: bool, mask: u32) {
-        if self.a20 != a20 || self.mask != mask {
+    pub(crate) fn reconcile(&mut self, a20: bool, mask: u32, paged: bool) {
+        if self.a20 != a20 || self.mask != mask || self.paged != paged {
             self.flush();
             self.a20 = a20;
             self.mask = mask;
+            self.paged = paged;
+            self.source = 0;
         }
     }
 
@@ -106,12 +149,43 @@ impl MachineTlb {
         self.entries = [FastEntry::default(); TLB_SLOTS];
     }
 
+    /// With paging on, before a compiled entry: clear the slots of every
+    /// page the TLB changed since the last sync (decision-32 §3 rule 2), and
+    /// name the TLB the miss helper fills from. Clearing is always safe:
+    /// the view is a subset of the TLB, not a copy of it. The TLB is first
+    /// reconciled with `cpu` (one compare of its context), so a changed CR3,
+    /// CR0.WP or A20 empties both before the view is read: write tags granted
+    /// under WP = 0 cannot outlive a WP change, whatever path reached here.
+    #[inline(always)]
+    pub(crate) fn sync(&mut self, cpu: &CpuState, tlb: &PagedTlb) {
+        debug_assert!(self.paged);
+        self.source = std::ptr::from_ref(tlb) as usize;
+        let mut tlb = tlb.borrow_mut();
+        tlb.reconcile(cpu);
+        if !tlb.view_log_empty() {
+            self.clear_logged(&mut tlb);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clear_logged(&mut self, tlb: &mut crate::interp::legacy::paging::Tlb) {
+        match tlb.take_view_log() {
+            None => self.flush(),
+            Some(pages) => {
+                for page in pages {
+                    self.entries[page as usize % TLB_SLOTS] = FastEntry::default();
+                }
+            }
+        }
+    }
+
     /// Fill the slot of `linear`'s page after a completed helper access: an
     /// identity entry when its whole bus frame is RAM or ROM in the backing.
     #[cold]
     #[inline(never)]
     fn fill(&mut self, cpu: &CpuState, memory: &crate::Memory, mask: u32, linear: u32) {
-        if self.mask != mask || self.a20 != (cpu.legacy.a20_enabled != 0) {
+        if self.paged || self.mask != mask || self.a20 != (cpu.legacy.a20_enabled != 0) {
             return;
         }
         let page = linear >> 12;
@@ -122,18 +196,89 @@ impl MachineTlb {
             return;
         };
         let tag = memory.code_tag_slot(frame >> 12);
+        let write = if writable && tag.is_some() {
+            page + 1
+        } else {
+            0
+        };
+        // No page protection exists with PG = 0: both privileges alike.
         *slot = FastEntry {
             read_tag: page + 1,
-            write_tag: if writable && tag.is_some() {
-                page + 1
-            } else {
-                0
-            },
+            write_tag: write,
             addend: host.wrapping_sub(base),
             tag_word: tag.map_or(0, |(word, _)| word as u64),
             frame: (frame >> 12) as u32,
             tag_bit: tag.map_or(0, |(_, bit)| bit),
+            user_read_tag: page + 1,
+            user_write_tag: write,
         };
+    }
+
+    /// Paged (decision-32 §3): fill the slot of `linear`'s page from the
+    /// TLB entry the helper's access just hit. The tags are the
+    /// interpreter's own rights for the CPU state now (`permitted`, WP and
+    /// the model included), a write tag needs PTE.D, and the frame must be
+    /// one RAM or ROM region of the backing, RAM with a code-tag word for a
+    /// write tag.
+    #[cold]
+    #[inline(never)]
+    fn fill_paged(&mut self, cpu: &CpuState, memory: &crate::Memory, linear: u32) {
+        if !self.paged || self.source == 0 {
+            return;
+        }
+        // SAFETY: `sync` set it at this compiled entry from the vCPU's live
+        // paging state, which outlives the compiled call.
+        let cell = unsafe { &*(self.source as *const PagedTlb) };
+        let tlb = cell.borrow();
+        let Some(rights) = crate::interp::legacy::paging::view_rights(cpu, &tlb, linear) else {
+            return;
+        };
+        let page = linear >> 12;
+        let base = u64::from(page) << 12;
+        let (frame, _) = crate::legacy::physical_span(cpu, u32::MAX, u64::from(rights.frame), 1);
+        let Some((host, writable)) = memory.fast_frame(frame) else {
+            return;
+        };
+        let tag = memory.code_tag_slot(frame >> 12);
+        let writes = writable && tag.is_some();
+        let tag_of = |ok: bool| if ok { page + 1 } else { 0 };
+        self.entries[page as usize % TLB_SLOTS] = FastEntry {
+            read_tag: page + 1,
+            write_tag: tag_of(writes && rights.supervisor_write),
+            addend: host.wrapping_sub(base),
+            tag_word: tag.map_or(0, |(word, _)| word as u64),
+            frame: (frame >> 12) as u32,
+            tag_bit: tag.map_or(0, |(_, bit)| bit),
+            user_read_tag: tag_of(rights.user_read),
+            user_write_tag: tag_of(writes && rights.user_write),
+        };
+        #[cfg(debug_assertions)]
+        self.assert_subset(cpu, &tlb);
+    }
+
+    /// Decision-32 §3: every valid entry equals a current TLB entry, with
+    /// its frame and no right or D bit the TLB does not hold.
+    #[cfg(debug_assertions)]
+    fn assert_subset(&self, cpu: &CpuState, tlb: &crate::interp::legacy::paging::Tlb) {
+        for (index, entry) in self.entries.iter().enumerate() {
+            let tag = entry.read_tag | entry.write_tag | entry.user_read_tag | entry.user_write_tag;
+            if tag == 0 {
+                continue;
+            }
+            let page = entry.read_tag.wrapping_sub(1);
+            assert!(
+                entry.read_tag != 0 && page as usize % TLB_SLOTS == index,
+                "a view slot {index} without its page: {entry:?}"
+            );
+            let rights = crate::interp::legacy::paging::view_rights(cpu, tlb, page << 12)
+                .unwrap_or_else(|| panic!("view page {page:#x} has no TLB entry"));
+            let (frame, _) =
+                crate::legacy::physical_span(cpu, u32::MAX, u64::from(rights.frame), 1);
+            assert_eq!(u64::from(entry.frame), frame >> 12, "view page {page:#x}");
+            assert!(entry.write_tag == 0 || rights.supervisor_write, "{page:#x}");
+            assert!(entry.user_read_tag == 0 || rights.user_read, "{page:#x}");
+            assert!(entry.user_write_tag == 0 || rights.user_write, "{page:#x}");
+        }
     }
 }
 
@@ -254,9 +399,7 @@ pub unsafe extern "C" fn machine_load(
     let (mask, routed, order) = split(config);
     // In: the instruction's IP, which the compiled block stored there.
     let ip = ctx.machine_value;
-    match crate::interp::legacy::machine_jit::access(
-        cpu, memory, mask, routed, order, addr, size as u8, None, ip,
-    ) {
+    match checked_access(ctx, cpu, memory, mask, routed, order, addr, size, None, ip) {
         crate::interp::legacy::machine_jit::Access::Done(value) => {
             ctx.machine_value = value;
             fill(ctx, cpu, memory, mask, routed, addr, size);
@@ -286,14 +429,15 @@ pub unsafe extern "C" fn machine_store(
     let (mask, routed, order) = split(config);
     // In: the instruction's IP, which the compiled block stored there.
     let ip = ctx.machine_value;
-    match crate::interp::legacy::machine_jit::access(
+    match checked_access(
+        ctx,
         cpu,
         memory,
         mask,
         routed,
         order,
         addr,
-        size as u8,
+        size,
         Some(value),
         ip,
     ) {
@@ -310,6 +454,47 @@ pub unsafe extern "C" fn machine_store(
         crate::interp::legacy::machine_jit::Access::Defer => ACCESS_DEFER,
     }
 }
+
+/// The helpers' checked access: unpaged, J1's; paged, the decision-32 §3
+/// miss helper, which completes an access only from an existing TLB
+/// translation and otherwise defers without walking.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn checked_access(
+    ctx: &MemCtx,
+    cpu: &mut CpuState,
+    memory: &crate::Memory,
+    mask: u32,
+    routed: bool,
+    order: u8,
+    addr: u64,
+    size: u64,
+    store: Option<u64>,
+    ip: u64,
+) -> crate::interp::legacy::machine_jit::Access {
+    if cpu.legacy.cr0 & PAGING == 0 {
+        return crate::interp::legacy::machine_jit::access(
+            cpu, memory, mask, routed, order, addr, size as u8, store, ip, None,
+        );
+    }
+    if ctx.ret_stack == 0 {
+        return crate::interp::legacy::machine_jit::Access::Defer;
+    }
+    // SAFETY: a Machine run points `ret_stack` at its vCPU's view, whose
+    // `sync` named the live TLB at this compiled entry.
+    let source = unsafe { (*(ctx.ret_stack as *const MachineTlb)).source };
+    if source == 0 {
+        return crate::interp::legacy::machine_jit::Access::Defer;
+    }
+    // SAFETY: as above; the paging state outlives the compiled call.
+    let tlb = unsafe { &*(source as *const PagedTlb) };
+    crate::interp::legacy::machine_jit::paged_access(
+        cpu, memory, tlb, routed, order, addr, size as u8, store, ip,
+    )
+}
+
+/// CR0.PG (SDM Vol 3A §2.5).
+const PAGING: u32 = 1 << 31;
 
 /// After a helper access inside one page, fill that page's slot of the view,
 /// when the run has one and its accesses are inlined (no host-fault routing).
@@ -329,7 +514,11 @@ fn fill(
     // SAFETY: a Machine run points `ret_stack` at its vCPU's view, which
     // nothing else touches during the compiled call.
     let tlb = unsafe { &mut *(ctx.ret_stack as *mut MachineTlb) };
-    tlb.fill(cpu, memory, mask, addr as u32);
+    if cpu.legacy.cr0 & PAGING == 0 {
+        tlb.fill(cpu, memory, mask, addr as u32);
+    } else {
+        tlb.fill_paged(cpu, memory, addr as u32);
+    }
 }
 
 /// Machine store barrier (decision-30 §4): an inline store wrote a page whose
@@ -375,13 +564,23 @@ mod tests {
     #[test]
     fn fast_entry_layout_matches_generated_code() {
         assert_eq!(size_of::<FastEntry>(), 1 << ENTRY_SHIFT);
-        assert_eq!(align_of::<FastEntry>(), 8);
+        assert_eq!(align_of::<FastEntry>(), 64);
         assert_eq!(offset_of!(FastEntry, read_tag) as i32, ENTRY_READ_TAG);
         assert_eq!(offset_of!(FastEntry, write_tag) as i32, ENTRY_WRITE_TAG);
         assert_eq!(offset_of!(FastEntry, addend) as i32, ENTRY_ADDEND);
         assert_eq!(offset_of!(FastEntry, tag_word) as i32, ENTRY_TAG_WORD);
         assert_eq!(offset_of!(FastEntry, frame) as i32, ENTRY_FRAME);
         assert_eq!(offset_of!(FastEntry, tag_bit) as i32, ENTRY_TAG_BIT);
+        assert_eq!(
+            offset_of!(FastEntry, user_read_tag) as i32,
+            ENTRY_USER_READ_TAG
+        );
+        assert_eq!(
+            offset_of!(FastEntry, user_write_tag) as i32,
+            ENTRY_USER_WRITE_TAG
+        );
+        assert_eq!(tag_offsets(0), (ENTRY_READ_TAG, ENTRY_WRITE_TAG));
+        assert_eq!(tag_offsets(3), (ENTRY_USER_READ_TAG, ENTRY_USER_WRITE_TAG));
         assert_eq!(offset_of!(MachineTlb, entries), 0);
         assert_eq!(offset_of!(MachineTlb, ring) as i64, RING_OFFSET);
         assert_eq!(RING_OFFSET % 8, 0);

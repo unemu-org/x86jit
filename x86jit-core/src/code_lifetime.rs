@@ -101,6 +101,10 @@ pub struct MachineTarget {
     pub icount: u32,
     /// The successor's `MachineBlockKey::flags`.
     pub flags: u32,
+    /// `flags`, and with paging on also the successor's linear page and bus
+    /// frame, which a paged chain must stay in (decision-32 §4): one compare
+    /// at a chain edge tests both.
+    pub edge: u64,
 }
 
 /// Shared by a backend and every cache publishing its units. No registry lock is

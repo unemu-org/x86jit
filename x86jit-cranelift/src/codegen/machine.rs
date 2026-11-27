@@ -31,6 +31,9 @@ pub(crate) struct MachineLowering {
     stored: bool,
     /// The block's last transfer (decision-31 §3).
     exit: abi::MachineExit,
+    /// The view's read and write tag offsets for the unit's CPL
+    /// (decision-32 §3): its key names the CPL, so the U/S check is free.
+    tags: (i32, i32),
 }
 
 impl MachineLowering {
@@ -45,6 +48,7 @@ impl MachineLowering {
             stop,
             stored: false,
             exit: abi::machine_exit(ir),
+            tags: abi::tag_offsets(ir.legacy_context.map_or(0, |c| c.cpl)),
         }
     }
 }
@@ -184,6 +188,105 @@ impl Translator<'_, '_> {
                         .icmp_imm_s(IntCC::UnsignedGreaterThan, offset, last as i64);
                 self.machine_defer_if(deferred);
                 self.set(*dst, offset);
+                Some(false)
+            }
+            // The 486 alignment gate (decision-32 §6), emitted at CPL 3 with
+            // CR0.AM set: #AC needs CPL 3, CR0.AM and EFLAGS.AC (SDM Vol 3A
+            // §7.15, Event 17, p. 7-53), so with both set the instruction
+            // defers before any effect and the interpreter decides it. AC
+            // changes only through deferred instructions (POPF), but both
+            // bits are read live. There is no CPL test: the lifter emits the
+            // gate only at CPL 3 (`lift::legacy::lower`), and the unit's key
+            // names its CPL, so it never runs at another.
+            IrOp::Legacy(LegacyOp::I486Gate) => {
+                use x86jit_core::CpuState;
+                let legacy = std::mem::offset_of!(CpuState, legacy);
+                let cr0 = self.builder.ins().uload32(
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    (legacy + std::mem::offset_of!(x86jit_core::legacy::LegacyCpuState, cr0))
+                        as i32,
+                );
+                let rflags = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    std::mem::offset_of!(CpuState, rflags_system) as i32,
+                );
+                let both = self.builder.ins().band(cr0, rflags);
+                let ac = self.builder.ins().band_imm_s(both, 1 << 18);
+                let deferred = self.builder.ins().icmp_imm_s(IntCC::NotEqual, ac, 0);
+                self.machine_defer_if(deferred);
+                Some(false)
+            }
+            // The live segment check of a Flat32 FS or GS operand (decision-32
+            // §6): the passing subset of the interpreter's `legacy::access`
+            // (SDM Vol 3A §§3.4.5.1, 6.3-6.4; 80386 PRM §§6.3.1.1-6.3.1.2
+            // pp. 6-4-6). A usable expand-up data segment, writable for a
+            // store, whose limit holds the whole operand, gives base + offset
+            // mod 2^32; anything else defers, and the interpreter raises the
+            // #GP or #SS. An operand that wraps past 4 GiB crosses a page and
+            // defers at its access.
+            IrOp::Legacy(LegacyOp::Address {
+                dst,
+                segment,
+                offset,
+                bytes,
+                access,
+            }) => {
+                use x86jit_core::legacy::{LegacyCpuState, SegmentCache};
+                use x86jit_core::CpuState;
+                let cache = (std::mem::offset_of!(CpuState, legacy)
+                    + std::mem::offset_of!(LegacyCpuState, segments)
+                    + *segment as usize * std::mem::size_of::<SegmentCache>())
+                    as i32;
+                let field = |f: usize| cache + f as i32;
+                let offset = self.val(*offset);
+                let base = self.builder.ins().uload32(
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    field(std::mem::offset_of!(SegmentCache, base)),
+                );
+                let limit = self.builder.ins().uload32(
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    field(std::mem::offset_of!(SegmentCache, limit)),
+                );
+                let attributes = self.builder.ins().uload16(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    field(std::mem::offset_of!(SegmentCache, attributes)),
+                );
+                let unusable = self.builder.ins().uload8(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    field(std::mem::offset_of!(SegmentCache, unusable)),
+                );
+                // Type bits 3:1: code, expand-down, writable.
+                let (mask, want) = if *access == x86jit_core::AccessKind::Write {
+                    (0xe, 0x2)
+                } else {
+                    (0xc, 0)
+                };
+                let kind = self.builder.ins().band_imm_s(attributes, mask);
+                let wrong = self.builder.ins().icmp_imm_s(IntCC::NotEqual, kind, want);
+                let unusable = self.builder.ins().icmp_imm_s(IntCC::NotEqual, unusable, 0);
+                let last = self
+                    .builder
+                    .ins()
+                    .iadd_imm_s(offset, i64::from(bytes.saturating_sub(1)));
+                let beyond = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, last, limit);
+                let refused = self.builder.ins().bor(wrong, unusable);
+                let refused = self.builder.ins().bor(refused, beyond);
+                self.machine_defer_if(refused);
+                let linear = self.builder.ins().iadd(base, offset);
+                let linear = self.builder.ins().band_imm_s(linear, 0xffff_ffff);
+                self.set(*dst, linear);
                 Some(false)
             }
             // A live instruction field (decision-30 §5): one load of its bytes
@@ -459,7 +562,8 @@ impl Translator<'_, '_> {
     /// A load through the view, the helper on a miss or a page-crossing access.
     fn machine_inline_load(&mut self, addr: Value, size: u8, config: u64) -> Value {
         self.sync_guest_fault_state();
-        let (entry, ok) = self.machine_probe(addr, size, abi::ENTRY_READ_TAG);
+        let tag = self.machine.as_ref().unwrap().tags.0;
+        let (entry, ok) = self.machine_probe(addr, size, tag);
         let fast = self.builder.create_block();
         let slow = self.builder.create_block();
         let join = self.builder.create_block();
@@ -491,7 +595,8 @@ impl Translator<'_, '_> {
     /// may stop the block after this instruction. The helper on a miss.
     fn machine_inline_store(&mut self, addr: Value, value: Value, size: u8, config: u64) -> Value {
         self.sync_guest_fault_state();
-        let (entry, ok) = self.machine_probe(addr, size, abi::ENTRY_WRITE_TAG);
+        let tag = self.machine.as_ref().unwrap().tags.1;
+        let (entry, ok) = self.machine_probe(addr, size, tag);
         let fast = self.builder.create_block();
         let slow = self.builder.create_block();
         let note = self.builder.create_block();

@@ -60,8 +60,15 @@ pub(crate) fn lowered_op(op: &IrOp) -> bool {
             | L::Checkpoint
             | L::LiveField { .. }
             | L::ReadSelector { .. }
-            | L::Loop { .. },
+            | L::Loop { .. }
+            // Decision-32 §6: the 486 alignment gate, which defers when
+            // CR0.AM and EFLAGS.AC are both set.
+            | L::I486Gate,
         ) => true,
+        // Decision-32 §6: the live segment check Flat32 leaves on FS and GS
+        // operands, inline for its passing subset. An execute check is never
+        // lifted as one in Flat32 code.
+        IrOp::Legacy(L::Address { access, .. }) => *access != crate::AccessKind::Execute,
         _ => false,
     }
 }
@@ -76,7 +83,7 @@ fn fallible(op: &IrOp) -> bool {
         IrOp::Load { .. }
             | IrOp::Store { .. }
             | IrOp::Div { .. }
-            | IrOp::Legacy(L::Flat32Address { .. })
+            | IrOp::Legacy(L::Flat32Address { .. } | L::Address { .. } | L::I486Gate)
     )
 }
 
@@ -93,7 +100,12 @@ fn commits(op: &IrOp) -> bool {
         | IrOp::GetCond { .. }
         | IrOp::Bswap { .. }
         | IrOp::Legacy(
-            L::Flat32Address { .. } | L::Checkpoint | L::LiveField { .. } | L::ReadSelector { .. },
+            L::Flat32Address { .. }
+            | L::Address { .. }
+            | L::I486Gate
+            | L::Checkpoint
+            | L::LiveField { .. }
+            | L::ReadSelector { .. },
         ) => false,
         IrOp::Add { set_flags, .. }
         | IrOp::Adc { set_flags, .. }
@@ -151,6 +163,68 @@ pub(super) fn plain_outcome(outcome: &Outcome) -> bool {
         && !outcome.software_interrupt
 }
 
+/// Why a compiled access or check deferred (decision-32 §9 done-when 1, the
+/// DEFER census), indexed as `MachineJitCounters::DEFER_CAUSE_NAMES`.
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_TLB_MISS: u8 = 0;
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_RIGHTS: u8 = 1;
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_CLEAN_WRITE: u8 = 2;
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_PAGE_CROSSING: u8 = 3;
+pub(crate) const CAUSE_DEVICE: u8 = 4;
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_AC_GATE: u8 = 5;
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_SEGMENT: u8 = 6;
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) const CAUSE_OTHER: u8 = 7;
+pub(crate) const CAUSES: usize = 8;
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    /// The cause of the access helper's last defer on this thread.
+    static DEFER_CAUSE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+#[inline(always)]
+fn note_cause(cause: impl FnOnce() -> u8) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    DEFER_CAUSE.with(|c| {
+        if c.get().is_none() {
+            c.set(Some(cause()));
+        }
+    });
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = cause;
+}
+
+/// The cause of a run-time defer at instruction `ordinal` of `ir`: the
+/// helper's, or for an inline check, the check the instruction holds.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn take_defer_cause(ir: &IrBlock, ordinal: u64, cpu: &CpuState) -> u8 {
+    if let Some(cause) = DEFER_CAUSE.with(|c| c.take()) {
+        return cause;
+    }
+    let from = instruction_op(ir, ordinal) + 1;
+    let ops = &ir.ops[from..];
+    let ops = &ops[..ops
+        .iter()
+        .position(|op| matches!(op, IrOp::InsnStart { .. }))
+        .unwrap_or(ops.len())];
+    if ops.iter().any(|op| matches!(op, IrOp::Legacy(L::I486Gate))) && alignment_regime(cpu) {
+        CAUSE_AC_GATE
+    } else if ops
+        .iter()
+        .any(|op| matches!(op, IrOp::Legacy(L::Address { .. })))
+    {
+        CAUSE_SEGMENT
+    } else {
+        CAUSE_OTHER
+    }
+}
+
 /// What the compiled access helper reports.
 pub(crate) enum Access {
     /// The access completed; a read's value.
@@ -168,7 +242,9 @@ pub(crate) enum Access {
 /// exit, the retry ledger and the fault itself, and a deferred instruction
 /// has written nothing.
 ///
-/// `ip` is the instruction's own IP, which the in-block device path reports.
+/// `ip` is the instruction's own IP, which the in-block device path reports,
+/// with `linear`, the access's linear address when paging is on (the address
+/// the paged exit path reports, `Vcpu::pending_mmio_linear_address`).
 /// The helper runs with `cpu.rip` at the block's start, not at the
 /// instruction: the walk's `read`/`write` key their MMIO retry ledger by RIP,
 /// so the entry contract (E5) guarantees there is no ledger to consult.
@@ -183,6 +259,7 @@ pub(crate) fn access(
     size: u8,
     store: Option<u64>,
     ip: u64,
+    linear: Option<u32>,
 ) -> Access {
     debug_assert!(
         !cpu.mmio_retry_active
@@ -211,10 +288,12 @@ pub(crate) fn access(
                 physical,
                 size,
                 store.unwrap_or(0),
+                linear,
             ) {
                 return Access::Done(value);
             }
         }
+        note_cause(|| CAUSE_DEVICE);
         return Access::Defer;
     }
     // A store in a VM with host-fault recovery could fault part-way through
@@ -259,6 +338,45 @@ pub(crate) fn access(
         "a preflighted RAM or ROM access trapped: {result:?}"
     );
     result.map_or(Access::Defer, Access::Done)
+}
+
+/// The paged compiled access (decision-32 §3, the miss helper with PG = 1):
+/// a translation the TLB already holds for this CPL, with D set for a write
+/// (`paging::compiled_translation`), then J1's access of the physical
+/// address it names, whose bus gate is A20 alone (paging design §3.6). A TLB
+/// miss, a right the entry lacks, a clean page's first write and a page
+/// crossing defer before any effect: the interpreter's re-execution walks,
+/// sets A and D in its own order and raises the #PF.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paged_access(
+    cpu: &mut CpuState,
+    memory: &Memory,
+    tlb: &std::cell::RefCell<paging::Tlb>,
+    routed: bool,
+    order: u8,
+    addr: u64,
+    size: u8,
+    store: Option<u64>,
+    ip: u64,
+) -> Access {
+    let Some(physical) =
+        paging::compiled_translation(cpu, &tlb.borrow(), addr, size, store.is_some())
+    else {
+        note_cause(|| paging::compiled_refusal(cpu, &tlb.borrow(), addr, size, store.is_some()));
+        return Access::Defer;
+    };
+    access(
+        cpu,
+        memory,
+        u32::MAX,
+        routed,
+        order,
+        u64::from(physical),
+        size,
+        store,
+        ip,
+        Some(addr as u32),
+    )
 }
 
 /// The rest of an ordinary block from its instruction at op index `from`, with

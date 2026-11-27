@@ -67,3 +67,4 @@ mod legacy_x87_bcd;
 mod machine_j1_lockstep;
 mod machine_j2_devices;
 mod machine_j2b_chains;
+mod machine_j34_paged;

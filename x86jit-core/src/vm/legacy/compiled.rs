@@ -93,12 +93,20 @@ pub struct MachineJitCounters {
     /// Why each compiled turn's last block was the last, indexed by the
     /// `CHAIN_END_*` constants (decision-31 §8 done-when 1).
     pub chain_ends: [u64; CHAIN_ENDS],
+    /// Run-time defers by cause (decision-32 §9 done-when 1), named by
+    /// [`Self::DEFER_CAUSE_NAMES`].
+    pub defer_causes: [u64; machine_jit::CAUSES],
+    /// Instructions completed by compiled (or scripted) code at CPL 3.
+    pub compiled_retired_cpl3: u64,
+    /// Compiled (or scripted) entries with paging on.
+    pub paged_entries: u64,
 }
 
 /// Chain-end reasons (decision-31 §8): the edge's budget test, the dispatch
 /// word, the execution epoch, the flags compare, an empty slot (`RET_LINK`),
 /// a return-ring miss, an unchained exit (`RET_CONTINUE`, or a `RET_CHAIN`
-/// with no chain started: chains off or the cold epilogue), DEFER, STOP.
+/// with no chain started: chains off or the cold epilogue), DEFER, STOP, and
+/// a paged target outside the chain's page or frame (decision-32 §4).
 const CHAIN_END_BUDGET: usize = 0;
 const CHAIN_END_WORD: usize = 1;
 const CHAIN_END_EPOCH: usize = 2;
@@ -108,9 +116,23 @@ const CHAIN_END_RETURN_MISS: usize = 5;
 const CHAIN_END_UNCHAINED: usize = 6;
 const CHAIN_END_DEFER: usize = 7;
 const CHAIN_END_STOP: usize = 8;
-const CHAIN_ENDS: usize = 9;
+/// Decision-32 §4: a paged chain stays inside its first block's page.
+const CHAIN_END_PAGE: usize = 9;
+const CHAIN_ENDS: usize = 10;
 
 impl MachineJitCounters {
+    /// The names of [`Self::defer_causes`]' entries, in order.
+    pub const DEFER_CAUSE_NAMES: [&'static str; machine_jit::CAUSES] = [
+        "tlb miss",
+        "rights",
+        "clean write",
+        "page crossing",
+        "device or hole",
+        "ac gate",
+        "segment",
+        "other",
+    ];
+
     /// The names of [`Self::chain_ends`]' entries, in order.
     pub const CHAIN_END_NAMES: [&'static str; CHAIN_ENDS] = [
         "budget",
@@ -122,6 +144,7 @@ impl MachineJitCounters {
         "unchained",
         "defer",
         "stop",
+        "page",
     ];
 }
 
@@ -275,12 +298,20 @@ enum Request {
 /// link reaches through the block it returns (decision-30 §2, §6).
 pub(super) struct Slot {
     // Keeps the block's address from being reused while it names this slot.
-    ir: Arc<IrBlock>,
+    // Weak, so that the memo does not make the block's proof look held
+    // (`Arc::strong_count`, the proof maps' bound eviction): a compiling
+    // vCPU's 256 slots would otherwise pin up to 256 proofs.
+    ir: std::sync::Weak<IrBlock>,
     entry: Option<(crate::CompiledPtr, u64)>,
     hot: u32,
     request: Request,
     delay: u32,
     runs: u64,
+    /// Decision-32 Q7: the shared Machine map was looked up once, on the
+    /// slot's first eligible turn.
+    looked: bool,
+    /// The block's bus address, the key's `physical_pc`, once computed.
+    bus: u64,
 }
 
 /// Slots of the per-vCPU memo: a direct-mapped table keyed by the block a
@@ -486,6 +517,42 @@ pub(super) fn admits(vm: &Vm) -> bool {
         && !vm.backend.code_space_exhausted()
 }
 
+/// The bus address of a Flat32 block (decision-30 §2, decision-32 §4): its
+/// EIP through the model's bus mask and A20 with paging off; with paging on,
+/// through the TLB entry its fetch used, which a held paged proof keeps
+/// (`paging::State::holds`, the TLB token). `None` if the TLB holds none.
+fn block_bus(
+    cpu: &CpuState,
+    paging: Option<&super::paging::State>,
+    context: MachineContext,
+    ir: &IrBlock,
+) -> Option<u64> {
+    let eip = ir.guest_start & 0xffff_ffff;
+    if !context.paging_enabled {
+        return Some(
+            crate::legacy::physical_span(
+                cpu,
+                crate::legacy::physical_mask(context.generation),
+                eip,
+                1,
+            )
+            .0,
+        );
+    }
+    crate::interp::legacy::paging::fetched_bus(cpu, &paging?.tlb.borrow(), eip as u32)
+}
+
+/// Decision-32 §2: a paged block may enter a compiled unit when its bytes
+/// lie in one 4 KiB linear page (so one frame), no paged transaction or port
+/// completion is outstanding (E9), and the block came from a paged proof
+/// this turn, by a hit or a link the paged path validated (E10): its TLB
+/// token is the entry check that the fetch translation is the lifted one.
+#[inline(always)]
+fn paged_entry(paging: Option<&super::paging::State>, ir: &Arc<IrBlock>) -> bool {
+    (ir.guest_start & 0xfff) + u64::from(ir.guest_len) <= 0x1000
+        && paging.is_some_and(|state| state.idle() && state.holds(ir))
+}
+
 /// The compiled identity of a Flat32 block (decision-27 §1, decision-30 §2):
 /// everything its lift and lowering read besides its bytes.
 fn machine_key(
@@ -519,18 +586,29 @@ fn key_flags(context: MachineContext, cpu: &CpuState) -> u32 {
         | u32::from(cpu.legacy.cr0 & (1 << 18) != 0) << 13
 }
 
+/// A chain edge's key (`MachineTarget::edge`): the key flags, and with
+/// paging on (flags bit 11) the block's linear page and bus frame
+/// (decision-32 §4), packed above them.
+#[inline(always)]
+fn edge_key(flags: u32, linear: u64, bus: u64) -> u64 {
+    let paged = u64::from((flags >> 11) & 1);
+    let page = (((linear >> 12) & 0xf_ffff) << 14) | (((bus >> 12) & 0xf_ffff) << 34);
+    u64::from(flags) | (paged * page)
+}
+
 /// Publish a `RET_LINK`'s slot with the unit this turn enters (decision-31
 /// §2.4): a descriptor, stored with Release under the lifetime's lock only
 /// while `fill.epoch` is current and `entry` live, so a slot that a
 /// retirement cleared is never refilled with a dead entry.
 #[cold]
 #[inline(never)]
-fn fill_slot(vm: &Vm, fill: Fill, entry: crate::CompiledPtr, ir: &Arc<IrBlock>) {
+fn fill_slot(vm: &Vm, fill: Fill, entry: crate::CompiledPtr, ir: &Arc<IrBlock>, bus: u64) {
     let target = MachineTarget {
         entry,
         ir: ir.clone(),
         icount: ir.icount,
         flags: fill.flags,
+        edge: edge_key(fill.flags, ir.guest_start, bus),
     };
     let slot = fill.slot as *const AtomicU64;
     let _ = vm
@@ -641,14 +719,22 @@ impl Vcpu {
             .compiling
             .as_deref_mut()
             .and_then(|state| state.fill.take());
-        // E2: the admitted class. E3-E5: no boundary is due inside the block.
-        // E6: no fetch policy. Decision-29 adds two: compiled code assumes the
+        // E2: the admitted class (decision-32 §2): Flat32 at CPL 0 or 3, the
+        // unpaged ordinary walk or the paged one. CPL 1 and 2 stay
+        // interpreted (Q5). E3-E5: no boundary is due inside the block. E6: no
+        // fetch policy. Decision-29 adds two: compiled code assumes the
         // default MXCSR mode and does not clear RF, which a retiring
         // instruction does (SDM Vol 3B §20.3.1.1), so RF=1 stays interpreted.
-        if !(matches!(walk, BlockWalk::Direct)
-            && context.segment_class == crate::SegmentClass::Flat32
-            && !context.paging_enabled
-            && self.cpu.legacy.cpl == 0)
+        // Paged, E9 and E10 (`paged_entry`).
+        let paged = context.paging_enabled;
+        let cpl = self.cpu.legacy.cpl;
+        if !(context.segment_class == crate::SegmentClass::Flat32
+            && (cpl == 0 || cpl == 3)
+            && if paged {
+                matches!(walk, BlockWalk::Paged)
+            } else {
+                matches!(walk, BlockWalk::Direct)
+            })
         {
             return None;
         }
@@ -662,7 +748,8 @@ impl Vcpu {
             && !self.cpu.mmio_retry_active
             && vm.mem.fetch_policy.is_none()
             && self.cpu.mxcsr & crate::jit_abi::fp::MODE_MASK == 0
-            && self.cpu.rflags_system & (1 << 16) == 0;
+            && self.cpu.rflags_system & (1 << 16) == 0
+            && (!paged || paged_entry(execution.paging.as_deref(), ir));
         if !eligible {
             execution.machine_jit.counters().refused += 1;
             return None;
@@ -674,13 +761,20 @@ impl Vcpu {
             state.tlb.reconcile(
                 self.cpu.legacy.a20_enabled != 0,
                 crate::legacy::physical_mask(context.generation),
+                paged,
             );
+            if paged {
+                // `paged_entry` found the paging state.
+                state
+                    .tlb
+                    .sync(&self.cpu, &execution.paging.as_deref().unwrap().tlb);
+            }
             if !state.memo[index]
                 .as_ref()
-                .is_some_and(|slot| Arc::ptr_eq(&slot.ir, ir))
+                .is_some_and(|slot| std::ptr::eq(slot.ir.as_ptr(), Arc::as_ptr(ir)))
             {
                 state.memo[index] = Some(Slot {
-                    ir: ir.clone(),
+                    ir: Arc::downgrade(ir),
                     entry: None,
                     hot: 0,
                     request: Request::None,
@@ -689,29 +783,46 @@ impl Vcpu {
                         _ => 0,
                     },
                     runs: 0,
+                    looked: false,
+                    bus: 0,
                 });
             }
             let slot = state.memo[index].as_mut().unwrap();
             slot.runs += 1;
             if let MachineJitMode::Scripted(seed) = vm.machine_jit {
+                // A scripted STOP at a random ordinal starts the next turn
+                // inside the block, which lifts a block there. The lift-count
+                // witnesses read such lifts as lost proofs (the unpaged
+                // reduced identity, decision-30 §7, shared across IOPL) or
+                // as a paged working set past its bound, so scripted units
+                // stay in the J2 class: unpaged, CPL 0. Paged and CPL-3
+                // units are witnessed in the Forced, Delayed and background
+                // modes.
+                if paged || cpl != 0 {
+                    return None;
+                }
                 let runs = slot.runs;
-                let chain = chains(vm) && !boundary.cold_epilogue;
-                return Some(self.scripted::<ROUTED, ORDER>(
+                // A scripted chain resolves its next block, which may lift it:
+                // the lift and proof-map witnesses count that. It chains the
+                // J2 class only, unpaged at CPL 0; paged and CPL-3 scripted
+                // units complete, defer and stop without chaining.
+                let chain = chains(vm) && !boundary.cold_epilogue && !paged && cpl == 0;
+                let before = state.counters.compiled_retired;
+                let result = self.scripted::<ROUTED, ORDER>(
                     vm, ir, context, remaining, seed, runs, exit_word, chain, hook,
-                ));
+                );
+                self.count_privilege(paged, cpl, before);
+                return Some(result);
             }
         }
-        let generation = execution.flat32.generation();
-        // The block's bus address: a Flat32 linear address is its EIP.
-        let physical = || {
-            crate::legacy::physical_span(
-                &self.cpu,
-                crate::legacy::physical_mask(context.generation),
-                ir.guest_start & 0xffff_ffff,
-                1,
-            )
-            .0
+        let generation = if paged {
+            execution.paging.as_deref().unwrap().proof_generation()
+        } else {
+            execution.flat32.generation()
         };
+        // The block's bus address (`block_bus`).
+        let paging = execution.paging.as_deref();
+        let physical = || block_bus(&self.cpu, paging, context, ir);
         let model = self.legacy_model.map_or(0, |m| m.model_semantics_id);
         let retired = self.retired;
         let State {
@@ -724,7 +835,8 @@ impl Vcpu {
         let cold = state.memo[index]
             .as_ref()
             .is_some_and(|slot| slot.entry.is_none() && slot.request == Request::None)
-            && state.demoted(physical() >> crate::memory::CODE_PAGE_BITS, retired);
+            && physical()
+                .is_none_or(|bus| state.demoted(bus >> crate::memory::CODE_PAGE_BITS, retired));
         if cold {
             return None;
         }
@@ -765,7 +877,18 @@ impl Vcpu {
                 return None;
             }
             None => {
+                // Decision-32 Q7: a fresh slot (a new lift of a block, after a
+                // relift that a CR3 load forced, or a memo conflict) looks the
+                // shared map up once, so a unit another lift, address space
+                // or vCPU published is entered at once.
+                let found = if slot.looked {
+                    None
+                } else {
+                    slot.looked = true;
+                    fresh_lookup(vm, ir, physical(), context, &self.cpu, model)
+                };
                 let ready = match slot.request {
+                    _ if found.is_some() => true,
                     Request::None => {
                         slot.hot += 1;
                         vm.machine_jit != MachineJitMode::Off
@@ -783,17 +906,21 @@ impl Vcpu {
                 if !ready {
                     return None;
                 }
-                let physical = physical();
-                let key = machine_key(ir, physical, context, &self.cpu, model);
-                let config = crate::jit_abi::machine::access_config(
-                    crate::legacy::physical_mask(context.generation),
-                    ROUTED,
-                    ORDER,
-                );
-                let (found, compiled) =
-                    tier_up(vm, ir, key, physical, generation, config, slot, exit_word)?;
+                let physical = physical()?;
+                let (found, compiled) = if let Some(found) = found {
+                    (found, false)
+                } else {
+                    let key = machine_key(ir, physical, context, &self.cpu, model);
+                    let config = crate::jit_abi::machine::access_config(
+                        crate::legacy::physical_mask(context.generation),
+                        ROUTED,
+                        ORDER,
+                    );
+                    tier_up(vm, ir, key, physical, generation, config, slot, exit_word)?
+                };
                 counters.compiled += u64::from(compiled);
                 slot.entry = Some((found, epoch));
+                slot.bus = physical;
                 if slot.delay != 0 {
                     return None;
                 }
@@ -805,7 +932,7 @@ impl Vcpu {
                 && fill.target == ir.guest_start
                 && fill.flags == key_flags(context, &self.cpu)
             {
-                fill_slot(vm, fill, entry, ir);
+                fill_slot(vm, fill, entry, ir, slot.bus);
             }
         }
         // Continuation slots pushed in an earlier epoch may name retired
@@ -816,6 +943,8 @@ impl Vcpu {
         }
         let lifetime = lifetime.as_deref().expect("a Machine run lifetime");
         // The hot path's counters exist for the witnesses only.
+        #[cfg(any(test, feature = "test-hooks"))]
+        let before = counters.compiled_retired;
         #[cfg(any(test, feature = "test-hooks"))]
         {
             counters.entries += 1;
@@ -842,6 +971,13 @@ impl Vcpu {
         if chain {
             let chain_flags = key_flags(context, &self.cpu);
             flags = Some(chain_flags);
+            // Decision-32 §4: a paged chain stays in this block's linear page
+            // and bus frame. Compiled code changes no TLB entry, so the fetch
+            // translation the first entry validated (E10) holds for the whole
+            // chain, and a target in the same page and frame is a unit of
+            // the bytes a fetch would now read. Other pages return to the
+            // dispatcher, whose link or resolve carries their own token.
+            let chain_edge = edge_key(chain_flags, ir.guest_start, slot.bus);
             loop {
                 let completed = cur.map_or(n, |t| u64::from(t.icount));
                 // SAFETY: a filled Machine slot holds a `MachineTarget`,
@@ -858,8 +994,12 @@ impl Vcpu {
                     Some(CHAIN_END_WORD)
                 } else if lifetime.epoch() != epoch {
                     Some(CHAIN_END_EPOCH)
-                } else if t.flags != chain_flags {
-                    Some(CHAIN_END_FLAGS)
+                } else if t.edge != chain_edge {
+                    Some(if t.flags != chain_flags {
+                        CHAIN_END_FLAGS
+                    } else {
+                        CHAIN_END_PAGE
+                    })
                 } else if remaining - done < u64::from(t.icount) {
                     Some(CHAIN_END_BUDGET)
                 } else {
@@ -910,11 +1050,13 @@ impl Vcpu {
             crate::time_stats::interpreted();
         }
         let ordinal = ctx.machine_ordinal;
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let before = 0;
         let Some(last) = last else {
-            return Some((
-                self.machine_result::<ROUTED, ORDER>(vm, ir, code, ordinal, remaining, exit_word),
-                None,
-            ));
+            let result =
+                self.machine_result::<ROUTED, ORDER>(vm, ir, code, ordinal, remaining, exit_word);
+            self.count_privilege(paged, cpl, before);
+            return Some((result, None));
         };
         // §4.4: a DEFER's suffix serves its transfers for the last block.
         if let Some(hook) = hook {
@@ -928,7 +1070,30 @@ impl Vcpu {
             remaining - prefix,
             exit_word,
         );
+        self.count_privilege(paged, cpl, before);
         Some((result, Some(Chain { prefix, ir: last })))
+    }
+
+    /// Test-only: a compiled turn's instructions at CPL 3 and its entries
+    /// with paging on (decision-32 §9 done-when 1), from its compiled-retired
+    /// count `before` the turn.
+    #[inline(always)]
+    fn count_privilege(&mut self, paged: bool, cpl: u8, before: u64) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let counters = self
+                .legacy_execution
+                .as_mut()
+                .unwrap()
+                .machine_jit
+                .counters();
+            if cpl == 3 {
+                counters.compiled_retired_cpl3 += counters.compiled_retired - before;
+            }
+            counters.paged_entries += u64::from(paged);
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = (paged, cpl, before);
     }
 
     /// A compiled block's return, for `ir`, the block that returned it, with
@@ -984,6 +1149,11 @@ impl Vcpu {
                 let c = ordinal & !HELPER_DEFER;
                 if ordinal & HELPER_DEFER != 0 {
                     counters.helper_defers += 1;
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    {
+                        let cause = machine_jit::take_defer_cause(ir, c, &self.cpu);
+                        counters.defer_causes[usize::from(cause)] += 1;
+                    }
                 } else {
                     counters.unconditional_defers += 1;
                 }
@@ -1017,17 +1187,25 @@ impl Vcpu {
         if c != 0 {
             crate::vm::device::advance_armed(c);
         }
+        let from = machine_jit::instruction_op(ir, c);
+        // Decision-32 §3: a paged block's rest takes the paged walk, which
+        // walks, sets A and D, raises #PF and publishes CR2 itself.
+        let suffix = if self.cpu.legacy.cr0 & (1 << 31) != 0 {
+            self.execute_paged_from::<ROUTED, ORDER>(vm, ir, remaining - c, from)
+        } else {
+            let execution = self.legacy_execution.as_mut().unwrap();
+            machine_jit::execute_suffix::<ROUTED, ORDER>(
+                ir,
+                &mut self.cpu,
+                &vm.mem,
+                &mut self.interp_scratch,
+                remaining - c,
+                exit_word,
+                &mut execution.task_switch,
+                from,
+            )
+        };
         let execution = self.legacy_execution.as_mut().unwrap();
-        let suffix = machine_jit::execute_suffix::<ROUTED, ORDER>(
-            ir,
-            &mut self.cpu,
-            &vm.mem,
-            &mut self.interp_scratch,
-            remaining - c,
-            exit_word,
-            &mut execution.task_switch,
-            machine_jit::instruction_op(ir, c),
-        );
         let counters = execution.machine_jit.counters();
         counters.compiled_retired += c;
         counters.defers_at_zero += u64::from(c == 0);
@@ -1112,7 +1290,12 @@ impl Vcpu {
                     .ok()
                     .filter(|(_, walk)| matches!(walk, BlockWalk::Direct))
             };
-            let counters = execution.machine_jit.counters();
+            let counters = self
+                .legacy_execution
+                .as_mut()
+                .unwrap()
+                .machine_jit
+                .counters();
             let Some((next, _)) = next else {
                 census(counters, CHAIN_END_UNCHAINED);
                 return (result, (prefix != 0).then_some(Chain { prefix, ir: cur }));
@@ -1151,11 +1334,16 @@ impl Vcpu {
         z ^= z >> 31;
         let c = z % (n + 1);
         let kind = (z >> 32) % 3;
-        let execution = self.legacy_execution.as_mut().unwrap();
-        execution.machine_jit.counters().entries += 1;
+        self.legacy_execution
+            .as_mut()
+            .unwrap()
+            .machine_jit
+            .counters()
+            .entries += 1;
         let prefix = if c == 0 {
             machine_jit::completed(0)
         } else {
+            let execution = self.legacy_execution.as_mut().unwrap();
             crate::interp::legacy::execute_instructions::<ROUTED, ORDER>(
                 ir,
                 &mut self.cpu,
@@ -1166,7 +1354,12 @@ impl Vcpu {
                 &mut execution.task_switch,
             )
         };
-        let counters = execution.machine_jit.counters();
+        let counters = self
+            .legacy_execution
+            .as_mut()
+            .unwrap()
+            .machine_jit
+            .counters();
         if !machine_jit::is_completed(&prefix, c) {
             // The interpreter itself ended the prefix: its result is the walk's.
             census(counters, CHAIN_END_UNCHAINED);
@@ -1206,6 +1399,22 @@ impl Vcpu {
             z,
         )
     }
+}
+
+/// Decision-32 Q7: the shared unit of a block's key, looked up once when a
+/// vCPU first meets that lift.
+#[cold]
+#[inline(never)]
+fn fresh_lookup(
+    vm: &Vm,
+    ir: &IrBlock,
+    physical: Option<u64>,
+    context: MachineContext,
+    cpu: &CpuState,
+    model: u64,
+) -> Option<crate::CompiledPtr> {
+    vm.cache
+        .machine_unit(&machine_key(ir, physical?, context, cpu, model))
 }
 
 /// Find or start this block's shared unit (decision-30 §2). A published unit

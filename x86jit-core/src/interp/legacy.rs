@@ -3109,18 +3109,8 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
         }
     }
 
-    /// The block from its first instruction to the outcome that ends it.
-    #[inline(always)]
-    pub(super) fn run(
-        &mut self,
-        cpu: &mut CpuState,
-        temps: &mut [u64],
-        retry: &mut Option<paging::Transaction>,
-    ) -> Result<Outcome, Exit> {
-        self.run_from(cpu, temps, retry, 0)
-    }
-
-    /// [`Self::run`] from the instruction whose marker is op `at`.
+    /// The block from the instruction whose marker is op `at` (0: the
+    /// block's first) to the outcome that ends it.
     #[inline(always)]
     pub(super) fn run_from(
         &mut self,

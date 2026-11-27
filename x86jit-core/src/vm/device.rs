@@ -1173,8 +1173,11 @@ fn sole_access(ir: &crate::ir::IrBlock, ip: u64) -> Option<u64> {
             // A segment limit check faults before the access, so before any call.
             IrOp::SegLimitCheck { .. } if !accessed => {}
             // So does the Flat32 whole-operand check (decision-30 §4): a
-            // compiled Flat32 access reaches the device only past it.
-            IrOp::Legacy(L::Flat32Address { .. }) if !accessed => {}
+            // compiled Flat32 access reaches the device only past it, and
+            // the live FS/GS check and the 486 alignment gate (decision-32
+            // §6), which refuse before any effect.
+            IrOp::Legacy(L::Flat32Address { .. } | L::Address { .. } | L::I486Gate)
+                if !accessed => {}
             op if pure(op) => {}
             _ => return None,
         }
@@ -1258,6 +1261,7 @@ fn armed<'h>(
 /// ordinary handoff.
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn in_block_access(
     ir: *const crate::ir::IrBlock,
     ip: u64,
@@ -1265,6 +1269,7 @@ pub(crate) fn in_block_access(
     address: u64,
     size: u8,
     value: u64,
+    linear: Option<u32>,
 ) -> Option<u64> {
     let (hook, run, vm, block) = armed(ir, address, size)?;
     let completed = {
@@ -1282,7 +1287,9 @@ pub(crate) fn in_block_access(
         retired_instructions: hook.retired.get() + completed,
         steps: hook.steps.get() + completed,
     };
-    serve(hook, run, vm, ip, position, write, address, size, value)
+    serve(
+        hook, run, vm, ip, position, write, address, size, value, linear,
+    )
 }
 /// A compiled Machine unit deferred at ordinal `completed` of the block the
 /// hook is armed for (decision-30 §4): the interpreted pass that walks the
@@ -1334,7 +1341,9 @@ pub(crate) fn in_pass_access(
         retired_instructions: hook.retired.get() + retired,
         steps: hook.steps.get() + steps,
     };
-    let answer = serve(hook, run, vm, ip, position, write, address, size, value);
+    let answer = serve(
+        hook, run, vm, ip, position, write, address, size, value, None,
+    );
     #[cfg(test)]
     if answer.is_some() {
         IN_PASS_TEST.with(|t| t.set(t.get() + 1));
@@ -1355,6 +1364,7 @@ fn serve(
     address: u64,
     size: u8,
     value: u64,
+    linear_address: Option<u32>,
 ) -> Option<u64> {
     let mask = u64::MAX >> (64 - u32::from(size) * 8);
     let request = DeviceRequest {
@@ -1369,9 +1379,10 @@ fn serve(
         value: if write { value & mask } else { 0 },
         total_size: u16::from(size),
         part: 0,
-        // An armed walk runs an unpaged block: the handoff names no
-        // linear address (`Vcpu::pending_mmio_linear_address`).
-        linear_address: None,
+        // An armed interpreted walk runs an unpaged block, whose handoff
+        // names no linear address; a paged compiled access names its own,
+        // as the paged exit path does (`Vcpu::pending_mmio_linear_address`).
+        linear_address,
         instruction_ip: ip,
         code_segment: hook.code_segment.get(),
         event: None,

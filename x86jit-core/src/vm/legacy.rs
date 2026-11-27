@@ -4028,13 +4028,26 @@ impl Vcpu {
                     if KIND == MACHINE_DISPATCH && ctx.ret_stack != 0 && !direct {
                         // Decision-27 §2.5: shared units dropped by a code write.
                         // The page the compiled key names: a Flat32 EIP
-                        // through the bus mask (`compiled::machine_key`).
+                        // through the bus mask, or with paging through the
+                        // TLB entry its fetch used (`compiled::block_bus`).
                         let eip = self.cpu.rip & 0xffff_ffff;
-                        let fetched =
-                            crate::legacy::physical_span(&self.cpu, physical_mask, eip, 1).0;
-                        execution
-                            .machine_jit
-                            .note_code_drop(fetched >> crate::memory::CODE_PAGE_BITS, self.retired);
+                        let fetched = if context.paging_enabled {
+                            execution.paging.as_deref().and_then(|state| {
+                                crate::interp::legacy::paging::fetched_bus(
+                                    &self.cpu,
+                                    &state.tlb.borrow(),
+                                    eip as u32,
+                                )
+                            })
+                        } else {
+                            Some(crate::legacy::physical_span(&self.cpu, physical_mask, eip, 1).0)
+                        };
+                        if let Some(fetched) = fetched {
+                            execution.machine_jit.note_code_drop(
+                                fetched >> crate::memory::CODE_PAGE_BITS,
+                                self.retired,
+                            );
+                        }
                     }
                     if let Some(last) = execution.last_direct_fetch {
                         // This bounded page hint is only a lowering choice. Precise

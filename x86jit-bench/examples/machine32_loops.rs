@@ -16,6 +16,11 @@
 //! Path machine-paged-v86-gp (workloads v86gp, v86gp-free) runs paged V86 at
 //! IOPL 0 with an IN every 266 retired that a ring-0 #GP monitor emulates;
 //! v86gp-free replaces the IN and monitor with the same count of V86 work.
+//! Decision-32 (J3+J4): machine-paged32-bg and machine-paged32-cpl3-bg are the
+//! paged paths in the production configuration; the cr3switch workload is
+//! the register loop in two address spaces that share the code and data
+//! pages, with a CR3 load every MACHINE32_CR3_INTERVAL iterations (default
+//! 1000), on the CPL-0 paged32 paths only.
 use std::sync::Arc;
 use std::time::Instant;
 use x86jit_core::{
@@ -47,7 +52,7 @@ fn instructions() -> u64 {
     0
 }
 
-const PATHS: [&str; 19] = [
+const PATHS: [&str; 21] = [
     "machine-real16",
     "machine-protected32",
     "machine-paged32",
@@ -73,10 +78,29 @@ const PATHS: [&str; 19] = [
     // Decision-31 (J2b): the same with chains off (`--features test-hooks`;
     // chained without it), the reference for the chain edge's cost.
     "machine-protected32-bg-nochain",
+    // Decision-32 (J3+J4): paged Flat32 at CPL 0 and CPL 3, background T1 = 50.
+    "machine-paged32-bg",
+    "machine-paged32-cpl3-bg",
 ];
-const WORKS: [&str; 6] = [
-    "register", "memory", "callret", "farseg", "farcall", "segmix",
+const WORKS: [&str; 7] = [
+    "register",
+    "memory",
+    "callret",
+    "farseg",
+    "farcall",
+    "segmix",
+    "cr3switch",
 ];
+
+fn cr3_interval() -> u64 {
+    let n = std::env::var("MACHINE32_CR3_INTERVAL").map_or(1000, |s| s.parse().unwrap());
+    assert!(n >= 1);
+    n
+}
+
+/// The second address space's page directory; its table is at 1D000h. Both
+/// map every page as the first does (`setup`).
+const CR3_SECOND: u32 = 0x1c000;
 
 fn farcall_interval() -> u64 {
     let n = std::env::var("MACHINE32_FAR_INTERVAL").map_or(25, |s| s.parse().unwrap());
@@ -112,6 +136,30 @@ fn code(work: &str, real: bool) -> Vec<u8> {
         // CALL sub; DEC DI; JNZ start; HLT; sub: INC A; RET.
         "callret" if real => vec![0xe8, 4, 0, 0x4f, 0x75, 0xfa, 0xf4, 0x40, 0xc3],
         "callret" => vec![0xe8, 4, 0, 0, 0, 0x4f, 0x75, 0xf8, 0xf4, 0x40, 0xc3],
+        // The register loop; every `cr3_interval()` iterations (ECX counts
+        // them down) the other address space: XOR EBP, CR3_SECOND ^ 1000h;
+        // MOV CR3, EBP; MOV ECX, interval. EBP starts at 1000h and ECX at the
+        // interval (`execute`).
+        "cr3switch" => {
+            use iced_x86::code_asm::*;
+            let mut a = CodeAssembler::new(32).unwrap();
+            let mut top = a.create_label();
+            let mut stay = a.create_label();
+            a.set_label(&mut top).unwrap();
+            a.inc(eax).unwrap();
+            a.add(ebx, eax).unwrap();
+            a.xor(edx, ebx).unwrap();
+            a.dec(ecx).unwrap();
+            a.jne(stay).unwrap();
+            a.xor(ebp, CR3_SECOND ^ 0x1000).unwrap();
+            a.mov(cr3, ebp).unwrap();
+            a.mov(ecx, cr3_interval() as u32).unwrap();
+            a.set_label(&mut stay).unwrap();
+            a.dec(edi).unwrap();
+            a.jne(top).unwrap();
+            a.hlt().unwrap();
+            a.assemble(CODE).unwrap()
+        }
         _ => panic!("unknown workload"),
     }
 }
@@ -136,7 +184,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
         #[cfg(feature = "test-hooks")]
         vm.set_machine_jit_for_test(x86jit_core::MachineJitMode::Forced);
         vm
-    } else if path == "machine-protected32-bg" || path == "machine-protected32-bg-nochain" {
+    } else if path.ends_with("-bg") || path == "machine-protected32-bg-nochain" {
         let mut vm = Vm::with_backend(
             VmConfig::flat(memory_size),
             Box::new(JitBackend::with_opt_level(OptLevel::Speed)),
@@ -157,7 +205,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     let seg16 = path.contains("protected16") || path.contains("paged16");
     let seg32 = path.contains("32seg");
     let v86 = path == "machine-paged-v86";
-    let user = path.ends_with("-cpl3") || v86;
+    let user = path.contains("-cpl3") || v86;
     let paged = path.starts_with("machine-paged");
     if machine {
         vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
@@ -259,6 +307,18 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
             )
             .unwrap();
         }
+        if work == "cr3switch" {
+            // The second directory names a second table with the same entries.
+            vm.write_bytes(u64::from(CR3_SECOND), &(0x1d000u32 | rights).to_le_bytes())
+                .unwrap();
+            for page in 0..(memory_size / 4096) as u32 {
+                vm.write_bytes(
+                    0x1d000 + u64::from(4 * page),
+                    &((page * 4096) | rights).to_le_bytes(),
+                )
+                .unwrap();
+            }
+        }
     }
     let mut cpu = vm.new_vcpu();
     if real {
@@ -348,7 +408,7 @@ fn setup(path: &str, work: &str) -> (Vm, x86jit_core::Vcpu) {
     (vm, cpu)
 }
 
-fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64, sliced: bool) {
+fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64, sliced: bool, cr3: bool) {
     // Real16 loops use DI, so split into runs without adding guest setup ops.
     let mut remaining = n;
     while remaining != 0 {
@@ -362,6 +422,12 @@ fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, real: bool, n: u64, sliced: boo
         cpu.set_reg(Reg::Rdi, count);
         cpu.set_reg(Reg::Rsi, if seg16 { 0 } else { DATA });
         cpu.set_reg(Reg::Rsp, if seg16 { 0x3000 } else { STACK });
+        if cr3 {
+            // cr3switch: the first address space and a full interval.
+            cpu.set_reg(Reg::Rbp, 0x1000);
+            cpu.set_reg(Reg::Rcx, cr3_interval());
+            cpu.cpu.legacy.cr3 = 0x1000;
+        }
         let exit = if sliced {
             loop {
                 cpu.disable_delivery_log();
@@ -435,6 +501,8 @@ fn main() {
                 let seg32 = path.contains("32seg");
                 if ((base_work == "farseg" || base_work == "segmix") && !seg16 && !seg32 && !v86)
                     || (base_work == "segmix" && sliced)
+                    || (base_work == "cr3switch"
+                        && (!path.starts_with("machine-paged32") || path.contains("-cpl3")))
                     || (base_work == "farcall"
                         && (!path.starts_with("machine") || path == "machine-real16"))
                 {
@@ -442,7 +510,8 @@ fn main() {
                 }
                 let real = path == "machine-real16" || seg16 || v86;
                 let (vm, mut cpu) = setup(path, work);
-                execute(&vm, &mut cpu, real, 10000, sliced);
+                let cr3 = base_work == "cr3switch";
+                execute(&vm, &mut cpu, real, 10000, sliced, cr3);
                 cpu.set_reg(Reg::Rax, 0);
                 cpu.set_reg(Reg::Rbx, 0);
                 cpu.set_reg(Reg::Rdx, 0);
@@ -455,7 +524,7 @@ fn main() {
                 let chain_before = cpu.machine_jit_counters_for_test();
                 let host_before = instructions();
                 let start = Instant::now();
-                execute(&vm, &mut cpu, real, n, sliced);
+                execute(&vm, &mut cpu, real, n, sliced, cr3);
                 let seconds = start.elapsed().as_secs_f64();
                 let host = instructions() - host_before;
                 let retired = cpu.retired_instructions() - retired_before;
@@ -488,12 +557,19 @@ fn main() {
                     "farseg" => 8 + u64::from(sliced),
                     "farcall" => farcall_interval(),
                     "segmix" => 25,
+                    "cr3switch" => 7,
                     _ => 5,
                 }) * n
-                    + if real {
-                        n.div_ceil(60000) * u64::from(!path.ends_with("-cpl3") && !v86)
+                    // Three more at each CR3 load.
+                    + if base_work == "cr3switch" {
+                        3 * (n / cr3_interval())
                     } else {
-                        u64::from(!path.ends_with("-cpl3") && !v86)
+                        0
+                    }
+                    + if real {
+                        n.div_ceil(60000) * u64::from(!path.contains("-cpl3") && !v86)
+                    } else {
+                        u64::from(!path.contains("-cpl3") && !v86)
                     };
                 if path.starts_with("machine") {
                     assert_eq!(retired, count);

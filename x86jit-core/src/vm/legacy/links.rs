@@ -378,8 +378,11 @@ impl Execution {
         let found = (Arc::clone(&link.ir), link.walk);
         if path == LinkPath::Paged {
             // As `resolve_paged`: no operand transaction survives into
-            // another block.
-            self.paging.as_mut().unwrap().transaction = None;
+            // another block, and the block is the one the resolve would
+            // have returned from its proof (`paging::State::holds`).
+            let state = self.paging.as_mut().unwrap();
+            state.transaction = None;
+            state.linked(&found.0);
         }
         probe!(LINKS);
         #[cfg(test)]

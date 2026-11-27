@@ -89,6 +89,23 @@ enum Subject {
     Background,
 }
 
+thread_local! {
+    /// Decision-32 §9: [`machine`] builds paged machines.
+    static PAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `run` with paged machines: every page identity-mapped through the
+/// directory at 3000h and the table at 4000h, but for linear 1A000h, a
+/// second mapping of the device page (80386 PRM §5.2 Figs. 5-8-10).
+fn paged(run: impl FnOnce()) {
+    PAGED.with(|p| p.set(true));
+    run();
+    PAGED.with(|p| p.set(false));
+}
+
+/// The linear page that [`paged`] machines map to the device frame.
+const ALIAS: u64 = 0x1a000;
+
 fn machine(code: &[u8], subject: Subject) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(SIZE), Box::new(JitBackend::new()));
     vm.map(0, MMIO as usize, Prot::RWX, RegionKind::Ram)
@@ -136,6 +153,20 @@ fn machine(code: &[u8], subject: Subject) -> (Vm, Vcpu) {
     cpu.cpu.gpr[4] = 0x8000;
     descriptor(&vm, 0x2008, 0, u32::MAX, 0xc09b);
     descriptor(&vm, 0x2010, 0, u32::MAX, 0xc093);
+    if PAGED.with(std::cell::Cell::get) {
+        vm.write_bytes(0x3000, &0x4007u32.to_le_bytes()).unwrap();
+        for page in 0..SIZE >> 12 {
+            let frame = if page << 12 == ALIAS {
+                MMIO
+            } else {
+                page << 12
+            };
+            vm.write_bytes(0x4000 + 4 * page, &(frame as u32 | 7).to_le_bytes())
+                .unwrap();
+        }
+        cpu.cpu.legacy.cr0 = 0x8000_0001;
+        cpu.cpu.legacy.cr3 = 0x3000;
+    }
     (vm, cpu)
 }
 
@@ -484,4 +515,68 @@ fn device_effects_in_chained_blocks_equal_the_interpreter() {
     let mut imm = [0; 4];
     vm.read_bytes(patch, &mut imm).unwrap();
     assert_ne!(u32::from_le_bytes(imm), PATCH_IMM, "the code was rewritten");
+}
+
+/// `mov ebp, N; L: mov eax, [ALIAS]; add ebx, eax; mov [ALIAS + 4], ebx;
+/// movzx edx, byte [9008h]; add esi, edx; dec ebp; jnz L; hlt`: the device
+/// page through its second linear mapping and its own.
+fn alias_program(iterations: u32) -> Vec<u8> {
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.mov(ebp, iterations).unwrap();
+    a.set_label(&mut top).unwrap();
+    a.mov(eax, dword_ptr(ALIAS)).unwrap();
+    a.add(ebx, eax).unwrap();
+    a.mov(dword_ptr(ALIAS + 4), ebx).unwrap();
+    a.movzx(edx, byte_ptr(0x9008)).unwrap();
+    a.add(esi, edx).unwrap();
+    a.dec(ebp).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    a.assemble(0x1000).unwrap()
+}
+
+/// Decision-32 Q9, §9: paged compiled code reaches in-process devices
+/// through the in-block contract with the access's linear address, which
+/// is what the paged exit path reports: transcripts (positions and linear
+/// addresses included), state and RAM equal the interpreter's, with chains
+/// on and off and in the background configuration, and a handled transfer
+/// keeps its block compiled.
+#[test]
+fn paged_device_accesses_equal_the_interpreter() {
+    paged(|| {
+        let effects = chained_effects(30);
+        let patch = patch_address(&effects);
+        for subject in [
+            Subject::Forced,
+            Subject::ForcedChainOff,
+            Subject::Background,
+        ] {
+            for budget in [1, 3, 7, 13, 64, 100_000] {
+                lockstep(&program(60), subject, budget);
+                lockstep(&chained_devices(20), subject, budget);
+                lockstep(&alias_program(60), subject, budget);
+                lockstep(&deferred_then_device(), subject, budget);
+                lockstep_with(&effects, subject, budget, || Recorder::with_effects(patch));
+            }
+        }
+        let (vm, mut cpu) = machine(&alias_program(50), Subject::Forced);
+        let mut handler = Recorder::default();
+        let run = cpu
+            .run_steps_with_devices(&vm, 100_000, StepOptions::default(), Some(&mut handler))
+            .unwrap();
+        assert!(matches!(run.into_stop(), StepStop::Exit(Exit::Hlt)));
+        let c = cpu.machine_jit_counters_for_test();
+        assert!(c.paged_entries > 0 && c.compiled_retired >= 50 * 5, "{c:?}");
+        assert_eq!(handler.requests.len(), 50 * 3, "one call per transfer");
+        for request in &handler.requests {
+            let linear = request.linear_address.expect("a paged linear address");
+            let expected = if request.address == MMIO + 8 {
+                MMIO + 8
+            } else {
+                ALIAS + (request.address - MMIO)
+            };
+            assert_eq!(u64::from(linear), expected, "{request:?}");
+        }
+    });
 }

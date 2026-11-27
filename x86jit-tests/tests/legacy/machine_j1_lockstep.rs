@@ -54,6 +54,50 @@ pub(crate) struct Setup {
     pub(crate) tf: bool,
     /// Decision-31 §8: compiled blocks return to the turn after each block.
     pub(crate) chain_off: bool,
+    /// Decision-32: paging on, every page identity-mapped through the
+    /// directory at [`PAGE_DIRECTORY`] (`paging_fixture`), A and D clear.
+    pub(crate) paged: bool,
+    /// Decision-32: CPL 3, with DPL-3 caches and descriptors.
+    pub(crate) user: bool,
+    /// With `paged`, CR0.WP (an Intel486 control; the 80386 has none).
+    pub(crate) wp: bool,
+}
+
+/// The page directory and the one table of [`Setup::paged`]: 4 MiB of linear
+/// space, every page user-writable but the cause pages below; pages from
+/// `SIZE` up alias frames 80000h-BFFFFh; the directory's second entry is not
+/// present (linear 400000h up).
+pub(crate) const PAGE_DIRECTORY: u64 = 0x3000;
+pub(crate) const PAGE_TABLE: u64 = 0x4000;
+/// Pages of [`Setup::paged`] with other entries, for the #PF witnesses: not
+/// present, supervisor read-write, user read-only, supervisor read-only.
+pub(crate) const NOT_PRESENT: u64 = 0x30000;
+pub(crate) const SUPERVISOR: u64 = 0x31000;
+pub(crate) const USER_READ_ONLY: u64 = 0x32000;
+pub(crate) const SUPERVISOR_READ_ONLY: u64 = 0x33000;
+/// A second linear mapping of the code page 1000h (decision-32 §9, SMC
+/// through an alias linear mapping).
+pub(crate) const CODE_ALIAS: u64 = 0x50000;
+
+/// The 80386 PRM §5.2 (Figs. 5-8-10 pp. 5-7-9) two-level tables of
+/// [`Setup::paged`]: PDE and PTE bits P (0), R/W (1), U/S (2), A (5), D (6).
+pub(crate) fn paging_fixture(vm: &Vm) {
+    vm.write_bytes(PAGE_DIRECTORY, &(PAGE_TABLE as u32 | 7).to_le_bytes())
+        .unwrap();
+    for page in 0..1024u64 {
+        let linear = page << 12;
+        let entry = match linear {
+            NOT_PRESENT => 0,
+            SUPERVISOR => linear | 3,
+            USER_READ_ONLY => linear | 5,
+            SUPERVISOR_READ_ONLY => linear | 1,
+            CODE_ALIAS => 0x1000 | 7,
+            _ if linear < SIZE => linear | 7,
+            _ => 0x80000 | (linear & 0x3_ffff) | 7,
+        };
+        vm.write_bytes(PAGE_TABLE + 4 * page, &(entry as u32).to_le_bytes())
+            .unwrap();
+    }
 }
 
 pub(crate) fn machine(
@@ -118,6 +162,26 @@ pub(crate) fn machine(
     cpu.cpu.gs = 16;
     descriptor(&vm, 0x2008, 0, u32::MAX, 0xc09b);
     descriptor(&vm, 0x2010, 0, u32::MAX, 0xc093);
+    if setup.user {
+        // DPL 3 caches and descriptors, RPL 3 selectors (SDM Vol 3A §5.5).
+        cpu.cpu.legacy.cpl = 3;
+        for cache in cpu.cpu.legacy.segments.iter_mut() {
+            cache.attributes |= 0x60;
+        }
+        cpu.cpu.cs = 8 | 3;
+        cpu.cpu.ds = 16 | 3;
+        cpu.cpu.es = 16 | 3;
+        cpu.cpu.ss = 16 | 3;
+        cpu.cpu.fs = 16 | 3;
+        cpu.cpu.gs = 16 | 3;
+        descriptor(&vm, 0x2008, 0, u32::MAX, 0xc0fb);
+        descriptor(&vm, 0x2010, 0, u32::MAX, 0xc0f3);
+    }
+    if setup.paged {
+        paging_fixture(&vm);
+        cpu.cpu.legacy.cr0 = 0x8000_0001 | if setup.wp { 1 << 16 } else { 0 };
+        cpu.cpu.legacy.cr3 = PAGE_DIRECTORY as u32;
+    }
     cpu.set_a20_enabled(!setup.a20_off);
     // Operands from a seeded generator; the stack and EBP stay the program's.
     let mut z = seed;
@@ -179,6 +243,12 @@ pub(crate) fn same_memory(avm: &Vm, bvm: &Vm, spans: &[(u64, u64)], what: &str) 
 pub(crate) fn same(a: &Vcpu, b: &Vcpu, what: &str) {
     assert_eq!(live(&a.cpu), live(&b.cpu), "{what}");
     assert_eq!(a.retired_instructions(), b.retired_instructions(), "{what}");
+    // Decision-32 §9: the TLBs too, which compiled code only reads.
+    assert_eq!(
+        a.paging_tlb_for_test(),
+        b.paging_tlb_for_test(),
+        "{what}: TLB"
+    );
 }
 
 /// Answer an exit identically on both machines; false when the run is over.
@@ -204,7 +274,7 @@ pub(crate) fn answer(cpu: &mut Vcpu, stop: &StepStop) -> bool {
 }
 
 /// Run both machines with this budget schedule until the program ends.
-fn lockstep(
+pub(crate) fn lockstep(
     model: CpuModel,
     code: &[u8],
     mode: MachineJitMode,
@@ -267,7 +337,7 @@ pub(crate) fn asm(build: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
 
 /// `mov ebp, 6; L: body; dec ebp; jnz L; hlt`: the body runs six times on the
 /// values it leaves behind.
-fn looped(body: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
+pub(crate) fn looped(body: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
     asm(|a| {
         let mut top = a.create_label();
         a.mov(ebp, 6u32).unwrap();
@@ -281,7 +351,7 @@ fn looped(body: impl Fn(&mut CodeAssembler)) -> Vec<u8> {
 
 /// Programs whose every instruction but HLT the J1 lowering completes: one per
 /// op family, with every width it has.
-fn families(model: CpuModel) -> Vec<(&'static str, Vec<u8>)> {
+pub(crate) fn families(model: CpuModel) -> Vec<(&'static str, Vec<u8>)> {
     // BSWAP is an Intel486 instruction (#UD on the 80386).
     let i486 = model != CpuModel::I80386;
     vec![
@@ -531,7 +601,7 @@ fn families(model: CpuModel) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// Programs that defer, stop, fault or exit on purpose.
-fn programs(model: CpuModel) -> Vec<(String, Vec<u8>, Setup)> {
+pub(crate) fn programs(model: CpuModel) -> Vec<(String, Vec<u8>, Setup)> {
     let plain = Setup::default();
     // mov ebp, 8; L: inc eax; add byte [100Eh], 1; mov ebx, imm32 (its
     // immediate is 100Eh); add ecx, ebx; dec ebp; jnz L; hlt. The store
@@ -769,9 +839,14 @@ pub(crate) fn add(total: &mut MachineJitCounters, c: MachineJitCounters) {
     for (t, s) in total.chain_ends.iter_mut().zip(c.chain_ends) {
         *t += s;
     }
+    for (t, s) in total.defer_causes.iter_mut().zip(c.defer_causes) {
+        *t += s;
+    }
+    total.compiled_retired_cpl3 += c.compiled_retired_cpl3;
+    total.paged_entries += c.paged_entries;
 }
 
-const MODES: [MachineJitMode; 4] = [
+pub(crate) const MODES: [MachineJitMode; 4] = [
     MachineJitMode::Forced,
     MachineJitMode::Delayed(1),
     MachineJitMode::Delayed(3),

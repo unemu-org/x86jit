@@ -416,6 +416,9 @@ pub(crate) struct Tlb {
     /// them (`crate::vm::TlbAdvance` order).
     #[cfg(feature = "test-hooks")]
     pub(crate) advances: [u64; crate::vm::TLB_ADVANCES],
+    /// The pages whose entries changed since the compiled view of this TLB
+    /// last synced (decision-32 §3 rule 2, `MachineTlb::sync`).
+    view: ViewLog,
 }
 impl Default for Tlb {
     fn default() -> Self {
@@ -426,6 +429,31 @@ impl Default for Tlb {
             lane: LaneWindows::default(),
             #[cfg(feature = "test-hooks")]
             advances: [0; crate::vm::TLB_ADVANCES],
+            // A new TLB shares nothing with a view filled from another.
+            view: ViewLog::FLUSH,
+        }
+    }
+}
+
+/// The pages a TLB's mutations touched, for the compiled view's clears; past
+/// its capacity, or on an invalidation, the whole view is cleared.
+#[derive(Clone, Copy)]
+struct ViewLog {
+    pages: [u32; 8],
+    len: u8,
+}
+impl ViewLog {
+    const FLUSH: Self = Self {
+        pages: [0; 8],
+        len: u8::MAX,
+    };
+    #[inline(always)]
+    fn page(&mut self, page: u32) {
+        if let Some(slot) = self.pages.get_mut(usize::from(self.len)) {
+            *slot = page;
+            self.len += 1;
+        } else {
+            self.len = u8::MAX;
         }
     }
 }
@@ -482,6 +510,7 @@ impl Tlb {
         self.entries.fill(None);
         self.context = None;
         self.advance(why);
+        self.view = ViewLog::FLUSH;
     }
 
     /// INVLPG: remove the entry of `linear`'s page (paging design §3.2;
@@ -515,6 +544,25 @@ impl Tlb {
         }
         e.fetched = true;
         Some((e.translation.physical & FRAME) | (linear & 0xfff))
+    }
+
+    /// Whether no entry changed since the compiled view last synced.
+    #[inline(always)]
+    pub(crate) fn view_log_empty(&self) -> bool {
+        self.view.len == 0
+    }
+
+    /// The pages whose entries changed since the compiled view last synced,
+    /// or `None` when it must be cleared whole; the log starts over.
+    pub(crate) fn take_view_log(&mut self) -> Option<impl Iterator<Item = u32>> {
+        let log = std::mem::replace(
+            &mut self.view,
+            ViewLog {
+                pages: [0; 8],
+                len: 0,
+            },
+        );
+        (log.len != u8::MAX).then(|| log.pages.into_iter().take(usize::from(log.len)))
     }
 
     pub(crate) fn reconcile(&mut self, cpu: &CpuState) {
@@ -558,6 +606,9 @@ impl Tlb {
             self.advances[Advance::LaneUndone as usize] += 1;
         }
         self.generation = self.lane.generation;
+        // The compiled view needs no clear here: the lane's own inserts and
+        // removes logged every page whose slot it changed, and a restored
+        // entry is one the view was already cleared of.
     }
 
     /// The valid entries, for the witnesses: slot, page, frame, PTE, rights
@@ -585,16 +636,25 @@ impl Tlb {
 
     fn remove(&mut self, linear: u32, why: Advance) {
         let slot = &mut self.entries[Self::index(linear)];
-        if slot.take().is_some_and(|e| e.fetched) {
-            self.advance(why);
+        if let Some(e) = slot.take() {
+            self.view.page(e.page);
+            if e.fetched {
+                self.advance(why);
+            }
         }
     }
 
     fn insert(&mut self, linear: u32, translation: Translation, rights: u32, fetched: bool) {
         let index = Self::index(linear);
-        if self.entries[index].is_some_and(|e| e.fetched && e.page != linear >> 12) {
-            self.advance(Advance::Replaced);
+        if let Some(e) = self.entries[index] {
+            if e.page != linear >> 12 {
+                self.view.page(e.page);
+                if e.fetched {
+                    self.advance(Advance::Replaced);
+                }
+            }
         }
+        self.view.page(linear >> 12);
         self.entries[index] = Some(Entry {
             page: linear >> 12,
             translation,
@@ -610,9 +670,122 @@ impl Tlb {
                 && (e.translation.pte ^ t.pte) & IDENTITY == 0
             {
                 e.translation.pte |= DIRTY;
+                self.view.page(linear >> 12);
             }
         }
     }
+}
+
+/// A TLB entry's answers for the compiled view (decision-32 §3): its frame
+/// (physical, before the bus gate) and the rights `permitted` grants it now,
+/// a write right only with PTE.D set. A supervisor read needs only the entry.
+pub(crate) struct ViewRights {
+    pub(crate) frame: u32,
+    pub(crate) supervisor_write: bool,
+    pub(crate) user_read: bool,
+    pub(crate) user_write: bool,
+}
+
+/// The current entry for `linear`'s page, as the compiled view may cache it.
+pub(crate) fn view_rights(cpu: &CpuState, tlb: &Tlb, linear: u32) -> Option<ViewRights> {
+    let e = tlb.entries[Tlb::index(linear)].filter(|e| e.page == linear >> 12)?;
+    // 80386 PRM §5.2.4.3 p. 5-10; SDM Vol 3A §5.8 p. 5-39: the first write
+    // to a clean page sets D, which only the interpreter's walk does.
+    let dirty = e.translation.pte & DIRTY != 0;
+    Some(ViewRights {
+        frame: e.translation.physical & FRAME,
+        supervisor_write: dirty
+            && permitted(cpu, AccessKind::Write, Privilege::Supervisor, e.rights),
+        user_read: permitted(cpu, AccessKind::Read, Privilege::User, e.rights),
+        user_write: dirty && permitted(cpu, AccessKind::Write, Privilege::User, e.rights),
+    })
+}
+
+/// The compiled miss helper's translation (decision-32 §3): the physical
+/// address of an access of `size` bytes at `linear` inside one page, from an
+/// existing TLB entry that grants it at the current CPL, with PTE.D set for
+/// a write. `None` defers: the helper never walks, so no A or D bit, fault
+/// or TLB entry changes, as `fast_window` requires of the fast lanes.
+pub(crate) fn compiled_translation(
+    cpu: &CpuState,
+    tlb: &Tlb,
+    linear: u64,
+    size: u8,
+    write: bool,
+) -> Option<u32> {
+    if size == 0 || linear > u64::from(u32::MAX) || u64::from(size) > 0x1000 - (linear & 0xfff) {
+        return None;
+    }
+    let entry = tlb.entries[Tlb::index(linear as u32)]
+        .filter(|entry| u64::from(entry.page) == linear >> 12)?;
+    // Every access of a compiled block at CPL 3 is a user access: implicit
+    // supervisor accesses occur only in deferred instructions.
+    let privilege = if cpu.legacy.cpl == 3 {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    let access = if write {
+        AccessKind::Write
+    } else {
+        AccessKind::Read
+    };
+    if !permitted(cpu, access, privilege, entry.rights)
+        || (write && entry.translation.pte & DIRTY == 0)
+    {
+        return None;
+    }
+    Some((entry.translation.physical & FRAME) | (linear as u32 & 0xfff))
+}
+
+/// Why [`compiled_translation`] refused, for the DEFER census.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn compiled_refusal(
+    cpu: &CpuState,
+    tlb: &Tlb,
+    linear: u64,
+    size: u8,
+    write: bool,
+) -> u8 {
+    use super::machine_jit::{
+        CAUSE_CLEAN_WRITE, CAUSE_PAGE_CROSSING, CAUSE_RIGHTS, CAUSE_TLB_MISS,
+    };
+    if size == 0 || linear > u64::from(u32::MAX) || u64::from(size) > 0x1000 - (linear & 0xfff) {
+        return CAUSE_PAGE_CROSSING;
+    }
+    let Some(entry) = tlb.entries[Tlb::index(linear as u32)]
+        .filter(|entry| u64::from(entry.page) == linear >> 12)
+    else {
+        return CAUSE_TLB_MISS;
+    };
+    let privilege = if cpu.legacy.cpl == 3 {
+        Privilege::User
+    } else {
+        Privilege::Supervisor
+    };
+    let access = if write {
+        AccessKind::Write
+    } else {
+        AccessKind::Read
+    };
+    if permitted(cpu, access, privilege, entry.rights) {
+        CAUSE_CLEAN_WRITE
+    } else {
+        CAUSE_RIGHTS
+    }
+}
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) fn compiled_refusal(_: &CpuState, _: &Tlb, _: u64, _: u8, _: bool) -> u8 {
+    0
+}
+
+/// The bus address of `linear`'s page from the TLB entry an instruction
+/// fetch of it used, with paging on: the frame a paged proof of a block in
+/// that page was lifted from while the TLB's token is unchanged.
+pub(crate) fn fetched_bus(cpu: &CpuState, tlb: &Tlb, linear: u32) -> Option<u64> {
+    let e = tlb.entries[Tlb::index(linear)].filter(|e| e.page == linear >> 12 && e.fetched)?;
+    let physical = (e.translation.physical & FRAME) | (linear & 0xfff);
+    Some(legacy::physical_span(cpu, u32::MAX, u64::from(physical), 1).0)
 }
 
 fn permitted(cpu: &CpuState, access: AccessKind, privilege: Privilege, rights: u32) -> bool {
@@ -3764,6 +3937,41 @@ pub(super) fn access_operand(
     )
 }
 
+/// [`execute_flat32`] of a protected (non-V86) block, entered at the
+/// instruction whose `InsnStart` is op `from`: the walk after a compiled
+/// paged block deferred it (decision-32 §3).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_flat32_from<const ROUTED: bool, const ORDER: u8>(
+    ir: &IrBlock,
+    insns: &[Insn],
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+    from: usize,
+) -> Progress {
+    debug_assert!(ir
+        .legacy_context
+        .is_some_and(|c| c.regime != legacy::MachineRegime::Virtual8086));
+    execute_ordinary_from::<ROUTED, ORDER, false>(
+        ir,
+        insns,
+        cpu,
+        memory,
+        scratch,
+        limit,
+        exit_word,
+        task_switch,
+        retry,
+        tlb,
+        from,
+    )
+}
+
 /// Paged Flat32, Segmented and V86 blocks execute effect-proved registers and
 /// preflighted RAM once; all other instructions retain the full operand
 /// transaction ledger. V86 takes the same walk with V86 address checks.
@@ -3869,6 +4077,36 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     retry: &mut Option<Transaction>,
     tlb: &std::cell::RefCell<Tlb>,
 ) -> Progress {
+    execute_ordinary_from::<ROUTED, ORDER, V86>(
+        ir,
+        insns,
+        cpu,
+        memory,
+        scratch,
+        limit,
+        exit_word,
+        task_switch,
+        retry,
+        tlb,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn execute_ordinary_from<const ROUTED: bool, const ORDER: u8, const V86: bool>(
+    ir: &IrBlock,
+    insns: &[Insn],
+    cpu: &mut CpuState,
+    memory: &Memory,
+    scratch: &mut impl ScratchBuffer,
+    limit: u64,
+    exit_word: &std::sync::atomic::AtomicU64,
+    task_switch: &mut tasks::SwitchState,
+    retry: &mut Option<Transaction>,
+    tlb: &std::cell::RefCell<Tlb>,
+    from: usize,
+) -> Progress {
     let context = ir.legacy_context.expect("protected block context");
     let temps = scratch.reused(ir.temp_count as usize);
     let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
@@ -3884,7 +4122,7 @@ fn execute_ordinary<const ROUTED: bool, const ORDER: u8, const V86: bool>(
         exit_word,
         limit,
     );
-    let outcome = pass.run(cpu, temps, retry);
+    let outcome = pass.run_from(cpu, temps, retry, from);
     Progress {
         sti_shadow: false,
         ss_shadow: 0,

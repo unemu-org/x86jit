@@ -72,13 +72,19 @@ CORE_SRC = "x86jit-core/src/"
 #     compiled for unit tests only).
 REVIEWED_ENTRY_POINTS = {
     # Decisions 29-30 (J1, J2): the compiled Machine helpers and classifier,
-    # called only from compiled Machine blocks.
-    "x86jit-core/src/jit_abi/machine.rs": {"interp::legacy::machine_jit"},
+    # called only from compiled Machine blocks. Decision-32 (J3+J4): the
+    # compiled TLB view is a subset of the paged interpreter's TLB, synced
+    # and filled from it, and the paged miss helper reads it; only compiled
+    # Machine blocks of paged Flat32 code reach them.
+    "x86jit-core/src/jit_abi/machine.rs": {
+        "interp::legacy::machine_jit", "interp::legacy::paging",
+    },
     # Decision-29 (J1): the Machine turn's compiled-unit path, reached only
-    # from the Machine dispatcher.
+    # from the Machine dispatcher. Decision-32: a paged block's bus address
+    # from the TLB entry its fetch used, on the same path.
     "x86jit-core/src/vm/legacy/compiled.rs": {
         "interp::legacy::Progress", "interp::legacy::execute_instructions",
-        "interp::legacy::machine_jit",
+        "interp::legacy::machine_jit", "interp::legacy::paging",
     },
     # Device callback witnesses explicitly select Machine catalogue entries.
     "x86jit-core/src/vm/device/tests.rs": {"model::CpuModel"},
