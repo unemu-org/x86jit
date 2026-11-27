@@ -1525,3 +1525,16 @@ protected-16 mode. Comparison coverage is partial: forms whose Application
 decode differs or whose Application execution refuses are reported separately;
 CPUID and system/cache instructions are excluded from that comparator and pinned
 by architectural witnesses instead.
+
+## Amendment: J2 lands over one blocking workload (2026-11-27, accepted)
+
+The maintainer accepted landing J2 (decision-30) with its gate run (Linux arm64,
+base 7e6a66cc, candidate 5f73e043) blocking on one workload only: `ip-boundary-1` on
+the I80286 and I80386 paths, A20 on and off, release +0.65 %, perf +1.22 %. The
+workload runs one guest step per run call, so it measures the fixed cost of entering
+run; the same cost does not reproduce on the macOS workstation. Every other cell is
+within the gate in at least one profile after three rounds (store-next-to-code and
+the alias SMC relift path fixed; release-only drift on `data-next-to-code` remains).
+J2 with J2b cuts `machine32_loops` from 423 / 564 / 1043 to 20 / 36 / 66 host
+instructions per step (register / memory / callret). The per-run cost is tracked in
+xj-to9.66; this exception covers only that workload and only this landing.
