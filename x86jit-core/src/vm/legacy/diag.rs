@@ -92,9 +92,12 @@ pub enum ReliftCause {
     Promotion,
     /// A gap in the write record dropped every proof.
     Gap(GapKind),
-    /// The proof map reached its bound (64 unpaged, 256 paged) and cleared.
+    /// The proof map reached its bound (8192 unpaged, 256 paged) and swept
+    /// a quarter of its proofs.
     Bound,
-    /// The proof's context identity was evicted from the retained contexts.
+    /// The proof's context identity was evicted from the retained contexts
+    /// (paged only: an unpaged proof of an evicted identity is never
+    /// returned again and leaves by the bound).
     ContextEvicted,
     /// A mapping change dropped every proof.
     Mapping,
@@ -396,7 +399,7 @@ pub struct ContextStats {
     pub recent_hits: u64,
     pub retained_hits: u64,
     pub created: u64,
-    /// Identities evicted from the 16 retained.
+    /// Identities evicted from the 256 retained.
     pub evicted: u64,
     /// Instructions that invalidated every translation (CR0 or CR3 writes,
     /// descriptor-table loads and the like).

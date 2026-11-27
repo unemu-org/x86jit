@@ -3,7 +3,7 @@
 //! is promoted and then is absorbed; a patched PUSH immediate, which no live
 //! read covers, is refused as an ineligible form and relifts on every patch
 //! with its instruction in the ring; an opcode store is an opcode store; a
-//! loop of more blocks than the unpaged proof map retains clears at its
+//! loop of more blocks than the unpaged proof map retains sweeps at its
 //! bound.
 use x86jit_core::{
     CpuModel, Exit, LiveRefusal, ProofClass, Prot, RegionKind, ReliftCause, StoreClass, Vcpu, Vm,
@@ -140,10 +140,10 @@ fn an_opcode_store_and_the_proof_bound_are_named() {
     assert!(opcode >= N - 2, "{d}");
     assert_eq!(cpu.cpu.gpr[5], 0, "INC and DEC alternate");
 
-    // 1100 blocks of ADD EBX, 1; JMP $+2, more than the 1024 proofs kept,
+    // 8300 blocks of ADD EBX, 1; JMP $+2, more than the 8192 proofs kept,
     // then DEC EDI; JNZ top; HLT.
     let mut c = Vec::new();
-    for _ in 0..1100 {
+    for _ in 0..8300 {
         c.extend([0x83, 0xc3, 0x01, 0xeb, 0x00]);
     }
     c.push(0x4f);
@@ -154,8 +154,8 @@ fn an_opcode_store_and_the_proof_bound_are_named() {
     let (vm, mut cpu) = setup(&c);
     run(&vm, &mut cpu);
     let d = vm.relift_diagnostics(true);
-    assert_eq!(cpu.cpu.gpr[3], 1100 * N);
-    assert!(d.lifts(None, ReliftCause::First) >= 1101, "{d}");
+    assert_eq!(cpu.cpu.gpr[3], 8300 * N);
+    assert!(d.lifts(None, ReliftCause::First) >= 8301, "{d}");
     assert!(d.lifts(None, ReliftCause::Bound) > 0, "{d}");
 }
 

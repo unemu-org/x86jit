@@ -36,7 +36,7 @@ path = "junit.xml"
 [profile.fast]
 default-filter = '''
 not (binary(fuzz_robustness))
-& not (binary_id(=x86jit-core) & (test(=vm::legacy::link_witness::a_reused_context_identity_is_never_followed) | test(=vm::legacy::live::tests::live_fields_match_relifting_on_every_patched_form) | test(=vm::legacy::tests::a_blocked_nmi_handler_that_never_irets_keeps_ordinary_dispatch)))
+& not (binary_id(=x86jit-core) & (test(=vm::legacy::link_witness::a_reused_context_identity_is_never_followed) | test(=vm::legacy::live::tests::live_fields_match_relifting_on_every_patched_form) | test(=vm::legacy::tests::a_blocked_nmi_handler_that_never_irets_keeps_ordinary_dispatch) | test(=vm::legacy::tests::context_churn_bounds_retained_contexts_and_their_blocks)))
 & not (binary_id(=x86jit-cranelift) & (test(=batch_tests::repeated_automatic_reclamation_bounds_all_metadata_including_ibtc) | test(=codegen::trap_tests::guest_trap_sites_lifter_capped_blocks_never_overflow) | test(=codegen::trap_tests::shifts_and_rotates_compile_with_guest_traps_on_both_isas)))
 & not (binary_id(=x86jit-cranelift::code_memory_fault_stress) & (test(=signals_and_fault_recovery_in_reused_code)))
 & not (binary_id(=x86jit-cranelift::code_memory_stress) & (test(=anonymous_multi_vcpu_smc_tiering_and_release) | test(=background_completion_rejection_during_smc) | test(=dense_multi_vcpu_smc_tiering_and_reuse) | test(=relaxed_republication_at_same_address_is_visible)))

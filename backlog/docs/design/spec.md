@@ -2727,7 +2727,12 @@ RAM accesses reuse the existing permission/D-bit TLB fast path after proving
 their segment interval; faults, misses, split operands, code stores and devices
 retain the transaction path. In particular, a near RET cannot skip its loaded
 CS target check under Segmented. The Machine context identity carries this class;
-BlockKey hashing, Application dispatch and CpuState remain unchanged.
+BlockKey hashing, Application dispatch and CpuState remain unchanged. An unpaged
+Flat32 or Segmented identity names only what its lift reads (xj-to9.56): the model,
+CR0.PE and AM, the CPL, A20, the reset-fetch and NEC state and, for Segmented, the
+segment caches; selectors, descriptor-table and task registers, CR3 and IOPL are
+read live by the helpers that use them. Identities are not reused before a
+translation flush.
 
 **Segment loads and far transfers inside blocks (xj-to9.18).** A MOV, POP,
 LDS, LES, LFS or LGS into DS, ES, FS or GS is an ordinary instruction of a
@@ -3022,7 +3027,7 @@ The source rows that disagree, and the engine's choice (decisions O1-O14):
   pp. B-86 and §10.1 p. 10-1 state the rule, and the engine cites those.
 
 Retention (O13): a ring change interns a new context stamp and counts against
-decision-20's 16 retained contexts. An INT and IRET round trip from ring 3,
+the retained contexts (decision-20; 256 since xj-to9.56). An INT and IRET round trip from ring 3,
 and a call-gate CALL and RETF round trip, each retain two contexts and relift
 nothing after the first trip
 (`ring_trips_retain_two_contexts_and_relift_nothing`).

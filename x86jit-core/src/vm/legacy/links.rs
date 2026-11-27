@@ -140,6 +140,43 @@ impl Links {
         self.run += 1;
         self.protected = protected;
     }
+    /// Drop the links of `path`, which a version advance made stale.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn drop_path(&mut self, path: LinkPath) {
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|link| link.path == path) {
+                *slot = None;
+            }
+        }
+    }
+    /// A link of `path` to `ir` in the first free slot (tests only).
+    #[cfg(test)]
+    pub(super) fn plant(&mut self, path: LinkPath, ir: &Arc<IrBlock>, context: MachineContext) {
+        let slot = self.slots.iter_mut().find(|s| s.is_none()).unwrap();
+        *slot = Some(Link {
+            rip: ir.guest_start,
+            physical: ir.guest_start,
+            run: self.run,
+            generation: 0,
+            identity: [0; 4],
+            context,
+            mxcsr: 0,
+            path,
+            walk: BlockWalk::for_flat32(ir),
+            used: true,
+            ir: Arc::clone(ir),
+        });
+    }
+    /// The links of `path` (tests only).
+    #[cfg(test)]
+    pub(super) fn count(&self, path: LinkPath) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|l| l.path == path)
+            .count()
+    }
     #[cold]
     #[inline(never)]
     pub(super) fn clear(&mut self) {

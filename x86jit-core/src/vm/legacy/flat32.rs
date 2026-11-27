@@ -39,16 +39,32 @@ impl Execution {
                 return Ok((retry.ir.clone(), retry.walk));
             }
         }
-        self.flat32.resolve(vm, cpu, context, key, exit_word)
+        self.flat32
+            .resolve(vm, cpu, context, key, exit_word, &mut self.links)
     }
 }
 
-/// Proofs retained per vCPU (xj-to9.53): a program's working set across
-/// its renderer, game logic and an extended-memory runtime's interrupt
-/// path, which enters its blocks under many contexts, exceeds 256 blocks.
-/// A proof is its IR (72 bytes per op, about 2–8 KiB for a typical block)
-/// and a counted source registration.
-const MAX_PROOFS: usize = 1024;
+/// Proofs retained per vCPU (xj-to9.53, xj-to9.56): a protected-mode
+/// program's working set across its renderer, game logic and an
+/// extended-memory runtime's interrupt path, which enters its blocks under
+/// many contexts, reaches several thousand blocks; at 1024 proofs a PC-class
+/// embedder's game relifted 130 to 150 thousand blocks with unchanged keys
+/// every five seconds.
+pub(super) const MAX_PROOFS: usize = 8192;
+
+/// The proofs' IR bytes retained per vCPU (`weight`), the bound that holds
+/// when blocks are large: an op is 72 bytes, a block of 32 instructions at
+/// 10–15 ops each is 25–35 KiB, so 8192 such proofs would hold 200–280 MiB.
+/// 32 MiB keeps 1000 such blocks or 8192 of 4 KiB.
+pub(super) const MAX_PROOF_BYTES: usize = 32 << 20;
+
+/// A proof's weight against `MAX_PROOF_BYTES`: its IR (the block, its ops
+/// at their capacity) and its registered source ranges.
+pub(super) fn weight(ir: &IrBlock, sources: usize) -> usize {
+    std::mem::size_of::<IrBlock>()
+        + ir.ops.capacity() * std::mem::size_of::<IrOp>()
+        + sources * std::mem::size_of::<(u64, u64)>()
+}
 
 struct Proof {
     ir: Arc<IrBlock>,
@@ -61,8 +77,9 @@ struct Proof {
 pub(super) struct State {
     mapping: Option<Arc<()>>,
     blocks: super::proof_map::ProofMap<LegacyBlockKey, Proof>,
-    // The key `resolve` last returned a proof for: `holds` looks it up.
-    last: Option<LegacyBlockKey>,
+    // The block `resolve` last returned a proof for and the map's version
+    // then (`holds`).
+    last: Option<(usize, u64)>,
     #[cfg(test)]
     pub(super) lifts: u64,
 }
@@ -75,19 +92,20 @@ impl State {
     }
 
     /// Whether a proof holds this very block. Links record the block the
-    /// last resolve returned, so its key is looked up rather than every
-    /// proof scanned.
+    /// last resolve returned: the map's version advances whenever a proof
+    /// may be dropped or replaced, so an unchanged version means the proof
+    /// that returned it still holds it, alive, and its address names it.
+    /// It does not mark the proof used: the resolve that returned the block
+    /// just did (a hit) or just inserted it, and the link made from it then
+    /// holds the block, which `make_room`'s `hot` counts while it does.
     pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
-        self.last
-            .and_then(|key| self.blocks.get(&key))
-            .is_some_and(|proof| Arc::ptr_eq(&proof.ir, ir))
+        self.last == Some((Arc::as_ptr(ir) as usize, self.blocks.version()))
     }
 
-    #[cold]
-    #[inline(never)]
-    pub(super) fn evict_context(&mut self, id: u64) {
-        self.blocks
-            .retain(|key| key.context_id != id, why!(ContextEvicted));
+    /// The proofs' weight now and its peak since the last call.
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn take_weight(&mut self) -> (usize, usize) {
+        (self.blocks.weight(), self.blocks.take_peak_weight())
     }
 
     #[cold]
@@ -99,6 +117,7 @@ impl State {
         context: MachineContext,
         key: LegacyBlockKey,
         exit_word: &AtomicU64,
+        links: &mut super::links::Links,
     ) -> Result<(Arc<IrBlock>, BlockWalk), Exit> {
         #[cfg(feature = "test-hooks")]
         let class = super::diag::ProofClass::of(context.segment_class, false);
@@ -124,7 +143,7 @@ impl State {
                 .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
             {
                 probe!(PROOFS);
-                self.last = Some(key);
+                self.last = Some((Arc::as_ptr(&proof.ir) as usize, self.blocks.version()));
                 return Ok((proof.ir.clone(), proof.walk));
             }
             probe!(LIFTS);
@@ -212,9 +231,21 @@ impl State {
             }
             // Keep retention bounded independently of the context LRU. Each
             // proof owns its counted physical registration until eviction.
-            self.blocks.make_room(MAX_PROOFS, why!(Bound), |proof| {
-                Arc::strong_count(&proof.ir) > 1
-            });
+            let mut ir = ir;
+            // The lift's spare capacity would count against the budget.
+            ir.ops.shrink_to_fit();
+            let weight = weight(&ir, sources.len());
+            if self
+                .blocks
+                .make_room(MAX_PROOFS, MAX_PROOF_BYTES, weight, why!(Bound), |proof| {
+                    Arc::strong_count(&proof.ir) > 1
+                })
+            {
+                // The sweep advanced the version every Flat link names
+                // (`links.rs`): the stale links would only hold their blocks
+                // and count them as hot at the next sweep.
+                links.drop_path(super::links::LinkPath::Flat);
+            }
             let link_exit = super::links::link_exit(&ir);
             let ir = Arc::new(IrBlock { link_exit, ..ir });
             self.blocks.insert(
@@ -226,8 +257,9 @@ impl State {
                     _registration: registration.unwrap(),
                 },
                 &sources,
+                weight,
             );
-            self.last = Some(key);
+            self.last = Some((Arc::as_ptr(&ir) as usize, self.blocks.version()));
             return Ok((ir, walk));
         }
     }
@@ -536,24 +568,34 @@ mod tests {
         }
     }
 
+    // Blocks of INC EAX; JMP $+2 from 0x4000, more than MAX_PROOFS, on RAM
+    // the fixture maps from 0x4000 to 0x10000.
+    const LOOP: u64 = 0x4000;
+    const PAST: u64 = (MAX_PROOFS + MAX_PROOFS / 4) as u64;
+
+    fn past_the_bound(vm: &mut Vm) {
+        vm.map(LOOP, 0xc000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(LOOP, &b"\x40\xeb\x00".repeat(PAST as usize))
+            .unwrap();
+    }
+
     // xj-to9.53: a working set of more blocks than the old bound of 64
     // proofs relifted every block it entered once the map cleared.
     #[test]
     fn a_working_set_past_the_bound_keeps_most_of_its_proofs() {
         for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Segmented] {
             let model = crate::CpuModel::I80486Dx;
-            let (vm, mut cpu, context) = proof_fixture(model, class);
-            // INC EAX; JMP $+2, 1300 times from 0x2000.
-            vm.write_bytes(0x2000, &b"\x40\xeb\x00".repeat(1300))
-                .unwrap();
+            let (mut vm, mut cpu, context) = proof_fixture(model, class);
+            past_the_bound(&mut vm);
             let exit = AtomicU64::new(0);
-            for (blocks, most) in [(80, 0), (300, 0), (1300, 650)] {
+            for (blocks, most) in [(80, 0), (300, 0), (PAST, PAST / 2)] {
                 let mut execution = Execution::new();
                 execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
                 let mut pass = |e: &mut Execution| {
                     let before = e.flat32.lifts;
                     for i in 0..blocks {
-                        resolve_at(e, &vm, &mut cpu, context, &exit, 0x2000 + 3 * i);
+                        resolve_at(e, &vm, &mut cpu, context, &exit, LOOP + 3 * i);
                     }
                     e.flat32.lifts - before
                 };
@@ -571,17 +613,15 @@ mod tests {
     fn a_flood_of_cold_blocks_keeps_the_hot_proofs() {
         let model = crate::CpuModel::I80486Dx;
         let class = crate::SegmentClass::Flat32;
-        let (vm, mut cpu, context) = proof_fixture(model, class);
-        // INC EAX; JMP $+2: 1300 cold blocks from 0x2000 and 20 hot ones
-        // from 0x3800.
-        vm.write_bytes(0x2000, &b"\x40\xeb\x00".repeat(1300))
-            .unwrap();
+        let (mut vm, mut cpu, context) = proof_fixture(model, class);
+        // PAST cold blocks from LOOP and 20 hot ones from 0x3800.
+        past_the_bound(&mut vm);
         vm.write_bytes(0x3800, &b"\x40\xeb\x00".repeat(20)).unwrap();
         let exit = AtomicU64::new(0);
         let mut execution = Execution::new();
         execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
         let mut hot_lifts = 0;
-        for i in 0..1300 {
+        for i in 0..PAST {
             if i % 10 == 0 {
                 for h in 0..20 {
                     let before = execution.flat32.lifts;
@@ -596,16 +636,163 @@ mod tests {
                     hot_lifts += execution.flat32.lifts - before;
                 }
             }
-            resolve_at(
-                &mut execution,
-                &vm,
-                &mut cpu,
-                context,
-                &exit,
-                0x2000 + 3 * i,
-            );
+            resolve_at(&mut execution, &vm, &mut cpu, context, &exit, LOOP + 3 * i);
         }
         assert_eq!(hot_lifts, 20, "only the first lift of each hot block");
+    }
+
+    // xj-to9.56: an unpaged Flat32 or Segmented identity names what its lift
+    // reads. States that differ only in the IDTR, GDTR, LDTR, TR, CR3, other
+    // CR0 bits, IOPL, NT or the selector values share one identity and its
+    // proofs; a cache the class bakes, CR0.AM and the A20 line do not.
+    #[test]
+    fn an_unpaged_identity_names_only_what_its_lift_reads() {
+        type Edit = fn(&mut CpuState);
+        let shared: [Edit; 12] = [
+            |c| {
+                c.legacy.idtr = crate::legacy::TableRegister {
+                    base: 0,
+                    limit: 0x3ff,
+                    reserved: 0,
+                }
+            },
+            |c| c.legacy.gdtr.base = 0x6000,
+            |c| c.legacy.ldtr.selector = 0x28,
+            |c| c.legacy.ldtr.cache.base = 0x5000,
+            |c| c.legacy.tr.cache.attributes = 0x8b,
+            |c| c.legacy.cr3 = 0x1000,
+            |c| c.legacy.cr0 |= 1 << 3,
+            |c| c.rflags_system |= 0x3000 | 0x4000,
+            |c| c.cs = 0x170,
+            |c| c.ds = 0x178,
+            |c| c.ss = 0x18,
+            |c| c.fs = 0x20,
+        ];
+        let distinct: [Edit; 2] = [|c| c.legacy.cr0 |= 1 << 18, |c| c.legacy.a20_enabled ^= 1];
+        for class in [crate::SegmentClass::Flat32, crate::SegmentClass::Segmented] {
+            let model = crate::CpuModel::I80486Dx;
+            let (vm, mut cpu, context) = proof_fixture(model, class);
+            cpu.cpu.legacy.a20_enabled = 1;
+            let legacy = model.legacy_model();
+            let mut execution = Execution::new();
+            execution.sync_class(&cpu.cpu, legacy, false, class);
+            let exit = AtomicU64::new(0);
+            let a = resolve_at(&mut execution, &vm, &mut cpu, context, &exit, A);
+            let id = execution.context_id;
+            let initial = cpu.cpu.clone();
+            let segment_base: Edit = |c| c.legacy.segments[SegmentId::Ds as usize].base = 0x10;
+            let distinct = distinct
+                .iter()
+                .chain((class == crate::SegmentClass::Segmented).then_some(&segment_base));
+            let edits = shared.iter().map(|e| (true, e));
+            for (shares, edit) in edits.chain(distinct.map(|e| (false, e))) {
+                cpu.cpu = initial.clone();
+                edit(&mut cpu.cpu);
+                let edited = derive_legacy_context(legacy, &cpu.cpu).unwrap();
+                assert_eq!(edited.segment_class, class);
+                execution.sync_class(&cpu.cpu, legacy, false, class);
+                let b = resolve_at(&mut execution, &vm, &mut cpu, edited, &exit, A);
+                assert_eq!(execution.context_id == id, shares, "{class:?}");
+                assert_eq!(Arc::ptr_eq(&a, &b), shares, "{class:?}");
+            }
+            cpu.cpu = initial;
+            execution.sync_class(&cpu.cpu, legacy, false, class);
+            assert_eq!(execution.context_id, id);
+        }
+    }
+
+    // xj-to9.56: a new identity is never an evicted one's, so no key names
+    // the evicted identity's proofs again and no walk over the proof map
+    // drops them; the bound sweeps them as unused.
+    #[test]
+    fn an_evicted_identity_is_never_reused() {
+        let model = crate::CpuModel::I80486Dx;
+        let class = crate::SegmentClass::Segmented;
+        let (vm, mut cpu, context) = proof_fixture(model, class);
+        let legacy = model.legacy_model();
+        let mut execution = Execution::new();
+        let exit = AtomicU64::new(0);
+        let mut first = None;
+        for k in 0..=super::MAX_RETAINED_CONTEXTS as u32 {
+            cpu.cpu.legacy.segments[SegmentId::Ds as usize].base = 0x10 * k;
+            execution.sync_class(&cpu.cpu, legacy, false, class);
+            assert_eq!(execution.context_id, u64::from(k));
+            let ir = resolve_at(&mut execution, &vm, &mut cpu, context, &exit, A);
+            first.get_or_insert(ir);
+        }
+        assert_eq!(execution.contexts.len(), super::MAX_RETAINED_CONTEXTS);
+        // The first stamp was evicted: it returns under a fresh identity.
+        cpu.cpu.legacy.segments[SegmentId::Ds as usize].base = 0;
+        execution.sync_class(&cpu.cpu, legacy, false, class);
+        assert_eq!(
+            execution.context_id,
+            super::MAX_RETAINED_CONTEXTS as u64 + 1
+        );
+        let again = resolve_at(&mut execution, &vm, &mut cpu, context, &exit, A);
+        assert!(!Arc::ptr_eq(first.as_ref().unwrap(), &again));
+    }
+
+    // xj-to9.56: a bound sweep advances the proof map's version, which every
+    // Flat link names; the stale links are dropped so that they do not hold
+    // their blocks as hot at the next sweep. Other paths' links stay.
+    #[test]
+    fn a_bound_sweep_drops_the_stale_flat_links() {
+        let model = crate::CpuModel::I80486Dx;
+        let class = crate::SegmentClass::Flat32;
+        let (mut vm, mut cpu, context) = proof_fixture(model, class);
+        past_the_bound(&mut vm);
+        let mut execution = Execution::new();
+        execution.sync_class(&cpu.cpu, model.legacy_model(), false, class);
+        let exit = AtomicU64::new(0);
+        let a = resolve_at(&mut execution, &vm, &mut cpu, context, &exit, A);
+        execution
+            .links
+            .plant(super::links::LinkPath::Flat, &a, context);
+        execution
+            .links
+            .plant(super::links::LinkPath::Direct, &a, context);
+        // A and MAX_PROOFS - 1 more fill the map; the next lift sweeps.
+        for i in 0..MAX_PROOFS as u64 - 1 {
+            resolve_at(&mut execution, &vm, &mut cpu, context, &exit, LOOP + 3 * i);
+        }
+        assert_eq!(execution.links.count(super::links::LinkPath::Flat), 1);
+        resolve_at(
+            &mut execution,
+            &vm,
+            &mut cpu,
+            context,
+            &exit,
+            LOOP + 3 * MAX_PROOFS as u64,
+        );
+        assert_eq!(execution.links.count(super::links::LinkPath::Flat), 0);
+        assert_eq!(execution.links.count(super::links::LinkPath::Direct), 1);
+    }
+
+    // xj-to9.56: the map is bounded by its proofs' weight as well as their
+    // count: heavy proofs sweep it before the count is reached, and the
+    // weight never exceeds the budget.
+    #[test]
+    fn heavy_proofs_stay_within_the_byte_budget() {
+        let mut map = super::super::proof_map::ProofMap::<u64, ()>::default();
+        let (bound, budget, heavy) = (1000, 1 << 20, (1 << 20) / 10 + 1);
+        let mut swept = 0;
+        for key in 0..100u64 {
+            if map.make_room(bound, budget, heavy, why!(Bound), |_| false) {
+                swept += 1;
+            }
+            map.insert(key, (), &[(0x1000 * key, 1)], heavy);
+            assert!(map.weight() <= budget, "{key}: {}", map.weight());
+            assert!(map.len() < 10);
+        }
+        assert!(swept > 0);
+        // Light proofs sweep at the count bound alone.
+        let mut map = super::super::proof_map::ProofMap::<u64, ()>::default();
+        for key in 0..2 * bound as u64 {
+            map.make_room(bound, budget, 1, why!(Bound), |_| false);
+            map.insert(key, (), &[(0x1000 * key, 1)], 1);
+            assert!(map.len() <= bound);
+        }
+        assert!(map.len() > bound / 2);
     }
 
     #[test]

@@ -136,3 +136,4 @@ x86jit-tests::legacy legacy_rollback_sweep::protected_code32_fault_atomicity_swe
 x86jit-tests::legacy legacy_smc_positions::stores_into_every_position_of_a_block_are_fetched
 x86jit-tests::legacy legacy_seg32::budgets_fault_ordinals_and_segment_loads_match_checked
 x86jit-tests::legacy legacy_seg16::budgets_fault_ordinals_and_segment_loads_match_checked
+x86jit-core vm::legacy::tests::context_churn_bounds_retained_contexts_and_their_blocks

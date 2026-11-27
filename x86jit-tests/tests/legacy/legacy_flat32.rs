@@ -1453,7 +1453,16 @@ fn cpl3_block_lifted_before_am_is_not_reused_after_the_kernel_sets_it() {
                 assert_eq!(cpu.cpu.legacy.cr0, cr0, "{case}");
                 let (run, lifts, _) = steps(&mut cpu, 2);
                 assert_eq!(run.steps(), 2, "{case}");
-                assert_ne!(lifts, 0, "{case}: the block's first lift after a return");
+                // The IRET loads CS and SS caches with G set (C0FBh, C0F3h)
+                // where the entry had it clear: an unpaged Flat32 identity
+                // names neither G nor the selectors (xj-to9.56), so the
+                // entry's proof serves the return; the paged and Checked
+                // identities name the whole stamp and lift again.
+                if paged || checked {
+                    assert_ne!(lifts, 0, "{case}: the block's first lift after a return");
+                } else {
+                    assert_eq!(lifts, 0, "{case}: the entry's proof serves the return");
+                }
                 assert_eq!(steps(&mut cpu, 7).0.steps(), 7, "{case}");
                 assert_eq!(cpu.cpu.legacy.cr0, cr0, "{case}");
                 let (run, lifts, proofs) = steps(&mut cpu, 2);
@@ -1717,6 +1726,284 @@ fn paged_privilege_gate_round_trips_reuse_prior_context_blocks() {
                     assert_eq!(Some(proof), warm, "call={call}");
                 }
             }
+        }
+    }
+}
+
+/// One witness case of `a_reduced_identity_reuses_its_proofs_exactly`: the
+/// code, its privilege, its step budget and the two states.
+struct ReuseCase {
+    name: &'static str,
+    code: &'static [u8],
+    user: bool,
+    budget: u64,
+    a: fn(&Vm, &mut Vcpu),
+    b: fn(&Vm, &mut Vcpu),
+}
+
+/// A second, protected 486 GDT at 5800h: the first one's 16 entries with
+/// selector 20h's limit at 1234h and selector 08h not present.
+fn second_gdt(vm: &Vm, cpu: &mut Vcpu) {
+    let mut table = [0; 0x80];
+    vm.read_bytes(0x2000, &mut table).unwrap();
+    vm.write_bytes(0x5800, &table).unwrap();
+    descriptor(vm, 0x5820, 0, 0x1234, 0x40f3);
+    descriptor(vm, 0x5808, 0, u32::MAX, 0xc01b);
+    cpu.cpu.legacy.gdtr.base = 0x5800;
+}
+
+// xj-to9.56: an unpaged Flat32 identity leaves out the selectors, GDTR,
+// IDTR, LDTR, TR, CR3, CR0 other than PE and AM, IOPL, NT and the flat
+// caches' bits other than D/B. Every instruction that reads one of them
+// reads it live: lifted under state A, the same proof runs under state B,
+// which changes one such field, and must do exactly what a vCPU that never
+// saw A does (a fresh lift). The cases: the IOPL checks of CLI, STI and
+// POPF (SDM Vol 1 §3.4.3.3, §20.5.1); the I/O permission bit map of IN,
+// OUT and INS, found through TR (Vol 1 §20.5.2); the task return of IRET
+// under NT (Vol 3A §10.4); the IDT limit of INT (Vol 3A §7.10); MOV from a
+// segment register, SLDT, STR, SIDT and SGDT (Vol 2B); LAR and LSL through
+// the GDT (Vol 3A §6.10); a far JMP and LDS through the GDT; MOV from CR3
+// and CR0.TS for an x87 instruction (Vol 3A §2.5); and loads, stores and
+// stack operations through caches with other G and A bits. Each runs
+// under Flat32 and Segmented.
+#[test]
+fn a_reduced_identity_reuses_its_proofs_exactly() {
+    let cases = [
+        ReuseCase {
+            name: "CLI/STI, IOPL",
+            code: b"\xfa\xfb\x90",
+            user: true,
+            budget: 3,
+            a: |_, c| c.cpu.rflags_system |= 0x3000,
+            b: |_, c| c.cpu.rflags_system &= !0x3000,
+        },
+        ReuseCase {
+            name: "POPF, IOPL",
+            // PUSHFD; POP EAX; XOR EAX,200h; PUSH EAX; POPFD; PUSHFD; POP EBX.
+            code: b"\x9c\x58\x35\x00\x02\x00\x00\x50\x9d\x9c\x5b",
+            user: true,
+            budget: 7,
+            a: |_, c| c.cpu.rflags_system |= 0x3000,
+            b: |_, c| c.cpu.rflags_system &= !0x3000,
+        },
+        ReuseCase {
+            name: "IN, TR",
+            code: b"\xe4\x60",
+            user: true,
+            budget: 1,
+            a: |vm, c| {
+                // A TSS at 5000h whose bitmap denies port 60h.
+                vm.write_bytes(0x5066, &0x100u16.to_le_bytes()).unwrap();
+                vm.write_bytes(0x510c, &[0xff]).unwrap();
+                c.cpu.legacy.tr.cache.base = 0x5000;
+            },
+            b: |_, _| {},
+        },
+        ReuseCase {
+            name: "OUT, TR",
+            code: b"\xe6\x60",
+            user: true,
+            budget: 1,
+            a: |vm, c| {
+                vm.write_bytes(0x5066, &0x100u16.to_le_bytes()).unwrap();
+                vm.write_bytes(0x510c, &[0xff]).unwrap();
+                c.cpu.legacy.tr.cache.base = 0x5000;
+            },
+            b: |_, _| {},
+        },
+        ReuseCase {
+            name: "INSB, TR",
+            code: b"\x6c",
+            user: true,
+            budget: 1,
+            a: |vm, c| {
+                vm.write_bytes(0x5066, &0x100u16.to_le_bytes()).unwrap();
+                vm.write_bytes(0x510c, &[0xff]).unwrap();
+                c.cpu.legacy.tr.cache.base = 0x5000;
+                c.cpu.gpr[2] = 0x60;
+                c.cpu.gpr[7] = 0x6000;
+            },
+            b: |_, c| {
+                c.cpu.gpr[2] = 0x60;
+                c.cpu.gpr[7] = 0x6000;
+            },
+        },
+        ReuseCase {
+            name: "IRETD, NT",
+            // A frame at 7FF4h: EIP 1100h, CS 8, EFLAGS 2; 1100h: NOP.
+            code: b"\xcf",
+            user: false,
+            budget: 1,
+            a: |vm, c| {
+                vm.write_bytes(0x1100, b"\x90").unwrap();
+                put(vm, 0x7ff4, 0x1100);
+                put(vm, 0x7ff8, 8);
+                put(vm, 0x7ffc, 2);
+                c.cpu.gpr[4] = 0x7ff4;
+            },
+            b: |_, c| {
+                c.cpu.gpr[4] = 0x7ff4;
+                c.cpu.rflags_system |= 0x4000;
+            },
+        },
+        ReuseCase {
+            name: "INT 20h, IDTR",
+            code: b"\xcd\x20",
+            user: true,
+            budget: 1,
+            a: |_, _| {},
+            b: |_, c| c.cpu.legacy.idtr.limit = 0xff,
+        },
+        ReuseCase {
+            name: "MOV r32,Sreg, selectors",
+            // MOV EAX,DS; MOV EBX,ES; MOV ECX,SS; MOV EDX,CS.
+            code: b"\x8c\xd8\x8c\xc3\x8c\xd1\x8c\xca",
+            user: true,
+            budget: 4,
+            a: |_, _| {},
+            b: |_, c| {
+                c.cpu.ds = 0x2b;
+                c.cpu.es = 0x33;
+                c.cpu.ss = 0x3b;
+                c.cpu.cs = 0x43;
+            },
+        },
+        ReuseCase {
+            name: "SLDT/STR/SIDT/SGDT, LDTR TR IDTR GDTR",
+            // SLDT EAX; STR EBX; SIDT [6000h]; SGDT [6008h].
+            code:
+                b"\x0f\x00\xc0\x0f\x00\xcb\x0f\x01\x0d\x00\x60\x00\x00\x0f\x01\x05\x08\x60\x00\x00",
+            user: true,
+            budget: 4,
+            a: |_, _| {},
+            b: |_, c| {
+                c.cpu.legacy.ldtr.selector = 0x38;
+                c.cpu.legacy.tr.selector = 0x40;
+                c.cpu.legacy.idtr.base = 0x2c00;
+                c.cpu.legacy.gdtr.limit = 0x7f;
+                c.cpu.legacy.gdtr.base = 0x5800;
+            },
+        },
+        ReuseCase {
+            name: "LAR/LSL, GDTR",
+            // MOV EAX,23h; LAR EBX,AX; LSL ECX,AX.
+            code: b"\xb8\x23\x00\x00\x00\x0f\x02\xd8\x0f\x03\xc8",
+            user: true,
+            budget: 3,
+            a: |_, _| {},
+            b: second_gdt,
+        },
+        ReuseCase {
+            name: "JMP FAR, GDTR",
+            // JMP FAR 0008h:1100h; 1100h: NOP.
+            code: b"\xea\x00\x11\x00\x00\x08\x00",
+            user: false,
+            budget: 2,
+            a: |vm, _| vm.write_bytes(0x1100, b"\x90").unwrap(),
+            b: second_gdt,
+        },
+        ReuseCase {
+            name: "LDS, GDTR",
+            // LDS EAX,[6010h], the pointer 0020h:1234h.
+            code: b"\xc5\x05\x10\x60\x00\x00",
+            user: true,
+            budget: 1,
+            a: |vm, _| {
+                put(vm, 0x6010, 0x1234);
+                vm.write_bytes(0x6014, &0x23u16.to_le_bytes()).unwrap();
+            },
+            b: second_gdt,
+        },
+        ReuseCase {
+            name: "MOV r32,CR3, CR3",
+            code: b"\x0f\x20\xd8",
+            user: false,
+            budget: 1,
+            a: |_, _| {},
+            b: |_, c| c.cpu.legacy.cr3 = 0x7000,
+        },
+        ReuseCase {
+            name: "FLD1, CR0.TS",
+            code: b"\xd9\xe8\x90",
+            user: false,
+            budget: 2,
+            a: |_, _| {},
+            b: |_, c| c.cpu.legacy.cr0 |= 1 << 3,
+        },
+        ReuseCase {
+            name: "loads and stores, G and A bits",
+            // MOV EAX,[6000h]; MOV [6004h],EAX; PUSH EAX; POP EBX.
+            code: b"\x8b\x05\x00\x60\x00\x00\x89\x05\x04\x60\x00\x00\x50\x5b",
+            user: true,
+            budget: 4,
+            a: |vm, _| put(vm, 0x6000, 0x1234_5678),
+            b: |_, c| {
+                for cache in &mut c.cpu.legacy.segments[1..4] {
+                    cache.attributes = (cache.attributes ^ 0x8000) & !1;
+                }
+            },
+        },
+    ];
+    // Segmented (64 KiB data and stack limits) as well as Flat32: its
+    // identity also names the caches, so only the G and A case lifts again.
+    for segmented in [false, true] {
+        let class_of = if segmented {
+            SegmentClass::Segmented
+        } else {
+            SegmentClass::Flat32
+        };
+        for case in &cases {
+            let name = format!("{} ({class_of:?})", case.name);
+            let caches = case.name.contains("G and A");
+            let (vm, mut warm) = if case.user {
+                user_setup(CpuModel::I80486Dx, case.code, false, false)
+            } else {
+                setup(CpuModel::I80486Dx, case.code, false)
+            };
+            warm.cpu.legacy.cr0 |= 0x10;
+            if segmented {
+                for cache in &mut warm.cpu.legacy.segments[1..4] {
+                    cache.limit = 0xffff;
+                }
+            }
+            let start = warm.cpu.clone();
+            (case.a)(&vm, &mut warm);
+            assert_eq!(class(&warm, CpuModel::I80486Dx), class_of, "{name}");
+            // State A lifts the proofs.
+            warm.run_steps(&vm, case.budget, StepOptions::default())
+                .unwrap();
+            // State B: the same code and registers, one dropped field changed.
+            let mut cold = vm.new_vcpu();
+            cold.cpu = start;
+            (case.b)(&vm, &mut cold);
+            assert_eq!(class(&cold, CpuModel::I80486Dx), class_of, "{name}");
+            let mut memory = vec![0; 0x10000];
+            vm.read_bytes(0, &mut memory).unwrap();
+            warm.cpu = cold.cpu.clone();
+            Vcpu::take_machine_counters_for_test();
+            let warm_run = warm.run_steps(&vm, case.budget, StepOptions::default());
+            let [_, _, lifts, ..] = Vcpu::take_machine_counters_for_test();
+            assert_eq!(
+                lifts == 0,
+                !(segmented && caches),
+                "{name}: state B reuses state A's proofs ({lifts} lifts)"
+            );
+            let mut warm_memory = vec![0; 0x10000];
+            vm.read_bytes(0, &mut warm_memory).unwrap();
+            // A vCPU that never ran under state A, on the same memory.
+            vm.write_bytes(0, &memory).unwrap();
+            let cold_run = cold.run_steps(&vm, case.budget, StepOptions::default());
+            let [_, _, lifts, ..] = Vcpu::take_machine_counters_for_test();
+            assert_ne!(lifts, 0, "{name}: the fresh vCPU lifts");
+            let mut cold_memory = vec![0; 0x10000];
+            vm.read_bytes(0, &mut cold_memory).unwrap();
+            assert_eq!(format!("{warm_run:?}"), format!("{cold_run:?}"), "{name}");
+            assert_eq!(
+                format!("{:?}", warm.cpu),
+                format!("{:?}", cold.cpu),
+                "{name}"
+            );
+            assert_eq!(warm_memory, cold_memory, "{name}");
         }
     }
 }

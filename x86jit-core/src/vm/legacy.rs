@@ -81,6 +81,16 @@ impl Vcpu {
     /// executed, context reselections, lifts, proof hits, the op walks of
     /// the protected and paged instruction walks and successor links
     /// followed. Cost probes only.
+    /// The unpaged Flat32/Segmented proofs' weight in bytes now
+    /// (`flat32::weight`) and its peak since the last call. Diagnostics only.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn take_proof_bytes_for_test(&mut self) -> (usize, usize) {
+        self.legacy_execution
+            .as_mut()
+            .map_or((0, 0), |e| e.flat32.take_weight())
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "test-hooks")]
     pub fn take_machine_counters_for_test() -> [u64; 6] {
@@ -227,14 +237,98 @@ impl LegacyContextStamp {
     /// reloads FS or GS keeps one identity and its proofs. Every other class
     /// keeps the whole stamp: Segmented proofs bake FS and GS caches
     /// (`flat32::specialize_segments`).
-    fn identity(mut self, class: crate::SegmentClass) -> Self {
-        if class == crate::SegmentClass::Flat32 {
-            for i in [SegmentId::Fs as usize, SegmentId::Gs as usize] {
-                self.selectors[i] = 0;
-                self.state.segments[i] = crate::legacy::SegmentCache::default();
+    ///
+    /// Unpaged Flat32 and Segmented identities go further (xj-to9.56): they
+    /// name only what their lift reads. A lift reads the guest bytes at the
+    /// key's linear fetch address through the CS cache and the A20 line
+    /// (`fetch_watched`, `legacy::physical_span`), the `MachineContext`
+    /// (derived from the model, CR0.PE and PG, the CPL, the reset fetch and
+    /// NEC state, EFLAGS.VM and the segment caches), CR0.AM
+    /// (`lift::legacy::alignment_mask`) and, for Segmented, every segment
+    /// cache (`flat32::specialize_segments`). Selectors, GDTR, IDTR, LDTR,
+    /// TR, CR3 (no paging), the other CR0 bits and EFLAGS IOPL and NT are
+    /// read live by the helpers that use them, and a Flat32 class proves CS,
+    /// DS, ES and SS flat, so only their D/B bits (also in the key) remain.
+    /// An extended-memory runtime's reflection that changes only the IDTR,
+    /// or loads another selector with an identical flat descriptor, keeps
+    /// its identity and its proofs. The class itself is part of the
+    /// identity, in the output-only CR2 slot.
+    ///
+    /// This: whether `class` at this state takes such a reduced identity
+    /// (`reduced_identity`); otherwise the identity is the whole stamp, less
+    /// FS and GS for a paged Flat32 (`drop_fs_gs`).
+    #[inline(always)]
+    fn reduced(cpu: &CpuState, class: crate::SegmentClass) -> bool {
+        matches!(
+            class,
+            crate::SegmentClass::Flat32 | crate::SegmentClass::Segmented
+        ) && cpu.legacy.cr0 & (1 << 31) == 0
+    }
+
+    /// The identity of a `reduced` class.
+    fn reduced_identity(cpu: &CpuState, model: LegacyCpuModel, class: crate::SegmentClass) -> Self {
+        let l = &cpu.legacy;
+        let mut state = crate::legacy::LegacyCpuState {
+            // PE (bit 0) and AM (bit 18); PG (bit 31) is clear.
+            cr0: l.cr0 & (1 | (1 << 18)),
+            cr2: 1 + class as u32,
+            cpl: l.cpl,
+            a20_enabled: l.a20_enabled,
+            reset_fetch: l.reset_fetch,
+            reserved: l.reserved,
+            ..Default::default()
+        };
+        if class == crate::SegmentClass::Segmented {
+            state.segments = l.segments;
+        } else {
+            for (cache, live) in state.segments[..4].iter_mut().zip(&l.segments) {
+                cache.attributes = live.attributes & 0x4000;
             }
         }
-        self
+        Self {
+            model,
+            state,
+            selectors: [0; 6],
+            system_flags: 0,
+        }
+    }
+
+    /// Whether this stamp is the `reduced_identity` of the live state, read
+    /// without building it: the steady context check after every
+    /// context-changing helper.
+    #[inline(always)]
+    fn is_reduced_identity(
+        &self,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        class: crate::SegmentClass,
+    ) -> bool {
+        // The class tag (CR2) marks a reduced identity, whose other fields
+        // `reduced_identity` leaves zero.
+        let (s, l) = (&self.state, &cpu.legacy);
+        self.model == model
+            && s.cr2 == 1 + class as u32
+            && s.cr0 == l.cr0 & (1 | (1 << 18))
+            && s.cpl == l.cpl
+            && s.a20_enabled == l.a20_enabled
+            && s.reset_fetch == l.reset_fetch
+            && s.reserved == l.reserved
+            && if class == crate::SegmentClass::Segmented {
+                s.segments == l.segments
+            } else {
+                s.segments[..4]
+                    .iter()
+                    .zip(&l.segments)
+                    .all(|(c, live)| c.attributes == live.attributes & 0x4000)
+            }
+    }
+
+    // The paged Flat32 identity, in place: the whole stamp but FS and GS.
+    fn drop_fs_gs(&mut self) {
+        for i in [SegmentId::Fs as usize, SegmentId::Gs as usize] {
+            self.selectors[i] = 0;
+            self.state.segments[i] = crate::legacy::SegmentCache::default();
+        }
     }
 
     fn new(cpu: &CpuState, model: LegacyCpuModel) -> Self {
@@ -309,10 +403,21 @@ impl LegacyContextStamp {
 // Decision-20: the firmware-style transition loop uses four contexts. An
 // extended-memory runtime's interrupt reflection walks through more than
 // sixteen stamps (code, data and stack selectors, CR0.PE, IDTR) on every
-// reflection (xj-to9.53); 64 keeps their identities, and so their proofs'
-// keys, stable while still bounding churn.
-const MAX_RETAINED_CONTEXTS: usize = 64;
+// reflection (xj-to9.53), and a PC-class embedder's still created and
+// evicted about 95 contexts a second at 64 (xj-to9.56): a cycle through
+// more stamps than are retained evicts every one of them by LRU, the
+// interrupted program's Flat32 identity included, which then relifts its
+// whole working set under a new identity. 256 keeps such a cycle's
+// identities, and so their proofs' keys, stable while still bounding
+// churn; a retained stamp is about 200 bytes.
+const MAX_RETAINED_CONTEXTS: usize = 256;
 const RECENT_CONTEXTS: usize = 4;
+// Checked one-instruction blocks retained per vCPU (xj-to9.56). The context
+// LRU drops an evicted context's blocks, but each of 256 retained contexts
+// keeps a block per instruction it ran, which only the program's size
+// bounds. A block is one instruction's IR (about 1–2 KiB) and its bytes:
+// about 4–8 MiB.
+const MAX_CHECKED_BLOCKS: usize = 4096;
 
 struct RetainedContext {
     id: u64,
@@ -653,6 +758,9 @@ pub(super) struct Execution {
     owner_id: u64,
     context_epoch: u64,
     context_id: u64,
+    // The identity the next new context receives; restarts only with a
+    // translation flush (`invalidate_translations`).
+    next_context_id: u64,
     stamp: Option<LegacyContextStamp>,
     validated: Option<(LegacyContextStamp, MachineContext, u64)>,
     // The validated stamp covers every selector and the effective A20 line.
@@ -730,6 +838,7 @@ impl Execution {
             owner_id,
             context_epoch: 0,
             context_id: 0,
+            next_context_id: 0,
             stamp: None,
             validated: None,
             validated_direct_bus: false,
@@ -845,6 +954,7 @@ impl Execution {
         self.blocks.clear();
         self.flat32 = flat32::State::default();
         self.contexts.clear();
+        self.next_context_id = 0;
         *self.recent = [None; RECENT_CONTEXTS];
         self.stamp = None;
         self.validated = None;
@@ -867,7 +977,27 @@ impl Execution {
         force: bool,
         class: crate::SegmentClass,
     ) {
-        let stamp = LegacyContextStamp::new(cpu, model).identity(class);
+        // A reduced identity is compared with the recent ones before it is
+        // built (`is_reduced_identity`): a hit takes the recent path below
+        // without building the stamp. The last identity is first in
+        // `recent` unless the last context was Direct.
+        let stamp = if LegacyContextStamp::reduced(cpu, class) {
+            if let Some(slot) = self.recent.iter().position(|r| {
+                r.as_ref()
+                    .is_some_and(|(s, ..)| s.is_reduced_identity(cpu, model, class))
+            }) {
+                if self.resync_recent(slot, force) {
+                    return;
+                }
+            }
+            LegacyContextStamp::reduced_identity(cpu, model, class)
+        } else {
+            let mut stamp = LegacyContextStamp::new(cpu, model);
+            if class == crate::SegmentClass::Flat32 {
+                stamp.drop_fs_gs();
+            }
+            stamp
+        };
         #[cfg(feature = "test-hooks")]
         if self.stamp != Some(stamp) {
             diag::note_context(diag::ContextNote::Switch);
@@ -905,7 +1035,7 @@ impl Execution {
                 self.remember_recent(stamp, id);
                 id
             } else {
-                let id = if self.contexts.len() == MAX_RETAINED_CONTEXTS {
+                if self.contexts.len() == MAX_RETAINED_CONTEXTS {
                     // The LRU sees every recent use before choosing.
                     for (stamp, _, epoch) in std::mem::take(&mut *self.recent).into_iter().flatten()
                     {
@@ -918,23 +1048,26 @@ impl Execution {
                         .unwrap()
                         .0;
                     let evicted = self.contexts.remove(&oldest).unwrap();
-                    // Its identity is reused: no link may name it. Redundant
-                    // today: the Flat32 proof map's version advances below
-                    // (`evict_context`) and a paged link also names the paging
-                    // state's own identity; kept so no link outlives the
-                    // identity it names.
+                    // Identities are never reused before a translation flush
+                    // (`next_context_id`), so no key or link can name the
+                    // evicted one again: its Flat32 and Segmented proofs are
+                    // never returned, and the proof map's bound sweeps them
+                    // first as unused (xj-to9.56) instead of a walk over every
+                    // proof per eviction. Every creation also advances the
+                    // epoch, whose rollover flushes first, so the counter
+                    // never reaches Direct's `u64::MAX`. The link flush is
+                    // redundant, kept so no link outlives the identity it
+                    // names; the Checked blocks have no other bound.
                     self.links.clear();
                     self.blocks.retain(|key, _| key.context_id != evicted.id);
-                    self.flat32.evict_context(evicted.id);
                     #[cfg(feature = "test-hooks")]
                     diag::note_context(diag::ContextNote::Evicted {
                         id: evicted.id,
                         fields: oldest.diag_fields(),
                     });
-                    evicted.id
-                } else {
-                    self.contexts.len() as u64
-                };
+                }
+                let id = self.next_context_id;
+                self.next_context_id += 1;
                 #[cfg(feature = "test-hooks")]
                 diag::note_context(diag::ContextNote::Created {
                     id,
@@ -952,6 +1085,49 @@ impl Execution {
                 id
             };
             self.stamp = Some(stamp);
+        }
+    }
+    // `sync_class` with a reduced identity found in `recent[slot]`: whether
+    // it is done, as the full path would have done it. An epoch rollover
+    // takes the full path, which flushes.
+    #[inline(always)]
+    fn resync_recent(&mut self, slot: usize, force: bool) -> bool {
+        let same = slot == 0 && self.context_id != u64::MAX;
+        if same && !force {
+            return true;
+        }
+        let Some(next) = self.context_epoch.checked_add(1) else {
+            return false;
+        };
+        #[cfg(feature = "test-hooks")]
+        {
+            if !same {
+                diag::note_context(diag::ContextNote::Switch);
+            }
+            diag::note_context(diag::ContextNote::Recent);
+        }
+        self.context_epoch = next;
+        self.recent[..=slot].rotate_right(1);
+        let entry = self.recent[0].as_mut().unwrap();
+        entry.2 = next;
+        self.context_id = entry.1;
+        self.stamp = Some(entry.0);
+        true
+    }
+    // A full Checked block map drops a quarter of its blocks in map order:
+    // each is fetched and compared with its bytes on every entry, so a
+    // dropped one only lifts again.
+    #[cold]
+    #[inline(never)]
+    fn drop_checked_blocks(&mut self) {
+        let gone: Vec<LegacyBlockKey> = self
+            .blocks
+            .keys()
+            .take(MAX_CHECKED_BLOCKS / 4)
+            .copied()
+            .collect();
+        for key in gone {
+            self.blocks.remove(&key);
         }
     }
     fn remember_recent(&mut self, stamp: LegacyContextStamp, id: u64) {
@@ -1056,6 +1232,9 @@ impl Execution {
         #[cfg(test)]
         {
             self.lifts += 1;
+        }
+        if self.blocks.len() >= MAX_CHECKED_BLOCKS {
+            self.drop_checked_blocks();
         }
         self.blocks.insert(
             key,
@@ -6545,6 +6724,35 @@ mod tests {
         );
         assert_ne!(e.context_epoch, before);
         assert_ne!(e.owner_id, Execution::new().owner_id);
+    }
+
+    // xj-to9.56: Checked blocks have their own bound. A run through more
+    // distinct instructions than it, in one context, keeps at most the
+    // bound, and every instruction still executes.
+    #[test]
+    fn checked_blocks_stay_within_their_bound() {
+        let count = MAX_CHECKED_BLOCKS + MAX_CHECKED_BLOCKS / 2;
+        let mut vm = Vm::new(VmConfig::flat(0x10000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.map(0, 0x10000, Prot::RWX, RegionKind::Ram).unwrap();
+        // INC AX, `count` times, then JMP $.
+        let mut code = vec![0x40; count];
+        code.extend([0xeb, 0xfe]);
+        vm.write_bytes(0x1000, &code).unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.rip = 0x1000;
+        cpu.cpu.legacy.cr0 = 1;
+        cpu.cpu.legacy.segments[SegmentId::Es as usize].attributes &= !0x80;
+        let context = derive_legacy_context(cpu.legacy_model.unwrap(), &cpu.cpu).unwrap();
+        assert_eq!(context.segment_class, crate::SegmentClass::Checked);
+        let run = cpu
+            .run_steps(&vm, count as u64, StepOptions::default())
+            .unwrap();
+        assert_eq!(run.steps(), count as u64);
+        assert_eq!(cpu.cpu.gpr[0] & 0xffff, count as u64);
+        let execution = cpu.legacy_execution.as_ref().unwrap();
+        assert!(execution.blocks.len() <= MAX_CHECKED_BLOCKS);
+        assert!(execution.lifts >= count as u64);
     }
 
     #[test]

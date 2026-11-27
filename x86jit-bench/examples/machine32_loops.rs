@@ -430,9 +430,10 @@ fn main() {
                 // Per 1000 retired, on stderr: blocks, reselections, lifts, proof hits.
                 #[cfg(feature = "test-hooks")]
                 eprintln!(
-                    "counters {work} {path}: {:?}",
+                    "counters {work} {path}: {:?}; proof bytes (now, peak) {:?}",
                     x86jit_core::Vcpu::take_machine_counters_for_test()
-                        .map(|c| (c * 1000) as f64 / retired.max(1) as f64)
+                        .map(|c| (c * 1000) as f64 / retired.max(1) as f64),
+                    cpu.take_proof_bytes_for_test()
                 );
                 let count = (match base_work {
                     "farseg" => 8 + u64::from(sliced),

@@ -2,9 +2,9 @@
 //! (xj-to9.45; spec.md §17.10), shared by the Flat32/Segmented and paged maps.
 use super::*;
 
-// A proof and its registered source byte ranges `[lo, hi)`.
-// and whether a lookup returned it since the last eviction sweep.
-type Entry<V> = (V, Box<[(u64, u64)]>, std::cell::Cell<bool>);
+// A proof, its registered source byte ranges `[lo, hi)`, whether a lookup
+// returned it since the last eviction sweep, and its weight (`insert`).
+type Entry<V> = (V, Box<[(u64, u64)]>, std::cell::Cell<bool>, usize);
 
 /// A per-vCPU proof map with a page index of each proof's registered source
 /// bytes (xj-to9.45). A source-generation advance drops only the proofs whose
@@ -17,6 +17,8 @@ pub(super) struct ProofMap<K, V> {
     // Advances whenever a proof, and with it its registration, may be
     // dropped or replaced; successor links (`links.rs`) name it.
     version: u64,
+    // The sum of the proofs' weights (`insert`).
+    weight: usize,
     // Off the proof hit path, out of line.
     index: Box<SourceIndex<K>>,
 }
@@ -30,6 +32,9 @@ struct SourceIndex<K> {
     // The history's key for a proof's key (`set_history_key`).
     #[cfg(feature = "test-hooks")]
     history_key: Option<fn(&K) -> K>,
+    // The largest `weight` since the last `take_peak_weight`.
+    #[cfg(feature = "test-hooks")]
+    peak: usize,
 }
 
 /// Why a proof left the map (`ProofMap::dropped`), with the store that
@@ -58,6 +63,7 @@ impl<K, V> Default for ProofMap<K, V> {
             proofs: EngineMap::default(),
             generation: 0,
             version: 0,
+            weight: 0,
             index: Box::new(SourceIndex {
                 pages: EngineMap::default(),
                 written: Vec::new(),
@@ -65,6 +71,8 @@ impl<K, V> Default for ProofMap<K, V> {
                 history: EngineMap::default(),
                 #[cfg(feature = "test-hooks")]
                 history_key: None,
+                #[cfg(feature = "test-hooks")]
+                peak: 0,
             }),
         }
     }
@@ -82,7 +90,7 @@ fn source_pages(sources: &[(u64, u64)]) -> impl Iterator<Item = u64> + '_ {
 impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     #[inline(always)]
     pub(super) fn get(&self, key: &K) -> Option<&V> {
-        self.proofs.get(key).map(|(proof, _, used)| {
+        self.proofs.get(key).map(|(proof, _, used, _)| {
             used.set(true);
             proof
         })
@@ -101,14 +109,27 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.version
     }
 
+    /// The sum of the proofs' weights.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn weight(&self) -> usize {
+        self.weight
+    }
+
+    /// The largest sum of weights since the last call. Diagnostics only.
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn take_peak_weight(&mut self) -> usize {
+        std::mem::replace(&mut self.index.peak, self.weight)
+    }
+
     pub(super) fn clear(&mut self, _why: Why) {
         self.version = self.version.wrapping_add(1);
         #[cfg(feature = "test-hooks")]
-        for (key, (_, sources, _)) in self.proofs.drain() {
+        for (key, (_, sources, ..)) in self.proofs.drain() {
             self.index.remember(key, _why, None, sources);
         }
         self.proofs.clear();
         self.index.pages.clear();
+        self.weight = 0;
     }
 
     /// Drop every proof; later advances are compared from `generation`.
@@ -137,9 +158,10 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
 
     fn remove_because(&mut self, key: &K, _why: Why, _write: Option<(u64, u64)>) {
         self.version = self.version.wrapping_add(1);
-        let Some((_, sources, _)) = self.proofs.remove(key) else {
+        let Some((_, sources, _, weight)) = self.proofs.remove(key) else {
             return;
         };
+        self.weight -= weight;
         for page in source_pages(&sources) {
             if let Some(keys) = self.index.pages.get_mut(&page) {
                 keys.retain(|k| k != key);
@@ -167,8 +189,9 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.index.history_key = Some(f);
     }
 
-    /// Insert a proof registered over `sources` (address, length).
-    pub(super) fn insert(&mut self, key: K, proof: V, sources: &[(u64, u32)]) {
+    /// Insert a proof registered over `sources` (address, length) that
+    /// weighs `weight` (its IR bytes, `make_room`'s budget).
+    pub(super) fn insert(&mut self, key: K, proof: V, sources: &[(u64, u32)], weight: usize) {
         if self.proofs.contains_key(&key) {
             self.remove_because(&key, why!(First), None);
         }
@@ -188,7 +211,12 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
             }
         }
         self.proofs
-            .insert(key, (proof, sources, std::cell::Cell::new(false)));
+            .insert(key, (proof, sources, std::cell::Cell::new(false), weight));
+        self.weight += weight;
+        #[cfg(feature = "test-hooks")]
+        {
+            self.index.peak = self.index.peak.max(self.weight);
+        }
     }
 
     #[cfg(test)]
@@ -196,53 +224,58 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.proofs.values().map(|(proof, ..)| proof)
     }
 
-    /// Make room for one more proof in a map of at most `bound` proofs:
-    /// once full, drop a quarter of them rather than all (xj-to9.53), by
-    /// second chance: first the proofs no lookup returned since the last
-    /// sweep and that `hot` (a successor link or a running walk holding the
-    /// block) does not name, then, every flag cleared, the rest in map order.
-    /// A hot loop under pressure from blocks entered once (an interrupt
-    /// path through many contexts) keeps its proofs. Among equally cold
-    /// proofs the order is the map's bucket order, which the fixed hasher
-    /// makes the same keys every time rather than the oldest: a loop over
-    /// more blocks than the bound keeps a stable three quarters proved,
-    /// where evicting by age would evict each block just before its reuse.
-    pub(super) fn make_room(&mut self, bound: usize, why: Why, hot: impl Fn(&V) -> bool) {
-        if self.proofs.len() < bound {
-            return;
+    /// Make room for one more proof, of weight `incoming`, in a map of at
+    /// most `bound` proofs weighing at most `budget` in all: once either is
+    /// reached, drop proofs until both are three quarters or less, rather
+    /// than all (xj-to9.53, xj-to9.56), by second chance: first the proofs
+    /// no lookup returned since the last sweep and that `hot` (a successor
+    /// link or a running walk holding the block) does not name, then,
+    /// every flag cleared, the rest in map order. A hot loop under pressure
+    /// from blocks entered once (an interrupt path through many contexts)
+    /// keeps its proofs. Among equally cold proofs the order is the map's
+    /// bucket order, which the fixed hasher makes the same keys every time
+    /// rather than the oldest: a loop over more blocks than the bound keeps
+    /// a stable three quarters proved, where evicting by age would evict
+    /// each block just before its reuse. Returns whether it swept.
+    pub(super) fn make_room(
+        &mut self,
+        bound: usize,
+        budget: usize,
+        incoming: usize,
+        why: Why,
+        hot: impl Fn(&V) -> bool,
+    ) -> bool {
+        if self.proofs.len() < bound && self.weight + incoming <= budget {
+            return false;
         }
-        let quarter = bound / 4;
-        let mut gone: Vec<K> = self
-            .proofs
-            .iter()
-            .filter(|(_, (proof, _, used))| !used.get() && !hot(proof))
-            .map(|(key, _)| *key)
-            .take(quarter)
-            .collect();
-        for (_, _, used) in self.proofs.values() {
+        let (count, weight) = (bound - bound / 4, budget - budget / 4);
+        let (mut left, mut heavy) = (self.proofs.len(), self.weight + incoming);
+        // One pass: cold proofs in map order until both targets are met,
+        // and the others in map order for when too few are cold.
+        let mut gone: Vec<K> = Vec::new();
+        let mut rest: Vec<(K, usize)> = Vec::new();
+        for (key, (proof, _, used, w)) in &self.proofs {
+            if (left > count || heavy > weight) && !used.get() && !hot(proof) {
+                gone.push(*key);
+                left -= 1;
+                heavy -= w;
+            } else {
+                rest.push((*key, *w));
+            }
             used.set(false);
         }
-        if gone.len() < quarter {
-            let more: Vec<K> = self
-                .proofs
-                .keys()
-                .filter(|key| !gone.contains(key))
-                .take(quarter - gone.len())
-                .copied()
-                .collect();
-            gone.extend(more);
+        for (key, w) in rest {
+            if left <= count && heavy <= weight {
+                break;
+            }
+            gone.push(key);
+            left -= 1;
+            heavy -= w;
         }
         for key in gone {
             self.remove_because(&key, why, None);
         }
-    }
-
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool, why: Why) {
-        self.version = self.version.wrapping_add(1);
-        let gone: Vec<K> = self.proofs.keys().filter(|k| !keep(k)).copied().collect();
-        for key in gone {
-            self.remove_because(&key, why, None);
-        }
+        true
     }
 
     /// Drop the proofs that source writes since the map's generation
@@ -292,7 +325,7 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
             for &(lo, hi) in &written {
                 for page in source_pages(&[(lo, hi)]) {
                     for key in self.index.pages.get(&page).into_iter().flatten() {
-                        let (_, sources, _) = &self.proofs[key];
+                        let (_, sources, ..) = &self.proofs[key];
                         if sources.iter().any(|&(a, b)| a < hi && lo < b) {
                             victims.push((*key, (lo, hi)));
                         }

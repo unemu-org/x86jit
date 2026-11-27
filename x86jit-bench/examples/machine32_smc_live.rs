@@ -44,6 +44,9 @@
 //!   contexts) and back to the path's own data segment, as an
 //!   extended-memory runtime's interrupt reflection walks through many
 //!   context stamps.
+//! * runtime: no patching; a game, a renderer and an extended-memory
+//!   runtime's interrupt reflection with a real-mode round trip (the
+//!   `runtime` module below; the iterations are frames). Flat path only.
 //!
 //! MACHINE32_BLOCKS sets the number of loop blocks (default 19); more than
 //! the 64 unpaged proofs the engine retains exercises that bound.
@@ -81,9 +84,9 @@ fn instructions() -> u64 {
 
 const PATHS: [&str; 3] = ["flat", "seg", "paged"];
 const WORKS: [&str; 5] = ["imm", "disp", "opcode", "many", "data"];
-const FORMS: [&str; 13] = [
+const FORMS: [&str; 14] = [
     "imm8", "imm16", "sib", "shift", "branch", "imul", "movzx", "multi", "entry", "self",
-    "codedata", "fs", "reflect",
+    "codedata", "fs", "reflect", "runtime",
 ];
 /// The fs workload's GDT (linear) and its rotating selector's word.
 const GDT: u64 = 0x6000;
@@ -699,6 +702,458 @@ fn execute_many(vm: &Vm, cpu: &mut x86jit_core::Vcpu, first: u64, n: u64) -> Mod
     expect
 }
 
+/// The runtime workload (xj-to9.56): a protected-mode program as a PC-class
+/// embedder's game runs it, interrupted by an extended-memory runtime's
+/// interrupt reflection. Per frame (EDI frames):
+/// * game logic: MACHINE32_GAME (default 2000) Flat32 blocks, once;
+/// * renderer: MACHINE32_RENDER (default 250) Flat32 blocks with stack
+///   traffic, called MACHINE32_K1 (default 60) times under the flat stack
+///   and MACHINE32_K2 (default 30) times under a stack segment with a base
+///   and a 7D00h-byte limit, as the renderer runs under the runtime's
+///   locked stack;
+/// * reflection: a far call into the runtime's 32-bit code segment (base
+///   104820h), whose MACHINE32_RT (default 150) blocks run under
+///   fourteen DS/ES pairs (flat aliases and based data segments), then a
+///   16-bit protected segment that loads the real-mode IDTR, a real-mode
+///   round trip through four DS values, the protected IDTR again and five
+///   16-bit data segments, and a far return.
+///
+/// MACHINE32_EXTRA adds based data segments to the runtime's pairs. Every
+/// count is at least 1. Every block adds a constant to EBX and XORs one into EDX; the result is
+/// checked against the counts of each body's executions.
+mod runtime {
+    use super::*;
+    use iced_x86::code_asm::*;
+
+    const MEMORY: u64 = 0x40_0000;
+    const GDT: u64 = 0x6000;
+    const IDTR_PROTECTED: u16 = 0x6800;
+    const IDTR_REAL: u16 = 0x6808;
+    const SAVE_ESP: u32 = 0x6810;
+    const FLAT_CODE: u64 = 0x20_0000;
+    const RT_BASE: u32 = 0x10_4820;
+    const SIXTEEN_BASE: u32 = 0x2_8000;
+    const STACK_BASE: u32 = 0x11_6330;
+    const FLAT_ESP: u32 = 0x3f_0000;
+    // Selectors: flat code, flat data, a flat data alias, the based stack,
+    // the runtime's code, 16-bit code at SIXTEEN_BASE, a 64 KiB data
+    // segment at 0, then the runtime's data segments.
+    const CODE32: u16 = 0x08;
+    const FLAT: u16 = 0x10;
+    const ALIAS: u16 = 0x18;
+    const STACK: u16 = 0x20;
+    const RT: u16 = 0x28;
+    const CODE16: u16 = 0x30;
+    const DATA16: u16 = 0x38;
+    const DATA0: u16 = 0x40;
+    /// The runtime's data segment bases (selectors DATA0 + 8 k).
+    const BASES: [u32; 8] = [
+        0x10_4820, 0x11_6330, 0x0c_0000, 0x0a_0000, 0x5_6a00, 0x0e_0000, 0x400, 0x2_0000,
+    ];
+    fn data(k: usize) -> u16 {
+        DATA0 + 8 * k as u16
+    }
+    /// The DS/ES pairs the runtime's body runs under.
+    fn pairs() -> Vec<(u16, u16)> {
+        vec![
+            (FLAT, FLAT),
+            (ALIAS, FLAT),
+            (FLAT, ALIAS),
+            (ALIAS, ALIAS),
+            (data(0), FLAT),
+            (data(0), data(1)),
+            (data(1), data(1)),
+            (data(2), FLAT),
+            (data(3), data(3)),
+            (data(4), data(0)),
+            (data(5), FLAT),
+            (data(6), data(6)),
+            (data(7), ALIAS),
+            (data(0), data(0)),
+        ]
+        .into_iter()
+        .chain((0..extra()).map(|k| (data(BASES.len() + k as usize), FLAT)))
+        .collect()
+    }
+    /// MACHINE32_EXTRA more data segments (bases 30000h + 1000h k), each a
+    /// DS the runtime's body also runs under: more stamps than the engine
+    /// retains, as a runtime that reflects with ever new buffers.
+    fn extra() -> u32 {
+        env("MACHINE32_EXTRA", 0)
+    }
+    const REAL_DS: [u16; 4] = [0x56a, 0xe000, 0x40, 0x1234];
+    const SIXTEEN_DS: [u16; 5] = [DATA16, FLAT, 0x40 + 8 * 6, 0x40 + 8 * 7, 0x40 + 8 * 3];
+    const REAL_CS: u16 = (SIXTEEN_BASE >> 4) as u16;
+
+    fn env(name: &str, default: u32) -> u32 {
+        std::env::var(name).map_or(default, |s| s.parse().unwrap())
+    }
+    struct Shape {
+        game: u32,
+        render: u32,
+        k1: u32,
+        k2: u32,
+        rt: u32,
+        sixteen: u32,
+        real: u32,
+    }
+    fn shape() -> Shape {
+        let at_least_one = |name, default| env(name, default).max(1);
+        Shape {
+            game: at_least_one("MACHINE32_GAME", 2000),
+            render: at_least_one("MACHINE32_RENDER", 250),
+            k1: at_least_one("MACHINE32_K1", 60),
+            k2: at_least_one("MACHINE32_K2", 30),
+            rt: at_least_one("MACHINE32_RT", 150),
+            sixteen: at_least_one("MACHINE32_SIXTEEN", 24),
+            real: at_least_one("MACHINE32_REAL", 24),
+        }
+    }
+
+    /// Body constants: block `i` of body `salt` adds `add` and XORs `xor`.
+    fn add(salt: u32, i: u32) -> u32 {
+        constant(i.wrapping_mul(7).wrapping_add(salt))
+    }
+    fn xor(salt: u32, i: u32) -> u32 {
+        add(salt, i).rotate_left(11) ^ salt
+    }
+    const GAME: u32 = 0x100_0000;
+    const RENDER: u32 = 0x200_0000;
+    const RTB: u32 = 0x300_0000;
+    const SIXTEEN: u32 = 0x400_0000;
+    const REAL: u32 = 0x500_0000;
+
+    /// A body of `n` blocks ending in a near RET; `stack` adds PUSH EAX and
+    /// POP EAX to each block.
+    fn body(a: &mut CodeAssembler, salt: u32, n: u32, stack: bool) {
+        for i in 0..n {
+            let mut next = a.create_label();
+            a.add(ebx, add(salt, i) as i32).unwrap();
+            if stack {
+                a.push(eax).unwrap();
+            }
+            a.xor(edx, xor(salt, i) as i32).unwrap();
+            if stack {
+                a.pop(eax).unwrap();
+                a.add(eax, 1).unwrap();
+            }
+            a.jmp(next).unwrap();
+            a.set_label(&mut next).unwrap();
+        }
+        a.ret().unwrap();
+    }
+
+    fn far32(a: &mut CodeAssembler, opcode: u8, offset: u32, selector: u16) {
+        a.db(&[opcode]).unwrap();
+        a.dd(&[offset]).unwrap();
+        a.dw(&[selector]).unwrap();
+    }
+
+    struct Entries {
+        rt_entry: u32,
+        rt_tail: u32,
+        sixteen_entry: u16,
+        real_entry: u16,
+        sixteen_back: u16,
+    }
+
+    fn assemble(s: &Shape, e: &Entries) -> ([Vec<u8>; 3], Entries) {
+        // Flat main at FLAT_CODE (CS base 0).
+        let mut a = CodeAssembler::new(32).unwrap();
+        let (mut top, mut game, mut render) =
+            (a.create_label(), a.create_label(), a.create_label());
+        let (mut r1, mut r2) = (a.create_label(), a.create_label());
+        a.set_label(&mut top).unwrap();
+        a.call(game).unwrap();
+        a.mov(ecx, s.k1).unwrap();
+        a.set_label(&mut r1).unwrap();
+        a.call(render).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(r1).unwrap();
+        a.mov(dword_ptr(SAVE_ESP), esp).unwrap();
+        a.mov(ax, STACK as u32).unwrap();
+        a.mov(ss, ax).unwrap();
+        a.mov(esp, 0x7c00).unwrap();
+        a.mov(ecx, s.k2).unwrap();
+        a.set_label(&mut r2).unwrap();
+        a.call(render).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(r2).unwrap();
+        a.mov(ax, FLAT as u32).unwrap();
+        a.mov(ss, ax).unwrap();
+        a.mov(esp, dword_ptr(SAVE_ESP)).unwrap();
+        far32(&mut a, 0x9a, e.rt_entry, RT);
+        a.dec(edi).unwrap();
+        a.jne(top).unwrap();
+        a.hlt().unwrap();
+        a.set_label(&mut game).unwrap();
+        body(&mut a, GAME, s.game, false);
+        a.set_label(&mut render).unwrap();
+        body(&mut a, RENDER, s.render, true);
+        let flat = a.assemble(FLAT_CODE).unwrap();
+
+        // The runtime's 32-bit code, offsets from RT_BASE.
+        let mut a = CodeAssembler::new(32).unwrap();
+        let (mut entry, mut tail, mut rt) = (a.create_label(), a.create_label(), a.create_label());
+        a.set_label(&mut entry).unwrap();
+        for (ds_sel, es_sel) in pairs() {
+            a.mov(ax, u32::from(ds_sel)).unwrap();
+            a.mov(ds, ax).unwrap();
+            a.mov(ax, u32::from(es_sel)).unwrap();
+            a.mov(es, ax).unwrap();
+            a.call(rt).unwrap();
+        }
+        far32(&mut a, 0xea, u32::from(e.sixteen_entry), CODE16);
+        a.set_label(&mut tail).unwrap();
+        a.mov(ax, FLAT as u32).unwrap();
+        a.mov(ds, ax).unwrap();
+        a.mov(es, ax).unwrap();
+        a.mov(ss, ax).unwrap();
+        a.mov(esp, dword_ptr(SAVE_ESP)).unwrap();
+        a.sub(esp, 8).unwrap();
+        a.retf().unwrap();
+        a.set_label(&mut rt).unwrap();
+        body(&mut a, RTB, s.rt, false);
+        let result = a
+            .assemble_options(
+                0,
+                iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let rt_entry = result.label_ip(&entry).unwrap() as u32;
+        let rt_tail = result.label_ip(&tail).unwrap() as u32;
+        let rt_bytes = result.inner.code_buffer;
+
+        // 16-bit code at SIXTEEN_BASE: protected (CODE16) and real (REAL_CS)
+        // share its offsets.
+        let mut a = CodeAssembler::new(16).unwrap();
+        let (mut entry, mut real, mut back) =
+            (a.create_label(), a.create_label(), a.create_label());
+        let (mut sixteen, mut real_body) = (a.create_label(), a.create_label());
+        a.set_label(&mut entry).unwrap();
+        a.mov(ax, DATA16 as u32).unwrap();
+        for seg in [ds, es, fs, gs] {
+            a.mov(seg, ax).unwrap();
+        }
+        a.mov(ss, ax).unwrap();
+        a.mov(sp, 0x5ff0).unwrap();
+        // LIDT [IDTR_REAL]; the 16-bit form loads a 24-bit base.
+        a.db(&[0x0f, 0x01, 0x1e]).unwrap();
+        a.dw(&[IDTR_REAL]).unwrap();
+        a.call(sixteen).unwrap();
+        // MOV EAX, CR0; AND AL, FEh; MOV CR0, EAX; JMP FAR REAL_CS:real.
+        a.db(&[0x0f, 0x20, 0xc0, 0x24, 0xfe, 0x0f, 0x22, 0xc0, 0xea])
+            .unwrap();
+        a.dw(&[e.real_entry, REAL_CS]).unwrap();
+        a.set_label(&mut real).unwrap();
+        a.xor(ax, ax).unwrap();
+        for seg in [ss, fs, gs] {
+            a.mov(seg, ax).unwrap();
+        }
+        for seg in REAL_DS {
+            a.mov(ax, u32::from(seg)).unwrap();
+            a.mov(ds, ax).unwrap();
+            a.mov(es, ax).unwrap();
+            a.call(real_body).unwrap();
+        }
+        // MOV EAX, CR0; OR AL, 1; MOV CR0, EAX; JMP FAR CODE16:back.
+        a.db(&[0x0f, 0x20, 0xc0, 0x0c, 0x01, 0x0f, 0x22, 0xc0, 0xea])
+            .unwrap();
+        a.dw(&[e.sixteen_back, CODE16]).unwrap();
+        a.set_label(&mut back).unwrap();
+        a.mov(ax, DATA16 as u32).unwrap();
+        a.mov(ss, ax).unwrap();
+        for seg in [ds, es, fs, gs] {
+            a.mov(seg, ax).unwrap();
+        }
+        a.call(sixteen).unwrap();
+        a.db(&[0x0f, 0x01, 0x1e]).unwrap();
+        a.dw(&[IDTR_PROTECTED]).unwrap();
+        for seg in SIXTEEN_DS {
+            a.mov(ax, u32::from(seg)).unwrap();
+            a.mov(ds, ax).unwrap();
+            a.call(sixteen).unwrap();
+        }
+        a.mov(ax, FLAT as u32).unwrap();
+        a.mov(fs, ax).unwrap();
+        a.mov(gs, ax).unwrap();
+        // JMP FAR DWORD RT:tail (66 EA id iw).
+        a.db(&[0x66]).unwrap();
+        far32(&mut a, 0xea, e.rt_tail, RT);
+        a.set_label(&mut sixteen).unwrap();
+        body(&mut a, SIXTEEN, s.sixteen, false);
+        a.set_label(&mut real_body).unwrap();
+        body(&mut a, REAL, s.real, false);
+        let result = a
+            .assemble_options(
+                0,
+                iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .unwrap();
+        let entries = Entries {
+            rt_entry,
+            rt_tail,
+            sixteen_entry: result.label_ip(&entry).unwrap() as u16,
+            real_entry: result.label_ip(&real).unwrap() as u16,
+            sixteen_back: result.label_ip(&back).unwrap() as u16,
+        };
+        ([flat, rt_bytes, result.inner.code_buffer], entries)
+    }
+
+    fn descriptor(base: u32, limit: u32, access: u8, flags: u8) -> [u8; 8] {
+        let (b, l) = (base.to_le_bytes(), limit.to_le_bytes());
+        [
+            l[0],
+            l[1],
+            b[0],
+            b[1],
+            b[2],
+            access,
+            flags | (l[2] & 0x0f),
+            b[3],
+        ]
+    }
+
+    pub(super) fn setup() -> (Vm, x86jit_core::Vcpu) {
+        let s = shape();
+        let zero = Entries {
+            rt_entry: 0,
+            rt_tail: 0,
+            sixteen_entry: 0,
+            real_entry: 0,
+            sixteen_back: 0,
+        };
+        let (_, entries) = assemble(&s, &zero);
+        let ([flat, rt, sixteen], again) = assemble(&s, &entries);
+        assert_eq!(again.rt_tail, entries.rt_tail);
+        assert_eq!(again.sixteen_back, entries.sixteen_back);
+        let mut vm = Vm::new(VmConfig::flat(MEMORY));
+        vm.set_cpu_mode(CpuMode::Compat32);
+        vm.set_cpu_model(match std::env::var("MACHINE32_MODEL").as_deref() {
+            Ok("386") => CpuModel::I80386,
+            _ => CpuModel::I80486Dx,
+        });
+        vm.map(0, MEMORY as usize, Prot::RWX, RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(FLAT_CODE, &flat).unwrap();
+        vm.write_bytes(u64::from(RT_BASE), &rt).unwrap();
+        vm.write_bytes(u64::from(SIXTEEN_BASE), &sixteen).unwrap();
+        let mut gdt = vec![
+            [0; 8],
+            descriptor(0, 0xfffff, 0x9b, 0xc0),
+            descriptor(0, 0xfffff, 0x93, 0xc0),
+            descriptor(0, 0xfffff, 0x93, 0xc0),
+            descriptor(STACK_BASE, 0x7cff, 0x93, 0x40),
+            descriptor(RT_BASE, 0xffff, 0x9b, 0x40),
+            descriptor(SIXTEEN_BASE, 0xffff, 0x9b, 0),
+            descriptor(0, 0xffff, 0x93, 0),
+        ];
+        gdt.extend(BASES.map(|base| descriptor(base, 0xffff, 0x93, 0)));
+        gdt.extend((0..extra()).map(|k| descriptor(0x3_0000 + 0x1000 * k, 0xffff, 0x93, 0)));
+        vm.write_bytes(GDT, &gdt.concat()).unwrap();
+        // The IDTR images LIDT loads: protected (limit 7FFh at 7000h) and
+        // the real-mode IVT.
+        vm.write_bytes(u64::from(IDTR_PROTECTED), &[0xff, 0x07, 0, 0x70, 0, 0])
+            .unwrap();
+        vm.write_bytes(u64::from(IDTR_REAL), &[0xff, 0x03, 0, 0, 0, 0])
+            .unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.gdtr.base = GDT as u32;
+        cpu.cpu.legacy.gdtr.limit = (8 * gdt.len() - 1) as u16;
+        cpu.cpu.legacy.idtr.base = 0x7000;
+        cpu.cpu.legacy.idtr.limit = 0x7ff;
+        cpu.cpu.legacy.cr0 = 0x11;
+        cpu.cpu.legacy.cpl = 0;
+        for (i, segment) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+            segment.base = 0;
+            segment.limit = u32::MAX;
+            segment.attributes = (if i == 0 { 0x9b } else { 0x93 }) | 0xc000;
+            segment.unusable = 0;
+        }
+        cpu.cpu.cs = CODE32;
+        cpu.cpu.ds = FLAT;
+        cpu.cpu.es = FLAT;
+        cpu.cpu.ss = FLAT;
+        cpu.cpu.fs = FLAT;
+        cpu.cpu.gs = FLAT;
+        cpu.set_a20_enabled(true);
+        (vm, cpu)
+    }
+
+    fn sums(salt: u32, n: u32) -> (u32, u32) {
+        (0..n).fold((0, 0), |(a, x), i| {
+            (a.wrapping_add(add(salt, i)), x ^ xor(salt, i))
+        })
+    }
+
+    /// Runs `n` frames and checks EBX and EDX; returns the retired count.
+    pub(super) fn execute(vm: &Vm, cpu: &mut x86jit_core::Vcpu, n: u64) -> u64 {
+        let s = shape();
+        let per_frame = [
+            (GAME, s.game, 1),
+            (RENDER, s.render, s.k1 + s.k2),
+            (RTB, s.rt, pairs().len() as u32),
+            (SIXTEEN, s.sixteen, 2 + SIXTEEN_DS.len() as u32),
+            (REAL, s.real, REAL_DS.len() as u32),
+        ];
+        let (mut sum, mut mix) = (0u32, 0u32);
+        for (salt, blocks, calls) in per_frame {
+            let (a, x) = sums(salt, blocks);
+            let times = (u64::from(calls) * n) as u32;
+            sum = sum.wrapping_add(a.wrapping_mul(times));
+            if times & 1 != 0 {
+                mix ^= x;
+            }
+        }
+        cpu.set_reg(Reg::Rip, FLAT_CODE);
+        for reg in [Reg::Rax, Reg::Rbx, Reg::Rdx] {
+            cpu.set_reg(reg, 0);
+        }
+        cpu.set_reg(Reg::Rdi, n);
+        cpu.set_reg(Reg::Rsp, u64::from(FLAT_ESP));
+        let before = cpu.retired_instructions();
+        let exit = cpu.run(vm, None);
+        assert!(
+            matches!(exit, Exit::Hlt),
+            "{exit:?} at {:#x}",
+            cpu.reg(Reg::Rip)
+        );
+        assert_eq!(cpu.reg(Reg::Rbx) as u32, sum, "runtime EBX");
+        assert_eq!(cpu.reg(Reg::Rdx) as u32, mix, "runtime EDX");
+        cpu.retired_instructions() - before
+    }
+}
+
+fn run_runtime(round: usize, n: u64) {
+    let (vm, mut cpu) = runtime::setup();
+    runtime::execute(&vm, &mut cpu, 2);
+    #[cfg(feature = "test-hooks")]
+    vm.relift_diagnostics(true);
+    #[cfg(feature = "test-hooks")]
+    x86jit_core::Vcpu::take_machine_counters_for_test();
+    let host_before = instructions();
+    let start = Instant::now();
+    let retired = runtime::execute(&vm, &mut cpu, n);
+    let seconds = start.elapsed().as_secs_f64();
+    let host = instructions() - host_before;
+    #[cfg(feature = "test-hooks")]
+    eprintln!(
+        "counters smc-live runtime flat: {:?}; proof bytes (now, peak) {:?}",
+        x86jit_core::Vcpu::take_machine_counters_for_test()
+            .map(|c| (c as f64 * 1e6 / retired.max(1) as f64).round()),
+        cpu.take_proof_bytes_for_test()
+    );
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("MACHINE32_DIAG").is_some() {
+        eprintln!("{}", vm.relift_diagnostics(true));
+    }
+    println!(
+        "smc-live-runtime,flat,{round},{n},{retired},{retired},{seconds:.9},{:.3},{:.3}",
+        retired as f64 / seconds / 1e6,
+        host as f64 / retired as f64
+    );
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let n = args.get(1).map_or(200_000, |s| s.parse::<u64>().unwrap());
@@ -718,6 +1173,12 @@ fn main() {
     for round in 0..rounds {
         for &work in &works {
             for &path in &paths {
+                if work == "runtime" {
+                    if path == "flat" {
+                        run_runtime(round, n);
+                    }
+                    continue;
+                }
                 let (vm, mut cpu, fields) = setup(path, work);
                 execute(&vm, &mut cpu, work, &fields, 2000);
                 #[cfg(feature = "test-hooks")]

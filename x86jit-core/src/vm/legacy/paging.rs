@@ -71,8 +71,9 @@ pub(super) struct State {
     model: Option<LegacyCpuModel>,
     memory: usize,
     blocks: super::proof_map::ProofMap<Key, Proof>,
-    // The key `resolve` last returned a proof for: `holds` looks it up.
-    last: Option<Key>,
+    // The block `resolve` last returned a proof for and the map's version
+    // then (`holds`).
+    last: Option<(usize, u64)>,
     pub(super) lifts: u64,
     before_publication: Option<fn(&Vm)>,
     port_input: Option<crate::interp::legacy::paging::PortPlan>,
@@ -97,13 +98,15 @@ impl State {
         self.port_input = None;
     }
 
-    /// Whether a proof holds this very block.
-    /// Links record the block the last resolve returned, so its key is
-    /// looked up rather than every proof scanned.
+    /// Whether a proof holds this very block. Links record the block the
+    /// last resolve returned: the map's version advances whenever a proof
+    /// may be dropped or replaced, so an unchanged version means the proof
+    /// that returned it still holds it, alive, and its address names it.
+    /// It does not mark the proof used: the resolve that returned the block
+    /// just did (a hit) or just inserted it, and the link made from it then
+    /// holds the block, which `make_room`'s `hot` counts while it does.
     pub(super) fn holds(&self, ir: &Arc<IrBlock>) -> bool {
-        self.last
-            .and_then(|key| self.blocks.get(&key))
-            .is_some_and(|proof| Arc::ptr_eq(&proof.ir, ir))
+        self.last == Some((Arc::as_ptr(ir) as usize, self.blocks.version()))
     }
 
     pub(super) fn invalidate(&mut self) {
@@ -244,7 +247,7 @@ impl State {
                 .filter(|p| p.permit.as_ref().is_none_or(|p| p.is_current()))
             {
                 probe!(PROOFS);
-                self.last = Some(key);
+                self.last = Some((Arc::as_ptr(&proof.ir) as usize, self.blocks.version()));
                 return Ok((proof.ir.clone(), proof.ordinary));
             }
             probe!(LIFTS);
@@ -348,9 +351,12 @@ impl State {
                 continue;
             }
             if !self.blocks.contains_key(&key) {
-                self.blocks.make_room(MAX_BLOCKS, why!(Bound), |proof| {
-                    Arc::strong_count(&proof.ir) > 1
-                });
+                // A count bound only: 256 proofs of at most about 35 KiB
+                // (`flat32::MAX_PROOF_BYTES`) hold about 9 MiB.
+                self.blocks
+                    .make_room(MAX_BLOCKS, usize::MAX, 0, why!(Bound), |proof| {
+                        Arc::strong_count(&proof.ir) > 1
+                    });
             }
             self.blocks.insert(
                 key,
@@ -361,8 +367,9 @@ impl State {
                     _registration: registration.unwrap(),
                 },
                 &sources,
+                0,
             );
-            self.last = Some(key);
+            self.last = Some((Arc::as_ptr(&ir) as usize, self.blocks.version()));
             return Ok((ir, ordinary));
         }
     }
