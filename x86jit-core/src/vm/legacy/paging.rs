@@ -1639,7 +1639,8 @@ mod tests {
 
     /// Paged V86 at IOPL 0 with a ring-0 #GP monitor (SDM Vol 3B §23.2.8.1
     /// p. 23-11, §23.3.1.1 pp. 23-12–13; Vol 2A IRET pp. 3-492–493). The
-    /// V86 stack page 47h and the ring-0 stack page 6 share a TLB set.
+    /// V86 stack page 47h and the ring-0 stack page 146h (frame 6) share a
+    /// TLB set (`Tlb::index`).
     fn v86_monitor(model: crate::CpuModel, v86: &[u8], paged: bool) -> (Vm, Vcpu) {
         let mut vm = Vm::new(crate::VmConfig::flat(0x60000));
         vm.set_cpu_model(model);
@@ -1653,6 +1654,8 @@ mod tests {
                 vm.write_bytes(0x2000 + u64::from(page * 4), &entry.to_le_bytes())
                     .unwrap();
             }
+            vm.write_bytes(0x2000 + 0x146 * 4, &0x6003u32.to_le_bytes())
+                .unwrap();
         }
         vm.write_bytes(0x3808, &0x00cf_9b00_0000_ffffu64.to_le_bytes())
             .unwrap();
@@ -1661,7 +1664,10 @@ mod tests {
         // Vector 13: 32-bit interrupt gate, DPL 0, to 8:9000h.
         vm.write_bytes(0x3000 + 13 * 8, &0x00008e00_00089000u64.to_le_bytes())
             .unwrap();
-        vm.write_bytes(0x5004, &[0, 0x70, 0, 0, 0x10, 0]).unwrap();
+        // ESP0 = 147000h paged (7000h unpaged), SS0 = 10h.
+        let esp0: u32 = if paged { 0x147000 } else { 0x7000 };
+        vm.write_bytes(0x5004, &esp0.to_le_bytes()).unwrap();
+        vm.write_bytes(0x5008, &0x10u16.to_le_bytes()).unwrap();
         vm.write_bytes(0x5066, &0x68u16.to_le_bytes()).unwrap();
         // PUSH EAX; MOV AX,10h; MOV DS,AX; INC DWORD [6000h];
         // ADD DWORD [ESP+8],2; POP EAX; ADD ESP,4; IRETD.
@@ -1751,18 +1757,29 @@ mod tests {
     #[test]
     fn replacing_a_fetch_translation_still_expires_its_proofs() {
         // SDM Vol 3A §5.10.2: an edited PTE may stay unobserved until its
-        // translation leaves the TLB. Data page 51h shares code page 10h's
-        // set, so MOV AL,[0] replaces the fetch entry each iteration and the
-        // next fetch must walk to the edited frame.
-        // MOV AL,[0]; INC CX (DEC CX at frame 30h); JMP to the MOV.
+        // translation leaves the TLB. Data page 10Fh (FFFFh:F010h, A20 on)
+        // shares code page Eh's set, so MOV AL,[F010h] replaces the fetch
+        // entry each iteration and the next fetch must walk to the edited
+        // frame. Code page Eh maps frame 10h, then 30h; page 10Fh frame 51h.
+        // MOV AL,[F010h]; INC CX (DEC CX at frame 30h); JMP to the MOV.
+        use crate::interp::legacy::paging::Tlb;
+        assert_eq!(Tlb::index(0xe000), Tlb::index(0x10f000));
         for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
-            let (vm, mut cpu) = v86_monitor(model, &[0xa0, 0, 0, 0x41, 0xeb, 0xfa], true);
-            vm.write_bytes(0x30000, &[0xa0, 0, 0, 0x49, 0xeb, 0xfa])
+            let (vm, mut cpu) = v86_monitor(model, &[0xa0, 0x10, 0xf0, 0x41, 0xeb, 0xfa], true);
+            vm.write_bytes(0x30000, &[0xa0, 0x10, 0xf0, 0x49, 0xeb, 0xfa])
                 .unwrap();
+            vm.write_bytes(0x2000 + 0xe * 4, &0x10007u32.to_le_bytes())
+                .unwrap();
+            vm.write_bytes(0x2000 + 0x10f * 4, &0x51007u32.to_le_bytes())
+                .unwrap();
+            for (segment, selector) in [(SegmentId::Cs, 0xe00u16), (SegmentId::Ds, 0xffff)] {
+                cpu.cpu.legacy.segments[segment as usize].base = u32::from(selector) << 4;
+            }
+            (cpu.cpu.cs, cpu.cpu.ds) = (0xe00, 0xffff);
             let options = crate::StepOptions::default();
             assert_eq!(cpu.run_steps(&vm, 30, options).unwrap().steps(), 30);
             assert_eq!(cpu.cpu.gpr[1], 10);
-            vm.write_bytes(0x2000 + 0x10 * 4, &0x30007u32.to_le_bytes())
+            vm.write_bytes(0x2000 + 0xe * 4, &0x30007u32.to_le_bytes())
                 .unwrap();
             assert_eq!(cpu.run_steps(&vm, 30, options).unwrap().steps(), 30);
             assert_eq!(

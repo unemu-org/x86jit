@@ -389,13 +389,20 @@ struct Entry {
     fetched: bool,
 }
 
+/// The per-vCPU TLB's entries (decision-32 Q3). The architecture fixes no
+/// size: software "should not rely on the existence of TLBs or on the
+/// retention of TLB entries" (SDM Vol 3A §5.10.2.2 p. 5-43), so any size, and
+/// any replacement, is a correct TLB. 256 entries cover 1 MiB of 4 KiB pages.
+pub(crate) const TLB_ENTRIES: usize = 256;
+const _: () = assert!(TLB_ENTRIES.is_power_of_two());
+
 /// Paging design §3.2 / decision-27: tokens are issued by the VM namespace,
 /// never per-vCPU counters. Removing or replacing an entry that an instruction
 /// fetch used conservatively expires source proofs. A data or stack entry
 /// backs no proof: fetch translates through its own entries, and a page
 /// whose fetch entry was replaced walks again and takes a new token.
 pub(crate) struct Tlb {
-    entries: [Option<Entry>; 64],
+    entries: [Option<Entry>; TLB_ENTRIES],
     pub(crate) generation: u64,
     context: Option<(u32, u32, u8, u32)>,
     /// The pages of the running `tlb_lane`, reset when one starts.
@@ -404,7 +411,7 @@ pub(crate) struct Tlb {
 impl Default for Tlb {
     fn default() -> Self {
         Self {
-            entries: [None; 64],
+            entries: [None; TLB_ENTRIES],
             generation: 0,
             context: None,
             lane: LaneWindows::default(),
@@ -413,11 +420,12 @@ impl Default for Tlb {
 }
 impl Tlb {
     #[inline]
-    fn index(linear: u32) -> usize {
+    pub(crate) fn index(linear: u32) -> usize {
         let page = linear >> 12;
-        // Fold the whole page number: descriptor tables and data separated by
-        // 256 KiB must not repeatedly expire each other's instruction proofs.
-        ((page ^ (page >> 6) ^ (page >> 12) ^ (page >> 18)) & 63) as usize
+        // Fold the whole 20-bit page number over 8 bits: descriptor tables
+        // and data separated by 1 MiB must not repeatedly expire each other's
+        // instruction proofs.
+        ((page ^ (page >> 8) ^ (page >> 16)) as usize) & (TLB_ENTRIES - 1)
     }
 
     pub(crate) fn invalidate(&mut self) {
@@ -3907,8 +3915,8 @@ mod tests {
     fn only_fetched_entries_expire_source_proofs_on_replacement() {
         // Paging design §3.2: replacing a data or stack translation leaves
         // every fetch translation, and so every retained source proof, intact.
-        // Pages 6 and 47h share a set (`Tlb::index`).
-        assert_eq!(Tlb::index(0x6000), Tlb::index(0x47000));
+        // Pages 6 and 107h share a set (`Tlb::index`); 107h maps frame 47h.
+        assert_eq!(Tlb::index(0x6000), Tlb::index(0x107000));
         let mut vm = crate::Vm::new(crate::VmConfig::flat(0x50000));
         vm.set_cpu_model(crate::CpuModel::I80386);
         vm.map(0, 0x50000, crate::Prot::RWX, crate::RegionKind::Ram)
@@ -3921,6 +3929,8 @@ mod tests {
             )
             .unwrap();
         }
+        vm.write_bytes(0x2000 + 0x107 * 4, &0x47007u32.to_le_bytes())
+            .unwrap();
         let mut cpu = vm.new_vcpu().cpu;
         cpu.legacy.cr0 = 0x80000001;
         cpu.legacy.cr3 = 0x1000;
@@ -3942,23 +3952,79 @@ mod tests {
         translate(0x6000, AccessKind::Write);
         let token = tlb.borrow().generation;
         for _ in 0..3 {
-            translate(0x47000, AccessKind::Read);
+            translate(0x107000, AccessKind::Read);
             translate(0x6000, AccessKind::Write);
         }
         assert_eq!(tlb.borrow().generation, token);
         // A fetch through the set makes its replacement expire the token,
         // also when the fetch only hit an entry a data access filled.
         for fill in [AccessKind::Execute, AccessKind::Read] {
-            let phys = translate(0x47000, fill).physical;
+            let phys = translate(0x107000, fill).physical;
             if fill == AccessKind::Read {
-                assert_eq!(translate(0x47000, AccessKind::Execute).physical, phys);
+                assert_eq!(translate(0x107000, AccessKind::Execute).physical, phys);
             }
             let token = tlb.borrow().generation;
             translate(0x6000, AccessKind::Read);
             assert_ne!(tlb.borrow().generation, token);
             let token = tlb.borrow().generation;
-            translate(0x47000, AccessKind::Read);
+            translate(0x107000, AccessKind::Read);
             assert_eq!(tlb.borrow().generation, token);
+        }
+    }
+
+    #[test]
+    fn tlb_keeps_256_distinct_pages_and_the_257th_replaces_one() {
+        // Decision-32 Q3; SDM Vol 3A §5.10.2.2 p. 5-43 fixes no TLB size.
+        // Linear pages 100h-1FFh fold to the 256 distinct sets, all mapping
+        // frame 3; the PTEs then move to frame 4 without a flush, so a hit
+        // still returns frame 3 and only a walk sees frame 4. Page 200h
+        // shares page 103h's set.
+        assert_eq!(Tlb::index(0x200000), Tlb::index(0x103000));
+        let mut vm = crate::Vm::new(crate::VmConfig::flat(0x5000));
+        vm.set_cpu_model(crate::CpuModel::I80386);
+        vm.map(0, 0x5000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(0x1000, &0x2007u32.to_le_bytes()).unwrap();
+        let set_frames = |vm: &crate::Vm, frame: u32| {
+            for page in 0x100..=0x200u64 {
+                vm.write_bytes(0x2000 + page * 4, &(frame << 12 | 7).to_le_bytes())
+                    .unwrap();
+            }
+        };
+        set_frames(&vm, 3);
+        let mut cpu = vm.new_vcpu().cpu;
+        cpu.legacy.cr0 = 0x80000001;
+        cpu.legacy.cr3 = 0x1000;
+        let tlb = std::cell::RefCell::new(Tlb::default());
+        let mut mem = LegacyAccess::<false, 0, true>::new(&vm.mem, u32::MAX);
+        mem.paging.tlb = Some(&tlb);
+        let mut frame = |page: u32| {
+            translate_linear(
+                &mut cpu,
+                &mem,
+                page << 12,
+                1,
+                AccessKind::Read,
+                Privilege::Supervisor,
+                true,
+            )
+            .unwrap()
+            .physical
+                >> 12
+        };
+        for page in 0x100..0x200 {
+            assert_eq!(frame(page), 3);
+        }
+        let resident = |tlb: &Tlb| tlb.entries.iter().flatten().count();
+        assert_eq!(resident(&tlb.borrow()), TLB_ENTRIES);
+        set_frames(&vm, 4);
+        for page in 0x100..0x200 {
+            assert_eq!(frame(page), 3, "page {page:#x} was walked again");
+        }
+        assert_eq!(frame(0x200), 4);
+        assert_eq!(resident(&tlb.borrow()), TLB_ENTRIES);
+        for page in 0x100..0x200 {
+            assert_eq!(frame(page), if page == 0x103 { 4 } else { 3 });
         }
     }
 

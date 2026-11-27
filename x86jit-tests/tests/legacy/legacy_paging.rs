@@ -1074,12 +1074,12 @@ fn paged_fetch_tlb_eviction_replaces_equal_byte_physical_proof() {
             f.fetch_at(0x400).unwrap();
             let before = f.cpu.paging_cache_for_test();
             f.code_mapping(0, OTHER_FRAME);
-            // Pages 0 and 65 share the folded TLB index; force eviction
+            // Pages 0 and 101h share the folded TLB index; force eviction
             // without a guest flush.
-            f.code_mapping(0x41000, OTHER_FRAME);
+            f.code_mapping(0x101000, OTHER_FRAME);
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x500, &[0x90])
                 .unwrap();
-            f.fetch_at(0x41500).unwrap();
+            f.fetch_at(0x101500).unwrap();
             f.fetch_at(0x400).unwrap();
             let after = f.cpu.paging_cache_for_test();
             assert!(after.0 > before.0);
@@ -1150,9 +1150,18 @@ fn paged_fetch_eviction_releases_pages_but_preserves_shared_cache_tags() {
     for model in MODELS {
         let mut f = Fixture::with_vm(Vm::new(VmConfig::flat(0x80000)), model, true, 0);
         let first = 0x10000;
+        // Linear page 100h, the 65th code page, folds onto page 1's TLB set,
+        // so its fetch replaces a fetched entry and expires the proofs.
+        let linear = |index: u32| {
+            if index == 64 {
+                0x100000
+            } else {
+                index * 0x1000
+            }
+        };
         for index in 0..65 {
             let frame = first + index * 0x1000;
-            f.code_mapping(index * 0x1000, frame);
+            f.code_mapping(linear(index), frame);
             f.vm.write_bytes(u64::from(frame) + 0x400, &[0x40, 0xeb, 0xfd])
                 .unwrap();
         }
@@ -1170,7 +1179,7 @@ fn paged_fetch_eviction_releases_pages_but_preserves_shared_cache_tags() {
             },
         );
         for index in 0..65 {
-            f.fetch_at(index * 0x1000 + 0x400).unwrap();
+            f.fetch_at(u64::from(linear(index)) + 0x400).unwrap();
             assert!(f.cpu.paging_cache_for_test().1 <= 64);
         }
         assert_eq!(f.cpu.paging_cache_for_test().1, 1);
@@ -1183,7 +1192,7 @@ fn paged_fetch_eviction_releases_pages_but_preserves_shared_cache_tags() {
         let generation = f.vm.cache.publication_generation();
         f.vm.write_bytes(u64::from(first) + 0x1400, &[0x48])
             .unwrap();
-        f.fetch_at(64 * 0x1000 + 0x400).unwrap();
+        f.fetch_at(u64::from(linear(64)) + 0x400).unwrap();
         assert_eq!(f.cpu.paging_cache_for_test(), before);
         assert_eq!(f.vm.cache.publication_generation(), generation);
         assert!(f.vm.cache.get(key).is_some());

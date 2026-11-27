@@ -990,14 +990,14 @@ fn paged_flat32_page_end_and_noncontiguous_straddles_equal_checked() {
 fn paged_flat32_read_fill_first_write_and_tlb_replacement_equal_checked() {
     // Paging design §3.2: a clean read fill cannot waive first-write D;
     // replacement must expire the source token before executing a successor.
-    let code = b"\xa1\x00\x60\x00\x00\x40\xa3\x00\x60\x00\x00\xa1\x00\x10\x04\x00\x43\xf4";
+    let code = b"\xa1\x00\x60\x00\x00\x40\xa3\x00\x60\x00\x00\xa1\x00\x00\x10\x00\x43\xf4";
     for model in [CpuModel::I80386, CpuModel::I80486Dx] {
         for budget in 0..8 {
             let (avm, mut a) = paged_setup(model, code, false);
             let (bvm, mut b) = paged_setup(model, code, true);
             for vm in [&avm, &bvm] {
-                // Linear page 65 collides with code page 1's TLB slot.
-                put(vm, PT + 65 * 4, 0xb007);
+                // Linear page 100h folds onto code page 1's TLB slot.
+                put(vm, PT + 0x100 * 4, 0xb007);
                 put(vm, 0x6000, 41);
                 put(vm, 0xb000, 123);
             }
