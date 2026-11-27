@@ -156,3 +156,24 @@ that landed earlier without an amendment; item 2 lands with xj-to9.56.
      it is read live at execution. A witness lifts IOPL-, selector-,
      descriptor-table- and task-sensitive instructions under one state and runs
      them under another, against the Checked class.
+
+## Amendment: paged proofs survive translation-preserving TLB changes (2026-11-27, accepted)
+
+Accepted by the maintainer on 2026-11-27 for bead xj-to9.70. A protected-mode operating
+system ran its paged phases with about one proof lift per five retired instructions: every
+TLB generation advance (an INVLPG, the flush it caused to repeat, a fill replacing a fetched
+entry) dropped every paged proof, and CR0.TS toggles split the paged stamp. The paged
+identity changes as follows; everything else in this record stands.
+
+- The paged proof key and the paged context stamp no longer contain the TLB generation, and
+  their CR0 omits MP, EM and TS. ESC and WAIT still test those bits when they execute (SDM
+  Vol 3A §2.5 CR0), so no lifted op depends on them.
+- A paged proof records the linear and bus address of the first fetched byte of each code
+  page it covers. On a hit after a generation advance it translates them again as a fetch
+  would; the same bus address keeps the proof, another frame or a fault relifts it
+  (`ReliftCause::Translation`). The byte proof against the source is unchanged.
+- Only a flush drops every paged proof: a CR3 load (decision-32 Q8 stands), a change of the
+  paging bits of CR0, A20, the model, or an explicit `Vcpu::invalidate_paging`. INVLPG
+  removes only its page's TLB entry, and advances the generation only when a fetch had used
+  that entry.
+- The paged proof map is bounded at 4096 blocks or 16 MiB of IR, up from 256 blocks.

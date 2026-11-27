@@ -435,3 +435,12 @@ compared after every `run_steps`) gains paged and CPL-3 variants of every J2 cas
 - Revisit if the census shows TLB-miss DEFERs or relifts above about 10 % of host time (Q1
   (b), Q3, Q8), if CPL 1-2 code appears in a workload, or if paged cells miss done-when 2 by
   more than 2× (the turn, then J2b).
+
+## Amendment: the paged identity the compiled view builds on (2026-11-27, accepted)
+
+Decision-20's amendment of the same day (xj-to9.70) removes the TLB generation and CR0.MP,
+EM and TS from the interpreter's paged proof key and stamp, revalidates a proof's code-page
+translation on a hit after a generation advance, makes INVLPG page-only, and raises the
+paged proof bound to 4096 blocks. Q8 stands: a CR3 load still drops every paged proof. The
+compiled view of §3 is a subset of the `Tlb` and is cleared on every `Tlb` mutation, so it
+follows these rules unchanged; a compiled unit keyed by `physical_pc` is unaffected.
