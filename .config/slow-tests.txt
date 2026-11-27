@@ -143,3 +143,5 @@ x86jit-core vm::device::tests::in_pass_census_equals_exit_and_stage_two
 x86jit-tests::legacy machine_j1_lockstep::background_tier_up_equals_the_interpreter
 x86jit-tests::legacy machine_j1_lockstep::background_compiled_stores_into_code_equal_the_interpreter
 x86jit-tests::legacy machine_j1_lockstep::every_lowered_family_runs_compiled
+x86jit-tests::legacy legacy_relift_diag::an_opcode_store_and_the_proof_bound_are_named
+x86jit-tests::threads bg_tier::shutdown_wait_idle_race_finishes_compiler_destruction

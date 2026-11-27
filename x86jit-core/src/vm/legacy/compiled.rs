@@ -159,33 +159,38 @@ struct HotPage {
 /// instructions keep the policy deterministic; it affects cost only.
 const DEMOTION_WINDOW: u64 = 1 << 20;
 
+#[derive(Default)]
 pub(super) struct State {
-    memo: Box<[Option<Slot>]>,
-    hot_pages: [HotPage; 16],
-    /// The compiled view of the TLB (decision-30 §4), at a stable address
-    /// for `MemCtx::ret_stack` (its Machine meaning), and the mapping its entries were filled from.
-    pub(super) tlb: Box<crate::jit_abi::machine::MachineTlb>,
-    mapping: Option<Arc<()>>,
+    /// Allocated by the first run that compiles (`begin_run`): a vCPU that
+    /// compiles no Machine code allocates nothing for it.
+    pub(super) compiling: Option<Box<Compiling>>,
     lifetime: Option<Arc<crate::code_lifetime::CodeLifetime>>,
     participant: Option<crate::code_lifetime::ExecutionParticipant>,
     pub(super) counters: MachineJitCounters,
 }
 
-impl Default for State {
+/// The state only a run that compiles uses.
+pub(super) struct Compiling {
+    memo: Box<[Option<Slot>]>,
+    hot_pages: [HotPage; 16],
+    /// The compiled view of the TLB (decision-30 §4), at a stable address
+    /// for `MemCtx::ret_stack` (its Machine meaning), and the mapping its entries were filled from.
+    pub(super) tlb: crate::jit_abi::machine::MachineTlb,
+    mapping: Option<Arc<()>>,
+}
+
+impl Default for Compiling {
     fn default() -> Self {
         Self {
             memo: (0..MEMO).map(|_| None).collect(),
             hot_pages: [HotPage::default(); 16],
-            tlb: Box::default(),
+            tlb: crate::jit_abi::machine::MachineTlb::default(),
             mapping: None,
-            lifetime: None,
-            participant: None,
-            counters: MachineJitCounters::default(),
         }
     }
 }
 
-impl State {
+impl Compiling {
     /// A drained code write dropped compiled units while this vCPU ran the
     /// code page `page` (decision-27 §2.5).
     #[cold]
@@ -232,6 +237,17 @@ impl State {
         *hot = HotPage::default();
         false
     }
+}
+
+impl State {
+    /// A drained code write dropped compiled units while this vCPU ran the
+    /// code page `page` (decision-27 §2.5).
+    #[cold]
+    pub(super) fn note_code_drop(&mut self, page: u64, retired: u64) {
+        if let Some(compiling) = &mut self.compiling {
+            compiling.note_code_drop(page, retired);
+        }
+    }
 
     /// At run entry: follow the VM's code lifetime, forgetting every entry of
     /// a previous one, and hold a participation in it.
@@ -240,14 +256,15 @@ impl State {
         lifetime: Arc<crate::code_lifetime::CodeLifetime>,
         mapping: Arc<()>,
     ) {
+        let compiling = self.compiling.get_or_insert_with(Box::default);
         // Regions change only between runs (`Vm::map` takes `&mut Vm`).
-        if self
+        if compiling
             .mapping
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &mapping))
         {
-            self.tlb.flush();
-            self.mapping = Some(mapping);
+            compiling.tlb.flush();
+            compiling.mapping = Some(mapping);
         }
         if self
             .lifetime
@@ -256,7 +273,7 @@ impl State {
         {
             return;
         }
-        self.memo.iter_mut().for_each(|slot| *slot = None);
+        compiling.memo.iter_mut().for_each(|slot| *slot = None);
         self.participant = Some(lifetime.participant());
         self.lifetime = Some(lifetime);
     }
@@ -439,7 +456,8 @@ impl Vcpu {
         }
         let index = memo_index(ir);
         {
-            let state = &mut *execution.machine_jit;
+            // `begin_run` allocated the share: this run compiles.
+            let state = execution.machine_jit.compiling.as_deref_mut().unwrap();
             state.tlb.reconcile(
                 self.cpu.legacy.a20_enabled != 0,
                 crate::legacy::physical_mask(context.generation),
@@ -482,7 +500,13 @@ impl Vcpu {
         };
         let model = self.legacy_model.map_or(0, |m| m.model_semantics_id);
         let retired = self.retired;
-        let state = &mut *execution.machine_jit;
+        let State {
+            compiling,
+            participant,
+            counters,
+            ..
+        } = &mut *execution.machine_jit;
+        let state = compiling.as_deref_mut().unwrap();
         let cold = state.memo[index]
             .as_ref()
             .is_some_and(|slot| slot.entry.is_none() && slot.request == Request::None)
@@ -490,13 +514,7 @@ impl Vcpu {
         if cold {
             return None;
         }
-        let State {
-            memo,
-            participant,
-            counters,
-            ..
-        } = state;
-        let slot = memo[index].as_mut().unwrap();
+        let slot = state.memo[index].as_mut().unwrap();
         // Participation precedes probing or calling any executable pointer
         // (`code_lifetime::ExecutionParticipant`); it lasts through the call.
         let guard = participant

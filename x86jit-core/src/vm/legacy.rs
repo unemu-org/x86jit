@@ -3582,9 +3582,17 @@ impl Vcpu {
             if machine_compile {
                 // Decision-30 §4: compiled loads and stores probe the view
                 // (Machine code has no shadow return stack).
-                ctx.ret_stack =
-                    std::ptr::addr_of!(*self.legacy_execution.as_ref().unwrap().machine_jit.tlb)
-                        as u64;
+                ctx.ret_stack = std::ptr::from_ref::<crate::jit_abi::machine::MachineTlb>(
+                    &self
+                        .legacy_execution
+                        .as_ref()
+                        .unwrap()
+                        .machine_jit
+                        .compiling
+                        .as_deref()
+                        .unwrap()
+                        .tlb,
+                ) as u64;
             }
         }
         if KIND == APPLICATION_DISPATCH {

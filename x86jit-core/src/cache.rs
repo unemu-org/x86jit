@@ -505,13 +505,34 @@ struct SpanIndex {
     suppression_bytes: u64,
     next_request: u64,
     interpreter_only: HashSet<BlockKey>,
-    machine: Box<MachineSpans>,
-    // Whether any Machine request was ever made: until then every Machine
-    // check on the interpreter's code-write paths is one test of this.
-    machine_active: bool,
+    // Allocated by the first Machine request: until then every Machine
+    // check on the interpreter's code-write paths is one test of this, and
+    // a VM that compiles no Machine code allocates nothing for it.
+    machine: Option<Box<MachineSpans>>,
 }
 
 impl SpanIndex {
+    /// The coverage overlap of the pending sources and, once a Machine
+    /// request was made, of the Machine units and their requests.
+    #[inline(never)]
+    fn secondary_overlap(&self, lo: u64, hi: u64) -> (bool, bool) {
+        let mut overlap = if self.pending_sources.coverage.root.is_none() {
+            (false, false)
+        } else {
+            self.pending_sources.coverage_overlap(lo, hi)
+        };
+        if let Some(machine) = &self.machine {
+            let (o, p) = machine.coverage_overlap(lo, hi);
+            overlap = (overlap.0 || o, overlap.1 || p);
+        }
+        overlap
+    }
+
+    /// The Machine share, allocated on first use (a Machine request).
+    fn machine_spans(&mut self) -> &mut MachineSpans {
+        self.machine.get_or_insert_with(Box::default)
+    }
+
     fn insert(&mut self, key: BlockKey, spans: Vec<(u64, u32)>) {
         self.interpreter_only.remove(&key);
         self.cached.insert(key, spans);
@@ -522,11 +543,7 @@ impl SpanIndex {
             + self.pending_sources.bytes()
             + self.pending_bytes
             + self.suppression_bytes
-            + if self.machine_active {
-                self.machine.bytes()
-            } else {
-                0
-            }
+            + self.machine.as_ref().map_or(0, |machine| machine.bytes())
     }
 }
 
@@ -824,7 +841,7 @@ pub struct TranslationCache {
     // Compiled Machine units (decision-30 §2; exception E3: no shared
     // interpreted entry), their in-flight requests by id, a count of their
     // publications, which a vCPU waiting for one compares, and of requests.
-    machine: Box<MachineCache>,
+    machine: std::sync::OnceLock<Box<MachineCache>>,
 }
 
 /// The compiled Machine units' share of the cache, out of line so that the
@@ -1020,7 +1037,7 @@ impl TranslationCache {
             tier_up_latency_ns: AtomicU64::new(0),
             tier_up_latency_count: AtomicU64::new(0),
             tier_bg_rejected: AtomicU64::new(0),
-            machine: Box::default(),
+            machine: std::sync::OnceLock::new(),
         }
     }
 
@@ -1217,29 +1234,34 @@ impl TranslationCache {
             return false;
         }
         lifetime.remove_publications(map.values());
-        {
-            let mut machine = self.machine.map.write().unwrap();
+        if let Some(cache) = self.machine.get() {
+            let mut machine = cache.map.write().unwrap();
             lifetime.remove_publications(machine.values());
             for (key, block) in machine.iter() {
                 self.account_memory_replace(
                     Some(block),
-                    spans.machine.cached.units.get(key).map_or(0, Vec::len),
+                    spans
+                        .machine
+                        .as_ref()
+                        .and_then(|machine| machine.cached.units.get(key))
+                        .map_or(0, Vec::len),
                     None,
                     0,
                 );
             }
             machine.clear();
-            for page in spans
-                .machine
+            cache.requests.lock().unwrap().clear();
+            cache.inflight.store(0, Ordering::Release);
+        }
+        if let Some(machine_spans) = &spans.machine {
+            for page in machine_spans
                 .cached
                 .pages
                 .keys()
-                .chain(spans.machine.pending_sources.pages.keys())
+                .chain(machine_spans.pending_sources.pages.keys())
             {
                 clear_page(*page);
             }
-            self.machine.requests.lock().unwrap().clear();
-            self.machine.inflight.store(0, Ordering::Release);
         }
         for (key, block) in map.iter() {
             self.account_memory_replace(
@@ -1542,24 +1564,34 @@ impl TranslationCache {
     /// A cold lookup: a vCPU caches the entry it finds.
     pub(crate) fn machine_unit(&self, key: &MachineBlockKey) -> Option<CompiledPtr> {
         let lifetime = self.code_lifetime();
-        match self.machine.map.read().unwrap().get(key) {
+        match self.machine.get()?.map.read().unwrap().get(key) {
             Some(CachedBlock::Compiled { entry }) if lifetime.is_open() => Some(*entry),
             _ => None,
         }
+    }
+
+    /// The Machine share of the cache, allocated on first use (a Machine
+    /// request).
+    fn machine_cache(&self) -> &MachineCache {
+        self.machine.get_or_init(Box::default)
     }
 
     /// Machine publications so far: a vCPU that requested a unit looks it up
     /// again only when this moves.
     #[inline(always)]
     pub(crate) fn machine_published(&self) -> u64 {
-        self.machine.published.load(Ordering::Acquire)
+        self.machine
+            .get()
+            .map_or(0, |machine| machine.published.load(Ordering::Acquire))
     }
 
     /// Whether any Machine request is in flight: a turn drains the worker's
     /// results only then.
     #[inline(always)]
     pub(crate) fn machine_inflight(&self) -> bool {
-        self.machine.inflight.load(Ordering::Acquire) != 0
+        self.machine
+            .get()
+            .is_some_and(|machine| machine.inflight.load(Ordering::Acquire) != 0)
     }
 
     /// Claim a background slot for `key` and register its sources, under the
@@ -1575,13 +1607,12 @@ impl TranslationCache {
         on_mark: impl FnOnce(&[(u64, u32)]),
     ) -> Option<u64> {
         let mut spans = self.spans.write().unwrap();
-        spans.machine_active = true;
-        if spans.machine.interpreter_only.contains(&key) {
+        if spans.machine_spans().interpreter_only.contains(&key) {
             self.tier_bg_interpreter_only_skipped
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        if spans.machine.pending.contains_key(&key) {
+        if spans.machine_spans().pending.contains_key(&key) {
             self.tier_bg_duplicates_skipped
                 .fetch_add(1, Ordering::Relaxed);
             return None;
@@ -1595,7 +1626,7 @@ impl TranslationCache {
             .expect("tier-up request IDs exhausted");
         let id = spans.next_request;
         on_mark(&source_spans);
-        spans.machine.pending.insert(
+        spans.machine_spans().pending.insert(
             key,
             PendingTierUp {
                 queued_at: crate::time_stats::enabled().then(crate::time_stats::MonotonicTime::now),
@@ -1604,20 +1635,30 @@ impl TranslationCache {
                 generation,
             },
         );
-        spans.machine.pending_sources.insert(key, source_spans);
+        spans
+            .machine_spans()
+            .pending_sources
+            .insert(key, source_spans);
         self.coverage_bytes
             .store(spans.coverage_bytes(), Ordering::Relaxed);
         drop(spans);
-        self.machine.requests.lock().unwrap().insert(id, key);
-        self.machine.inflight.fetch_add(1, Ordering::Release);
+        self.machine_cache()
+            .requests
+            .lock()
+            .unwrap()
+            .insert(id, key);
+        self.machine_cache()
+            .inflight
+            .fetch_add(1, Ordering::Release);
         Some(id)
     }
 
     /// The key of an in-flight Machine request, which it forgets.
     pub(crate) fn machine_request(&self, id: u64) -> Option<MachineBlockKey> {
-        let key = self.machine.requests.lock().unwrap().remove(&id);
+        let machine = self.machine.get()?;
+        let key = machine.requests.lock().unwrap().remove(&id);
         if key.is_some() {
-            self.machine.inflight.fetch_sub(1, Ordering::Release);
+            machine.inflight.fetch_sub(1, Ordering::Release);
         }
         key
     }
@@ -1626,8 +1667,8 @@ impl TranslationCache {
     pub(crate) fn abandon_machine_tier_up(&self, key: MachineBlockKey, mem: &crate::Memory) {
         let source = {
             let mut spans = self.spans.write().unwrap();
-            spans.machine.pending.remove(&key);
-            let source = spans.machine.pending_sources.remove(&key);
+            spans.machine_spans().pending.remove(&key);
+            let source = spans.machine_spans().pending_sources.remove(&key);
             self.coverage_bytes
                 .store(spans.coverage_bytes(), Ordering::Relaxed);
             source
@@ -1650,7 +1691,7 @@ impl TranslationCache {
     ) -> bool {
         let mut spans = self.spans.write().unwrap();
         if spans
-            .machine
+            .machine_spans()
             .pending
             .get(&key)
             .is_none_or(|p| p.id != request_id)
@@ -1660,8 +1701,8 @@ impl TranslationCache {
             self.code_lifetime().discard(&block);
             return false;
         }
-        let pending = spans.machine.pending.remove(&key).unwrap();
-        let source_spans = spans.machine.pending_sources.remove(&key);
+        let pending = spans.machine_spans().pending.remove(&key).unwrap();
+        let source_spans = spans.machine_spans().pending_sources.remove(&key);
         self.coverage_bytes
             .store(spans.coverage_bytes(), Ordering::Relaxed);
         if pending.cancelled {
@@ -1670,7 +1711,7 @@ impl TranslationCache {
             return false;
         }
         let source_spans = source_spans.expect("a Machine request registers its sources");
-        let mut map = self.machine.map.write().unwrap();
+        let mut map = self.machine_cache().map.write().unwrap();
         if map.contains_key(&key) {
             self.record_tier_bg_rejected();
             self.tier_bg_superseded.fetch_add(1, Ordering::Relaxed);
@@ -1682,8 +1723,8 @@ impl TranslationCache {
             if compile_failure.is_some_and(crate::CompileFailureReason::is_deterministic) {
                 // A write to any source byte releases the suppression.
                 on_mark(&source_spans);
-                spans.machine.cached.insert(key, source_spans);
-                spans.machine.interpreter_only.insert(key);
+                spans.machine_spans().cached.insert(key, source_spans);
+                spans.machine_spans().interpreter_only.insert(key);
                 self.coverage_bytes
                     .store(spans.coverage_bytes(), Ordering::Relaxed);
                 self.tier_bg_interpreter_only
@@ -1698,12 +1739,14 @@ impl TranslationCache {
             return false;
         }
         map.insert(key, block);
-        spans.machine.interpreter_only.remove(&key);
-        spans.machine.cached.insert(key, source_spans);
+        spans.machine_spans().interpreter_only.remove(&key);
+        spans.machine_spans().cached.insert(key, source_spans);
         self.coverage_bytes
             .store(spans.coverage_bytes(), Ordering::Relaxed);
         self.record_tier_bg_published();
-        self.machine.published.fetch_add(1, Ordering::Release);
+        self.machine_cache()
+            .published
+            .fetch_add(1, Ordering::Release);
         true
     }
 
@@ -1712,9 +1755,10 @@ impl TranslationCache {
     #[cold]
     #[inline(never)]
     fn drop_machine_victims(&self, spans: &mut SpanIndex, lo: u64, hi: u64) -> bool {
-        let victims = spans.machine.cached.victims(lo, hi);
+        let machine = spans.machine_spans();
+        let victims = machine.cached.victims(lo, hi);
         if !victims.is_empty() {
-            let mut map = self.machine.map.write().unwrap();
+            let mut map = self.machine_cache().map.write().unwrap();
             self.invalidation_blocks_dropped
                 .fetch_add(victims.len() as u64, Ordering::Relaxed);
             self.code_lifetime()
@@ -1722,19 +1766,19 @@ impl TranslationCache {
             for key in &victims {
                 self.account_memory_replace(
                     map.get(key),
-                    spans.machine.cached.units.get(key).map_or(0, Vec::len),
+                    machine.cached.units.get(key).map_or(0, Vec::len),
                     None,
                     0,
                 );
-                spans.machine.interpreter_only.remove(key);
-                spans.machine.cached.remove(key);
+                machine.interpreter_only.remove(key);
+                machine.cached.remove(key);
                 map.remove(key);
             }
         }
         if lo < hi {
-            for key in spans.machine.pending_sources.victims(lo, hi) {
-                spans.machine.pending.get_mut(&key).unwrap().cancelled = true;
-                spans.machine.pending_sources.remove(&key);
+            for key in machine.pending_sources.victims(lo, hi) {
+                machine.pending.get_mut(&key).unwrap().cancelled = true;
+                machine.pending_sources.remove(&key);
             }
         }
         !victims.is_empty()
@@ -1795,9 +1839,10 @@ impl TranslationCache {
             for page in span_pages(start, len) {
                 if !spans.cached.pages.contains_key(&page)
                     && !spans.pending_sources.pages.contains_key(&page)
-                    && !(spans.machine_active
-                        && (spans.machine.cached.pages.contains_key(&page)
-                            || spans.machine.pending_sources.pages.contains_key(&page)))
+                    && !spans.machine.as_ref().is_some_and(|machine| {
+                        machine.cached.pages.contains_key(&page)
+                            || machine.pending_sources.pages.contains_key(&page)
+                    })
                 {
                     mem.release_code_registration(page);
                 }
@@ -2060,7 +2105,10 @@ impl TranslationCache {
         if spans.cached.coverage_overlap(lo, hi).0
             || (spans.pending_sources.coverage.root.is_some()
                 && spans.pending_sources.coverage_overlap(lo, hi).0)
-            || (spans.machine_active && spans.machine.coverage_overlap(lo, hi).0)
+            || spans
+                .machine
+                .as_ref()
+                .is_some_and(|machine| machine.coverage_overlap(lo, hi).0)
         {
             return false;
         }
@@ -2184,20 +2232,15 @@ impl TranslationCache {
             let (overlap, on_page) = spans.cached.coverage_overlap(lo, hi);
             // Empty pending coverage has no source spans. The cached query
             // already sends conservative wide ranges to the slow path.
+            // Compiled Machine units and their requests (decision-30 §2)
+            // answer with the pending sources, out of line: until a Machine
+            // request is made, this costs one more test.
             let (pending_overlap, pending_on_page) =
-                if spans.pending_sources.coverage.root.is_none() {
+                if spans.pending_sources.coverage.root.is_none() && spans.machine.is_none() {
                     (false, false)
                 } else {
-                    spans.pending_sources.coverage_overlap(lo, hi)
+                    spans.secondary_overlap(lo, hi)
                 };
-            // Compiled Machine units and their requests (decision-30 §2);
-            // an empty instance costs one test.
-            let (machine_overlap, machine_on_page) = if spans.machine_active {
-                spans.machine.coverage_overlap(lo, hi)
-            } else {
-                (false, false)
-            };
-            let (overlap, on_page) = (overlap || machine_overlap, on_page || machine_on_page);
             if !overlap && !pending_overlap {
                 // §10: publication requires the exclusive spans lock. If it won
                 // first, this reader sees its coverage bits. Otherwise this write
@@ -2223,7 +2266,8 @@ impl TranslationCache {
         // Recompute after upgrading the lock: publication may have intervened.
         let mut spans = self.spans.write().unwrap();
         let victims = spans.cached.victims(lo, hi);
-        let machine_victims = spans.machine_active && self.drop_machine_victims(&mut spans, lo, hi);
+        let machine_victims =
+            spans.machine.is_some() && self.drop_machine_victims(&mut spans, lo, hi);
         let mut map = (!victims.is_empty()).then(|| self.map.write());
         if let Some(map) = map.as_mut() {
             self.invalidation_blocks_dropped
@@ -2265,7 +2309,10 @@ impl TranslationCache {
         on_write(
             !spans.pending_sources.has_units(lo, hi)
                 && !spans.cached.has_units(lo, hi)
-                && !(spans.machine_active && spans.machine.has_units(lo, hi)),
+                && !spans
+                    .machine
+                    .as_ref()
+                    .is_some_and(|machine| machine.has_units(lo, hi)),
         );
         // A source span may have been read but not cached yet. Reject its
         // publication even when all currently cached spans survive this write.
@@ -2281,8 +2328,13 @@ impl Drop for TranslationCache {
     fn drop(&mut self) {
         self.code_lifetime()
             .remove_publications(self.map.exclusive_values());
-        self.code_lifetime()
-            .remove_publications(self.machine.map.get_mut().unwrap().values());
+        self.code_lifetime().remove_publications(
+            self.machine
+                .get_mut()
+                .map(|machine| machine.map.get_mut().unwrap())
+                .into_iter()
+                .flat_map(|map| map.values()),
+        );
     }
 }
 
