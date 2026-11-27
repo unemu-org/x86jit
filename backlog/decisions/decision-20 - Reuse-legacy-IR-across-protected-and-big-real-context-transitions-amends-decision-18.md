@@ -111,3 +111,48 @@ conformance. Samples are sequential before/after measurements on the same host,
 not a statistically isolated throughput guarantee. Raw samples, including the
 rejected lookup trial, are in
 [decision-20-transition-measurements.csv](decision-20-transition-measurements.csv).
+
+## Amendment (context retention and the unpaged identity, 2026-11-27, accepted by the maintainer)
+
+Decider: maintainer (2026-11-27), accepting both items. Item 1 records a change
+that landed earlier without an amendment; item 2 lands with xj-to9.56.
+
+1. **Already on main (241c4cba, xj-to9.53).** It raised `MAX_RETAINED_CONTEXTS`
+   from 16 to 64, with least-recently-used eviction. This record was not amended
+   at the time, so this text closes that gap. A PC-class embedder's
+   extended-memory runtime walks through more than 16 distinct stamps on each
+   interrupt reflection. The code, data and stack selectors vary, there is a
+   real-mode round trip, and IDTR switches to and from the real-mode IVT. With
+   16 retained contexts, every reflection minted new context ids. The runtime's
+   own blocks were then relifted under new keys, and their proofs flooded the
+   proof map. The interrupted program's hot proofs were evicted under unchanged
+   keys. With 64 contexts, that embedder's in-game renderer went from 11.8-13.4
+   to 20.9-22.1 M steps/s, 126-134 % of its guest clock.
+
+2. **Unpaged identity (xj-to9.56).**
+   - **Identity.** An unpaged Flat32 or Segmented context identity names only
+     what its lift reads: the model, CR0.PE and CR0.AM, the CPL, A20, the
+     reset-fetch and NEC state, and, for Segmented, the descriptor caches. It
+     no longer names the selectors, GDTR, IDTR, LDTR, TR, CR3, IOPL, NT, or
+     the G and A bits of the flat caches.
+   - **Why the reduced identity is exact.** The lifter is a pure function of the
+     code bytes, the IP, the MachineContext, the profile and the alignment mask;
+     it receives no CpuState. IOPL-sensitive instructions lower to live
+     `Privileged` ops. Selector, descriptor-table and task-register reads, and
+     segment loads, run in live helpers. Flat32 admission requires a cached
+     limit of exactly 0xFFFFFFFF with base 0, so a G=0 cache cannot be admitted
+     as flat. Paged contexts, V86 and the Checked class keep the complete stamp,
+     as do the retry, REP and validation paths.
+   - **Retention.** 256 contexts are retained. Context ids are never reused
+     before a translation flush, so evicting a context no longer walks every
+     proof.
+   - **Proof map.** The Flat32 and Segmented proof map is bounded by size, not
+     only by count.
+   - **Measured.** On a local reproduction of the runtime's reflection cycle,
+     host instructions per step fall from 2345 to 649, and lifts per million
+     steps fall from 31,000-60,000 to 0.
+   - **Consequence.** Two unpaged stamps that differ only in fields the lift
+     never reads now share one namespace. Every such field stays exact because
+     it is read live at execution. A witness lifts IOPL-, selector-,
+     descriptor-table- and task-sensitive instructions under one state and runs
+     them under another, against the Checked class.
