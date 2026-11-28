@@ -223,6 +223,11 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
         self.proofs.values().map(|(proof, ..)| proof)
     }
 
+    #[cfg(test)]
+    pub(super) fn entries(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.proofs.iter().map(|(key, (proof, ..))| (key, proof))
+    }
+
     /// Make room for one more proof, of weight `incoming`, in a map of at
     /// most `bound` proofs weighing at most `budget` in all: once either is
     /// reached, drop proofs until both are three quarters or less, rather

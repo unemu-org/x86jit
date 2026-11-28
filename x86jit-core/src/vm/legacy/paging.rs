@@ -2316,4 +2316,133 @@ mod tests {
             assert_eq!(state.lifts, 5);
         }
     }
+
+    // Two ordinary paged blocks, A (INC EAX; JMP $+2) and B (INC EBX;
+    // JMP $+2), resolved into a fresh paging state: each proof keeps its
+    // instruction table and `resolve` filled a slot with it.
+    fn two_proved_blocks(model: crate::CpuModel) -> (State, Arc<IrBlock>, Arc<IrBlock>) {
+        use std::sync::atomic::AtomicU64;
+        let mut vm = Vm::new(crate::VmConfig::flat(0x8000));
+        vm.set_cpu_model(model);
+        vm.map(0, 0x8000, crate::Prot::RWX, crate::RegionKind::Ram)
+            .unwrap();
+        vm.write_bytes(0x2000, &0x3007u32.to_le_bytes()).unwrap();
+        vm.write_bytes(0x3004, &0x4007u32.to_le_bytes()).unwrap();
+        vm.write_bytes(0x4000, b"\x40\xeb\x00\x43\xeb\x00").unwrap();
+        let mut cpu = vm.new_vcpu();
+        cpu.cpu.legacy.cr0 = 0x80000001;
+        cpu.cpu.legacy.cr3 = 0x2000;
+        for (i, cache) in cpu.cpu.legacy.segments[..4].iter_mut().enumerate() {
+            cache.base = 0;
+            cache.limit = u32::MAX;
+            cache.attributes = if i == 0 { 0x409b } else { 0x4093 };
+        }
+        let context = derive_legacy_context(model.legacy_model(), &cpu.cpu).unwrap();
+        let mut state = State::default();
+        let exit = AtomicU64::new(0);
+        let mut at = |state: &mut State, ip| {
+            cpu.cpu.rip = ip;
+            let (ir, ordinary) = state
+                .resolve(
+                    &vm,
+                    &mut cpu.cpu,
+                    model.legacy_model(),
+                    context,
+                    1,
+                    &exit,
+                    true,
+                    None,
+                )
+                .unwrap();
+            assert!(ordinary, "{model:?}");
+            ir
+        };
+        let (a, b) = (at(&mut state, 0x1000), at(&mut state, 0x1003));
+        assert_eq!(state.lifts, 2);
+        (state, a, b)
+    }
+
+    fn key_of(state: &State, ir: &Arc<IrBlock>) -> Key {
+        *state
+            .blocks
+            .entries()
+            .find(|(_, proof)| Arc::ptr_eq(&proof.ir, ir))
+            .expect("a proof holds the block")
+            .0
+    }
+
+    // The table `lanes_for` gives the block at `ir`: its slot's, or the
+    // scratch buffer's.
+    fn table(state: &mut State, ir: &Arc<IrBlock>) -> (*const Insn, usize) {
+        let (insns, ..) = state.lanes_for(ir);
+        (insns.as_ptr(), insns.len())
+    }
+
+    // A's slot rewritten to name `other`'s address at the current version,
+    // as A's slot would read had A been allocated where `other` is: the
+    // shape a freed block's slot takes when its address is reused.
+    fn plant(state: &mut State, a: &Arc<IrBlock>, other: &Arc<IrBlock>) -> *const Insn {
+        let index = lanes_slot(Arc::as_ptr(a));
+        let insns = state.lane_slots[index]
+            .as_ref()
+            .filter(|slot| slot.ir == Arc::as_ptr(a) as usize)
+            .expect("resolve filled A's slot")
+            .insns
+            .clone();
+        let planted = insns.as_ptr();
+        state.lane_slots[lanes_slot(Arc::as_ptr(other))] = Some(LaneSlot {
+            ir: Arc::as_ptr(other) as usize,
+            version: state.blocks.version(),
+            insns,
+        });
+        planted
+    }
+
+    // A table slot names the proof map's version when it was filled. Each
+    // way a proof leaves the map (removal after an unpublishable lift, an
+    // eviction sweep) advances the version, so a slot filled before never
+    // serves a block again, even one at the same address: the address of a
+    // dropped block can be another block's.
+    #[test]
+    fn a_table_slot_outlives_no_removed_or_evicted_proof() {
+        for model in [crate::CpuModel::I80386, crate::CpuModel::I80486Dx] {
+            for evict in [false, true] {
+                let (mut state, a, b) = two_proved_blocks(model);
+                let kept = state.lane_slots[lanes_slot(Arc::as_ptr(&a))]
+                    .as_ref()
+                    .unwrap()
+                    .insns
+                    .as_ptr();
+                // While the proof holds A, its run takes the kept table.
+                assert_eq!(table(&mut state, &a), (kept, a.ops.len()), "{model:?}");
+                // C: a block no proof holds (a retry slice), standing at an
+                // address A's slot names.
+                let c = retry_instruction(&a, a.guest_start + 1);
+                assert_ne!(c.ops.len(), a.ops.len());
+                let planted = plant(&mut state, &a, &c);
+                assert_eq!(table(&mut state, &c).0, planted, "the slot is consulted");
+                if evict {
+                    // An eviction sweep with only A cold.
+                    let swept = state
+                        .blocks
+                        .make_room(1, usize::MAX, 0, why!(Bound), |proof| {
+                            !Arc::ptr_eq(&proof.ir, &a)
+                        });
+                    assert!(swept);
+                    assert!(state.blocks.entries().all(|(_, p)| !Arc::ptr_eq(&p.ir, &a)));
+                    assert!(state.blocks.entries().any(|(_, p)| Arc::ptr_eq(&p.ir, &b)));
+                } else {
+                    let key = key_of(&state, &a);
+                    state.blocks.remove_unpublished(&key);
+                }
+                // Neither block takes the table filled before.
+                let (insns, len) = table(&mut state, &c);
+                assert_ne!(insns, planted, "{model:?} evict={evict}");
+                assert_eq!(len, c.ops.len(), "{model:?} evict={evict}");
+                let (insns, len) = table(&mut state, &a);
+                assert_ne!(insns, kept, "{model:?} evict={evict}");
+                assert_eq!(len, a.ops.len());
+            }
+        }
+    }
 }
