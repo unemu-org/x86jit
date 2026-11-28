@@ -3657,6 +3657,8 @@ impl<'a, const ROUTED: bool, const ORDER: u8, const LANES: bool, const V86: bool
                     temps,
                     context,
                     self.task_switch,
+                    // The rollback groups from the block's table.
+                    self.tlb.map(|(_, _, insns)| insns[self.start].writes),
                     retry,
                 )
                 .map(|(outcome, input)| {

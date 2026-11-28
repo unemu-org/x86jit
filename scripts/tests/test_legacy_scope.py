@@ -323,6 +323,23 @@ def legacy_types(tree):
     return names
 
 
+def macro_declared_impls(text):
+    """Headers of the `impl $name` blocks inside a `macro_rules!` body that
+    itself declares `struct $name`: the type a metavariable names there is
+    the one that macro declares."""
+    headers = set()
+    for match in re.finditer(r"\bmacro_rules!\s*\w+\s*\{", text):
+        depth, end = 1, match.end()
+        while depth and end < len(text):
+            depth += {"{": 1, "}": -1}.get(text[end], 0)
+            end += 1
+        body = text[match.end():end]
+        declared = set(re.findall(r"\bstruct\s+(\$\w+)", body))
+        headers |= {header for header, name, _, _ in impl_blocks(body)
+                    if name in declared}
+    return headers
+
+
 def shared_methods(tree):
     """{(Type, method)} that legacy files add to the reviewed shared types."""
     methods = set()
@@ -459,7 +476,8 @@ class LegacyScopeSoundness(unittest.TestCase):
         foreign = sorted(f"{path}: impl {header}"
                          for path in self.tree.legacy
                          for header, self_type, _, _ in impl_blocks(self.tree.code[path])
-                         if self_type not in own)
+                         if self_type not in own
+                         and header not in macro_declared_impls(self.tree.code[path]))
         self.assertEqual(foreign, [], (
             "a legacy file implements a shared type, which shared code can reach "
             "without naming the legacy module. Move the impl to a shared file, or "

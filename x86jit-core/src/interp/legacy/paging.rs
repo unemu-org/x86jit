@@ -1247,7 +1247,7 @@ const MAX_ACCESS_BYTES: usize = 8;
 
 /// The bus spans of one planned access, in place. A span covers at least a
 /// byte, so an access has at most `MAX_ACCESS_BYTES` of them.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Fragments {
     len: u8,
     items: [Fragment; MAX_ACCESS_BYTES],
@@ -1279,6 +1279,26 @@ impl Fragments {
         self.items[usize::from(self.len)] = fragment;
         self.len += 1;
     }
+
+    /// Become a copy of `spans`, copying those only.
+    #[inline(always)]
+    fn copy_from(&mut self, spans: &[Fragment]) {
+        self.items[..spans.len()].copy_from_slice(spans);
+        self.len = spans.len() as u8;
+    }
+}
+
+/// Where a planned access keeps its spans in `Transaction::spans`.
+#[derive(Clone, Copy)]
+struct Spans {
+    start: u32,
+    len: u8,
+}
+
+impl Spans {
+    fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..self.start as usize + usize::from(self.len)
+    }
 }
 
 impl std::ops::Deref for Fragments {
@@ -1291,14 +1311,6 @@ impl std::ops::Deref for Fragments {
 impl std::ops::DerefMut for Fragments {
     fn deref_mut(&mut self) -> &mut [Fragment] {
         &mut self.items[..usize::from(self.len)]
-    }
-}
-
-impl IntoIterator for Fragments {
-    type Item = Fragment;
-    type IntoIter = std::iter::Take<std::array::IntoIter<Fragment, MAX_ACCESS_BYTES>>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.items.into_iter().take(usize::from(self.len))
     }
 }
 
@@ -1354,6 +1366,10 @@ fn complete_dirty<const ROUTED: bool, const ORDER: u8>(
     Ok(true)
 }
 
+/// The bus spans of the access `size` bytes at `addr`, into `out`. Within
+/// a transaction the spans are kept with the access's key (`Transaction`),
+/// and a later plan of the same access copies them back: only the spans
+/// themselves are copied, never the whole `Fragments`.
 fn plan<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -1361,7 +1377,8 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     access: AccessKind,
     dirty: bool,
-) -> Result<Fragments, Exit> {
+    out: &mut Fragments,
+) -> Result<(), Exit> {
     debug_assert!(usize::from(size) <= MAX_ACCESS_BYTES);
     // SDM Vol 3A §5.6.1 p. 5-33; 80386 PRM §6.5 p. 6-22:
     // implicit table/TSS and inner-stack accesses are supervisor at any CPL.
@@ -1379,26 +1396,28 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
         cr0: cpu.legacy.cr0,
     };
     if let Some(tx) = mem.transaction() {
-        let cached = tx
-            .borrow()
-            .plans
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, fragments)| *fragments);
-        if let Some(mut fragments) = cached {
+        let cached = {
+            let tx = tx.borrow();
+            tx.plans
+                .iter()
+                .position(|(k, _)| *k == key)
+                .inspect(|&at| out.copy_from(tx.planned(at)))
+        };
+        if let Some(at) = cached {
             if !dirty || preparing(mem) {
-                return Ok(fragments);
+                return Ok(());
             }
-            if complete_dirty(cpu, mem, &mut fragments)? {
+            if complete_dirty(cpu, mem, out)? {
                 let mut tx = tx.borrow_mut();
-                tx.plans.iter_mut().find(|(k, _)| *k == key).unwrap().1 = fragments;
-                return Ok(fragments);
+                let (_, spans) = tx.plans[at];
+                tx.spans[spans.range()].copy_from_slice(out);
+                return Ok(());
             }
-            tx.borrow_mut().plans.retain(|(k, _)| *k != key);
+            tx.borrow_mut().plans.remove(at);
         }
     }
     'restart: loop {
-        let mut fragments = Fragments::new();
+        out.len = 0;
         let mut consumed = 0;
         while consumed < size {
             let linear = (addr as u32).wrapping_add(u32::from(consumed));
@@ -1414,7 +1433,7 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
                 .raw()
                 .region_end(bus)
                 .map_or(bytes, |end| u64::from(bytes).min(end - bus) as u8);
-            fragments.push(Fragment {
+            out.push(Fragment {
                 linear,
                 bus,
                 bytes,
@@ -1425,7 +1444,7 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
             consumed += bytes;
         }
         if access == AccessKind::Write {
-            for fragment in &fragments {
+            for fragment in out.iter() {
                 probe_physical(
                     cpu,
                     mem,
@@ -1439,14 +1458,14 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
             // 80386 PRM §5.2.4.3 p. 5-10; Intel486 PRM §5.3.4.3
             // pp. 5-21–22: PTE.D precedes the operand write; PDE.D is preserved.
             // Preflight the entire span before D, retaining even aliased frames.
-            if !complete_dirty(cpu, mem, &mut fragments)? {
+            if !complete_dirty(cpu, mem, out)? {
                 continue 'restart;
             }
         }
         if let Some(tx) = mem.transaction() {
-            tx.borrow_mut().plans.push((key, fragments));
+            tx.borrow_mut().keep_plan(key, out);
         }
-        return Ok(fragments);
+        return Ok(());
     }
 }
 
@@ -1455,13 +1474,18 @@ fn commit_ram<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
 ) -> Result<(), Exit> {
     let mut tx = mem.transaction().expect("paged transaction").borrow_mut();
-    let Transaction { plans, writes, .. } = &mut *tx;
+    let Transaction {
+        plans,
+        spans,
+        writes,
+        ..
+    } = &mut *tx;
     for (bus, bytes, value, committed) in writes {
         if !*committed {
             if let Err(trap) = mem.raw().write(*bus, *value, *bytes) {
                 let linear = plans
                     .iter()
-                    .flat_map(|(_, spans)| spans)
+                    .flat_map(|(_, at)| &spans[at.range()])
                     .find(|f| f.bus == *bus)
                     .map_or(0, |f| f.linear);
                 let StepResult::Exit(exit) =
@@ -1657,10 +1681,11 @@ fn read_slow<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     access: AccessKind,
 ) -> Result<u64, Exit> {
-    let fragments = plan(cpu, mem, addr, size, access, false)?;
+    let mut fragments = Fragments::new();
+    plan(cpu, mem, addr, size, access, false, &mut fragments)?;
     let mut value = 0;
-    for f in fragments {
-        let part = match transfer_read(cpu, mem, &f) {
+    for f in fragments.iter() {
+        let part = match transfer_read(cpu, mem, f) {
             Err(Exit::MmioRead { .. }) if preparing(mem) => {
                 if mem.supervisor() || !mem.transaction().unwrap().borrow().device_dummy {
                     return Err(refusal(
@@ -1716,10 +1741,19 @@ pub(super) fn read_frame<const ROUTED: bool, const ORDER: u8>(
     if let Some(tx) = mem.transaction() {
         tx.borrow_mut().frame_reads = true;
     }
-    let fragments = plan(cpu, mem, addr, size, AccessKind::Read, false)?;
+    let mut fragments = Fragments::new();
+    plan(
+        cpu,
+        mem,
+        addr,
+        size,
+        AccessKind::Read,
+        false,
+        &mut fragments,
+    )?;
     let mut value = 0;
-    for f in fragments {
-        let part = transfer_read(cpu, mem, &f).inspect_err(|exit| {
+    for f in fragments.iter() {
+        let part = transfer_read(cpu, mem, f).inspect_err(|exit| {
             if matches!(exit, Exit::MmioRead { .. }) {
                 if let Some(tx) = mem.transaction() {
                     tx.borrow_mut().pending_mmio_linear = Some(f.linear);
@@ -1738,7 +1772,7 @@ pub(super) fn read_frame<const ROUTED: bool, const ORDER: u8>(
 #[cold]
 #[inline(never)]
 fn retain_frame_answers(cpu: &mut CpuState, before: &Ledger) {
-    cpu.pending_mmio_write = before.pending_mmio_write;
+    cpu.pending_mmio_write = before.head.pending_mmio_write;
 }
 
 pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
@@ -1772,8 +1806,17 @@ fn write_slow<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     value: u64,
 ) -> Result<(), Exit> {
-    let fragments = plan(cpu, mem, addr, size, AccessKind::Write, true)?;
-    for f in fragments {
+    let mut fragments = Fragments::new();
+    plan(
+        cpu,
+        mem,
+        addr,
+        size,
+        AccessKind::Write,
+        true,
+        &mut fragments,
+    )?;
+    for f in fragments.iter() {
         if preparing(mem) {
             let mut tx = mem.transaction().unwrap().borrow_mut();
             for byte in 0..f.bytes {
@@ -1784,7 +1827,7 @@ fn write_slow<const ROUTED: bool, const ORDER: u8>(
             }
             continue;
         }
-        transfer_write(cpu, mem, &f, value >> f.shift)?;
+        transfer_write(cpu, mem, f, value >> f.shift)?;
     }
     Ok(())
 }
@@ -1803,7 +1846,15 @@ pub(super) fn probe<const ROUTED: bool, const ORDER: u8>(
             None => lane_access(cpu, mem, addr, size, LaneAccess::Probe).map(|_| ()),
         };
     }
-    plan(cpu, mem, addr, size, AccessKind::Write, false).map(|_| ())
+    plan(
+        cpu,
+        mem,
+        addr,
+        size,
+        AccessKind::Write,
+        false,
+        &mut Fragments::new(),
+    )
 }
 
 #[cold]
@@ -2022,7 +2073,10 @@ impl PortPlan {
 #[derive(Default)]
 pub(crate) struct Transaction {
     mapping_identity: Option<std::sync::Arc<()>>,
-    plans: Vec<(PlanKey, Fragments)>,
+    /// Each planned access in plan order, with where its spans are.
+    plans: Vec<(PlanKey, Spans)>,
+    /// The spans of `plans`, and those of plans since dropped.
+    spans: Vec<Fragment>,
     overlay: Vec<(u64, u8)>,
     preparing: bool,
     device_dummy: bool,
@@ -2060,6 +2114,7 @@ impl Transaction {
     fn recycle(self) {
         let Self {
             mut plans,
+            mut spans,
             mut overlay,
             mut reads,
             mut prepared_reads,
@@ -2067,18 +2122,51 @@ impl Transaction {
             ..
         } = self;
         plans.clear();
+        spans.clear();
         overlay.clear();
         reads.clear();
         prepared_reads.clear();
         writes.clear();
         SPARE_TRANSACTION.set(Some(Self {
             plans,
+            spans,
             overlay,
             reads,
             prepared_reads,
             writes,
             ..Self::default()
         }));
+    }
+
+    /// The spans of the plan at `at` in `plans`.
+    fn planned(&self, at: usize) -> &[Fragment] {
+        &self.spans[self.plans[at].1.range()]
+    }
+
+    /// Every planned access with its spans, in plan order.
+    fn planned_all(&self) -> impl Iterator<Item = (&PlanKey, &[Fragment])> {
+        self.plans
+            .iter()
+            .map(|(key, spans)| (key, &self.spans[spans.range()]))
+    }
+
+    /// Keep `spans` as the plan of the access `key`, after the others.
+    fn keep_plan(&mut self, key: PlanKey, spans: &[Fragment]) {
+        let start = self.spans.len() as u32;
+        self.spans.extend_from_slice(spans);
+        self.plans.push((
+            key,
+            Spans {
+                start,
+                len: spans.len() as u8,
+            },
+        ));
+    }
+
+    /// Drop every plan (`task_cr3_loaded`).
+    fn clear_plans(&mut self) {
+        self.plans.clear();
+        self.spans.clear();
     }
 
     pub(crate) fn matches_memory(&self, memory: &Memory) -> bool {
@@ -2181,7 +2269,7 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
 ) -> Result<bool, Exit> {
     let mut tx = tx.borrow_mut();
     let mut dirtied = false;
-    for (key, spans) in &tx.plans {
+    for (key, spans) in tx.planned_all() {
         if key.access != AccessKind::Write {
             continue;
         }
@@ -2214,9 +2302,10 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
     // A source can alias a PTE whose D bit was just set. Re-evaluate the
     // prepared instruction with those physical walk writes already visible.
     if !dirtied {
-        for (key, spans) in &mut tx.plans {
+        let Transaction { plans, spans, .. } = &mut *tx;
+        for (key, at) in plans.iter() {
             if key.access == AccessKind::Write {
-                for f in spans {
+                for f in &mut spans[at.range()] {
                     f.dirty_complete = true;
                 }
             }
@@ -2277,6 +2366,7 @@ where
         temps,
         context,
         task_switch,
+        None,
         &mut None,
     )
 }
@@ -2297,6 +2387,7 @@ pub(super) fn execute_with_retry<
     temps: &mut [u64],
     context: MachineContext,
     task_switch: &mut tasks::SwitchState,
+    writes: Option<Groups>,
     retry: &mut Option<Transaction>,
 ) -> Result<(Outcome, Option<PortPlan>), Exit>
 where
@@ -2314,6 +2405,12 @@ where
         }
         let retained = retry.take();
         let resuming = retained.is_some();
+        debug_assert!(writes.is_none_or(|writes| writes == Groups::of_ops(ir.ops)));
+        let groups = Groups::written(
+            writes.unwrap_or_else(|| Groups::of_ops(ir.ops)),
+            cpu,
+            task_switch,
+        );
         let tx = std::cell::RefCell::new(retained.unwrap_or_else(|| {
             Transaction::begin(
                 original.raw().mapping_identity(),
@@ -2373,13 +2470,22 @@ where
                 tx.borrow_mut().overlay.clear();
             }
             // The preview runs on the instruction's own state and is rolled
-            // back from its images: only destinations and the ledger change
-            // (`Destinations`), so restoring both is the copy it ran on.
-            let destinations = Destinations::of(cpu);
-            let ledger = Ledger::of(cpu);
+            // back from its images: only the groups its ops write and the
+            // ledger change (`Groups::written`), so restoring both is the
+            // copy it ran on.
+            let destinations = Destinations::of(cpu, groups);
+            let ledger = Ledger::of(cpu, groups);
             #[cfg(debug_assertions)]
             let untouched = Untouched::of(cpu);
-            let mut preview_tasks = task_switch.clone();
+            // Only an op that can switch tasks or deliver an event, each in
+            // every group, reads or writes the switch state beyond the marks
+            // every instruction clears (`enter_instruction`); without one
+            // the preview's copy need not be one.
+            let mut preview_tasks = if groups.has(Groups::TABLES) {
+                task_switch.clone()
+            } else {
+                tasks::SwitchState::default()
+            };
             let guard = PreviewGuard {
                 cpu: &mut *cpu,
                 destinations: &destinations,
@@ -2398,7 +2504,7 @@ where
             });
             std::mem::forget(guard);
             #[cfg(debug_assertions)]
-            untouched.check(cpu);
+            untouched.check(cpu, groups);
             destinations.restore(cpu);
             if let Err(exit) = preview {
                 if tx.borrow().frame_reads && matches!(exit, Exit::MmioRead { .. }) {
@@ -2434,7 +2540,9 @@ where
             tx.preparing = false;
             tx.read_cursor = 0;
         }
-        let before_commit = Destinations::of(cpu);
+        let before_commit = Destinations::of(cpu, groups);
+        #[cfg(debug_assertions)]
+        let untouched = Untouched::of(cpu);
         let result = execute_instruction::<ROUTED, ORDER, true, V86>(
             block,
             ir,
@@ -2444,6 +2552,8 @@ where
             context,
             task_switch,
         );
+        #[cfg(debug_assertions)]
+        untouched.check(cpu, groups);
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(exit) => {
@@ -2463,7 +2573,7 @@ where
         // completed. Reads below see the staged stores in instruction order.
         let next_ip = cpu.rip;
         if !task_switch.committed {
-            cpu.rip = before_commit.rip;
+            cpu.rip = before_commit.rip();
         }
         if let Err(exit) = commit_ram(cpu, &mem) {
             if !task_switch.committed {
@@ -2478,8 +2588,7 @@ where
             let linear = (p.base as u32).wrapping_add(p.offset as u32);
             let spans = tx
                 .borrow()
-                .plans
-                .iter()
+                .planned_all()
                 .find(|(key, _)| {
                     key.addr == linear && key.size == p.elem && key.access == AccessKind::Write
                 })
@@ -2507,7 +2616,9 @@ pub(super) fn byte_bus<const ROUTED: bool, const ORDER: u8>(
     linear: u64,
     access: AccessKind,
 ) -> Result<u64, Exit> {
-    Ok(plan(cpu, mem, linear, 1, access, false)?[0].bus)
+    let mut spans = Fragments::new();
+    plan(cpu, mem, linear, 1, access, false, &mut spans)?;
+    Ok(spans[0].bus)
 }
 
 #[cold]
@@ -2526,7 +2637,16 @@ pub(super) fn probe_descriptor_cas<const ROUTED: bool, const ORDER: u8>(
         mem.fast_miss();
         return Err(fast_miss_exit(cpu));
     }
-    let spans = plan(cpu, mem, u64::from(address), 1, AccessKind::Write, false)?;
+    let mut spans = Fragments::new();
+    plan(
+        cpu,
+        mem,
+        u64::from(address),
+        1,
+        AccessKind::Write,
+        false,
+        &mut spans,
+    )?;
     if mem.raw().region_kind(spans[0].bus, 1) == Ok(crate::RegionKind::Trap) {
         return Err(refusal(
             cpu,
@@ -2560,7 +2680,17 @@ pub(super) fn descriptor_cas<const ROUTED: bool, const ORDER: u8>(
         }
         return Ok(observed);
     }
-    let f = &plan(cpu, mem, u64::from(address), 1, AccessKind::Write, true)?[0];
+    let mut spans = Fragments::new();
+    plan(
+        cpu,
+        mem,
+        u64::from(address),
+        1,
+        AccessKind::Write,
+        true,
+        &mut spans,
+    )?;
+    let f = &spans[0];
     // Inside a strict lane this plan commits the page's A/D and the CAS the
     // descriptor's A before the frame stores; no later access may miss.
     #[cfg(debug_assertions)]
@@ -2594,7 +2724,8 @@ pub(super) fn locked<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     update: super::super::integer::LockedUpdate,
 ) -> Result<u64, Exit> {
-    let spans = plan(cpu, mem, linear, size, AccessKind::Write, true)?;
+    let mut spans = Fragments::new();
+    plan(cpu, mem, linear, size, AccessKind::Write, true, &mut spans)?;
     if !preparing(mem) && spans.len() == 1 {
         let f = &spans[0];
         let result = match update {
@@ -2629,97 +2760,133 @@ pub(super) fn locked<const ROUTED: bool, const ORDER: u8>(
     Ok(old)
 }
 
-/// Declares [`Destinations`] and [`Ledger`] over named `CpuState` fields.
-/// The capture destructures `CpuState` without `..`, so a field appended to it
-/// does not compile until it is placed in one of the two images or in the
-/// excluded list below, with the reason it is excluded.
+/// Declares the rollback groups of [`Destinations`] and [`Ledger`] over named
+/// `CpuState` fields (and `LegacyCpuState` fields, under `legacy`).
+/// `instruction_images_are_complete` destructures both structs without `..`,
+/// so a field appended to either does not compile until it is placed in
+/// exactly one group or in the excluded list, with the reason it is
+/// excluded: a field named twice is a duplicate binding, one left out is a
+/// missing one.
 macro_rules! instruction_images {
     (
-        destinations { $($dest:ident: $dest_ty:ty),* $(,)? }
-        ledger { $($part:ident: $part_ty:ty),* $(,)? }
+        $(
+            $(#[$meta:meta])*
+            group $group:ident {
+                $($field:ident: $ty:ty),* $(,)?
+                $(; legacy { $($lfield:ident: $lty:ty),* $(,)? })?
+            }
+        )*
+        excluded { $($excluded:ident),* $(,)? }
     ) => {
-        /// Every `CpuState` field a Machine instruction can write, outside the
-        /// bus-handoff [`Ledger`]: what an instruction that ends early is
-        /// rolled back to. Fixed-size and allocation-free.
-        #[derive(Clone, Copy)]
-        pub(super) struct Destinations {
-            $($dest: $dest_ty,)*
-        }
+        $(
+            $(#[$meta])*
+            #[derive(Clone, Copy)]
+            #[cfg_attr(debug_assertions, derive(PartialEq))]
+            pub(super) struct $group {
+                $($field: $ty,)*
+                $($($lfield: $lty,)*)?
+            }
 
-        /// The bus-handoff ledger (`CpuState::mmio_parts` and its completion
-        /// slots). A rollback of an instruction's destinations keeps it: an
-        /// already consumed device answer must not come back.
-        #[derive(Clone, Copy)]
-        pub(super) struct Ledger {
-            $($part: $part_ty,)*
-        }
+            impl $group {
+                #[inline(always)]
+                fn of(cpu: &CpuState) -> Self {
+                    Self {
+                        $($field: cpu.$field,)*
+                        $($($lfield: cpu.legacy.$lfield,)*)?
+                    }
+                }
 
-        impl Destinations {
-            #[inline(always)]
-            pub(super) fn of(cpu: &CpuState) -> Self {
-                let CpuState {
-                    $($dest,)*
-                    $($part: _,)*
-                    // The vector register file. Only vector IR ops (and the
-                    // FXRSTOR/XRSTOR helpers, IR ops of their own) write it;
-                    // none is a Machine op (`supported`). Paging needs PE
-                    // (`legacy::derive_legacy_context`), so a paged context is
-                    // checked, and `execute_instruction` refuses a block with
-                    // any other op before its first effect.
-                    xmm: _,
-                    ymm_hi: _,
-                    zmm_hi: _,
-                    kmask: _,
-                    // Embedder configuration that no instruction writes.
-                    cpuid_table: _,
-                    cpuid_overrides: _,
-                    cpu_source: _,
-                } = cpu;
-                Self {
-                    $($dest: *$dest,)*
+                #[inline(always)]
+                fn restore(&self, cpu: &mut CpuState) {
+                    $(cpu.$field = self.$field;)*
+                    $($(cpu.legacy.$lfield = self.$lfield;)*)?
                 }
             }
+        )*
 
-            #[inline(always)]
-            pub(super) fn restore(&self, cpu: &mut CpuState) {
-                $(cpu.$dest = self.$dest;)*
-            }
-        }
-
-        impl Ledger {
-            #[inline(always)]
-            pub(super) fn of(cpu: &CpuState) -> Self {
-                Self {
-                    $($part: cpu.$part,)*
-                }
-            }
-
-            #[inline(always)]
-            pub(super) fn restore(&self, cpu: &mut CpuState) {
-                $(cpu.$part = self.$part;)*
-            }
+        /// Never called: it compiles only while every field of `CpuState`
+        /// and `LegacyCpuState` is in one group or excluded.
+        #[allow(dead_code)]
+        fn instruction_images_are_complete(cpu: &CpuState) {
+            let CpuState {
+                $($($field: _,)*)*
+                legacy: crate::legacy::LegacyCpuState {
+                    $($($($lfield: _,)*)?)*
+                },
+                $($excluded: _,)*
+            } = cpu;
         }
     };
 }
 
 instruction_images! {
-    destinations {
+    /// The registers every instruction can write: the general registers,
+    /// RIP, RFLAGS, and CR2, which a page fault publishes
+    /// (`execute_instruction`). Always in a rollback image.
+    group Core {
         gpr: [u64; 16],
         rip: u64,
-        fs_base: u64,
-        gs_base: u64,
         flags: crate::state::Flags,
-        fpr: [[u8; 10]; 8],
-        fpu_top: u32,
-        fpu_cw: u16,
-        fpu_pad: u16,
+        rflags_system: u64;
+        legacy {
+            cr2: u32,
+        }
+    }
+    /// The port-input handoff: IN/INS and its retained element.
+    group Io {
         pending_port_in: Option<u8>,
-        features: crate::features::GuestCpuFeatures,
-        x87_precision: crate::state::X87Precision,
+        port_string_in: Option<crate::state::PortStringIn>,
+    }
+    /// Segment registers, their hidden caches and the CPL they carry.
+    group Segments {
         cs: u16,
         ds: u16,
         es: u16,
         ss: u16,
+        fs: u16,
+        gs: u16,
+        fs_base: u64,
+        gs_base: u64;
+        legacy {
+            segments: [crate::legacy::SegmentCache; 6],
+            cpl: u8,
+            reset_fetch: u8,
+        }
+    }
+    /// The descriptor-table registers, LDTR, TR and the task-switch state
+    /// beside them.
+    group Tables {
+        task_io_map_base: u16,
+        task_debug_trap: u8;
+        legacy {
+            gdtr: crate::legacy::TableRegister,
+            idtr: crate::legacy::TableRegister,
+            ldtr: crate::legacy::SystemSegment,
+            tr: crate::legacy::SystemSegment,
+        }
+    }
+    /// Control, debug and test registers but CR2, the board's A20 line,
+    /// the model's mode latches and the processor configuration.
+    group Control {
+        debug_test_registers: [u32; 8],
+        fpu_emulation: bool,
+        features: crate::features::GuestCpuFeatures,
+        machine_flags_mask: u32,
+        source_id: u64,
+        random_state: u64;
+        legacy {
+            cr0: u32,
+            cr3: u32,
+            a20_enabled: u8,
+            reserved: u8,
+        }
+    }
+    /// The x87 and MXCSR state and the numeric-error wiring.
+    group X87 {
+        fpr: [[u8; 10]; 8],
+        fpu_top: u32,
+        fpu_cw: u16,
+        fpu_pad: u16,
         fpu_empty: u8,
         fpu_sw: u16,
         fpu_fip: u64,
@@ -2727,39 +2894,304 @@ instruction_images! {
         fpu_fop: u16,
         fpu_fcs: u16,
         fpu_fds: u16,
-        source_id: u64,
-        random_state: u64,
-        rflags_system: u64,
-        fs: u16,
-        gs: u16,
-        mxcsr: u32,
+        x87_precision: crate::state::X87Precision,
         x87_pointer_model: crate::state::X87PointerModel,
-        port_string_in: Option<crate::state::PortStringIn>,
-        legacy: crate::legacy::LegacyCpuState,
         fpu_model: crate::state::FpuModel,
-        fpu_emulation: bool,
-        task_io_map_base: u16,
-        task_debug_trap: u8,
-        debug_test_registers: [u32; 8],
-        machine_flags_mask: u32,
+        mxcsr: u32,
         numeric_error_route: crate::state::NumericErrorRoute,
         external_numeric_error: crate::state::ExternalNumericErrorState,
     }
-    ledger {
+    /// The bus-handoff ledger's pending completions and owner. Always in a
+    /// rollback image: it is small.
+    group LedgerHead {
         pending_mmio: Option<u64>,
         pending_mmio_write: bool,
-        mmio_parts: [(u64, u64); 64],
         mmio_parts_len: u8,
         mmio_parts_rip: u64,
         mmio_retry_active: bool,
         mmio_retry_cs: u16,
     }
+    /// The ledger's entries, 1 KiB.
+    group LedgerParts {
+        mmio_parts: [(u64, u64); 64],
+    }
+    excluded {
+        // The vector register file. Only vector IR ops (and the
+        // FXRSTOR/XRSTOR helpers, IR ops of their own) write it; none is a
+        // Machine op (`supported`). Paging needs PE
+        // (`legacy::derive_legacy_context`), so a paged context is checked,
+        // and `execute_instruction` refuses a block with any other op before
+        // its first effect.
+        xmm,
+        ymm_hi,
+        zmm_hi,
+        kmask,
+        // Embedder configuration that no instruction writes.
+        cpuid_table,
+        cpuid_overrides,
+        cpu_source,
+    }
 }
 
-/// The fields [`Destinations`] leaves out, as they were: a Machine
-/// instruction must leave them unchanged (debug builds check it).
+/// The rollback groups an instruction can write ([`Groups::written`]); a
+/// [`Destinations`] or [`Ledger`] image holds those only. `CORE` is in
+/// every set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Groups(u8);
+
+impl Groups {
+    pub(super) const CORE: Self = Self(0);
+    pub(super) const IO: Self = Self(1);
+    pub(super) const SEGMENTS: Self = Self(2);
+    pub(super) const TABLES: Self = Self(4);
+    pub(super) const CONTROL: Self = Self(8);
+    pub(super) const X87: Self = Self(16);
+    /// The ledger's entries (`LedgerParts`).
+    pub(super) const LEDGER: Self = Self(32);
+    pub(super) const ALL: Self = Self(63);
+    /// Not a group: an IRET, which is a task return, and writes every
+    /// group, when NT is set (80386 PRM §7.6 p. 7-10; `written`).
+    const NESTED_RETURN: Self = Self(64);
+
+    #[inline(always)]
+    pub(super) const fn has(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[inline(always)]
+    const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The groups the instruction `ops` can write: the union over its ops
+    /// (`op_writes`), every group for an op not named there. Kept per
+    /// instruction in a paged block's table (`Insn::writes`).
+    pub(super) fn of_ops(ops: &[IrOp]) -> Self {
+        ops.iter()
+            .fold(Self::CORE, |groups, op| groups.with(op_writes(op)))
+    }
+
+    /// The groups an instruction whose ops write `ops` (`of_ops`) can
+    /// write when it runs on `cpu`: every group for the resumption of a
+    /// task switch (which runs in place of the ops), plus the port handoff
+    /// while one is in flight and the ledger's entries while the ledger is
+    /// live (a pending completion is consumed into an entry). Debug builds
+    /// check, at every preview and commit, that the groups left out are
+    /// unchanged.
+    #[inline]
+    pub(super) fn written(ops: Self, cpu: &CpuState, tasks: &tasks::SwitchState) -> Self {
+        if tasks.context().is_some() {
+            return Self::ALL;
+        }
+        let mut groups = ops;
+        if groups.has(Self::NESTED_RETURN) {
+            groups = if cpu.rflags_system & 0x4000 != 0 {
+                Self::ALL
+            } else {
+                Self(groups.0 & Self::ALL.0)
+            };
+        }
+        if cpu.pending_port_in.is_some() || cpu.port_string_in.is_some() {
+            groups = groups.with(Self::IO);
+        }
+        // Without a pending completion an access to a device records
+        // nothing: it hands off (`transfer_read`, `transfer_write`). The
+        // other appends are the ops' own (`op_writes`).
+        if cpu.mmio_retry_active
+            || cpu.mmio_parts_len != 0
+            || cpu.pending_mmio.is_some()
+            || cpu.pending_mmio_write
+        {
+            groups = groups.with(Self::LEDGER);
+        }
+        groups
+    }
+}
+
+/// The groups one Machine op can write beyond `CORE`. An op not named here
+/// can write any.
+fn op_writes(op: &IrOp) -> Groups {
+    match op {
+        IrOp::InsnStart { .. }
+        | IrOp::ReadReg { .. }
+        | IrOp::ReadSelector { .. }
+        | IrOp::SegLimitCheck { .. }
+        | IrOp::Add { .. }
+        | IrOp::Adc { .. }
+        | IrOp::Sub { .. }
+        | IrOp::Sbb { .. }
+        | IrOp::And { .. }
+        | IrOp::Or { .. }
+        | IrOp::Xor { .. }
+        | IrOp::Shl { .. }
+        | IrOp::Shr { .. }
+        | IrOp::Sar { .. }
+        | IrOp::Rol { .. }
+        | IrOp::Ror { .. }
+        | IrOp::Rcl { .. }
+        | IrOp::Rcr { .. }
+        | IrOp::DoubleShift { .. }
+        | IrOp::Sext { .. }
+        | IrOp::Mul { .. }
+        | IrOp::Div { .. }
+        | IrOp::GetCond { .. }
+        | IrOp::BitScan { .. }
+        | IrOp::Bt { .. }
+        | IrOp::Bswap { .. }
+        | IrOp::Load { .. }
+        | IrOp::Store { .. }
+        | IrOp::AtomicRmw { .. }
+        | IrOp::AtomicCas { .. }
+        | IrOp::Jump { .. }
+        | IrOp::Branch { .. }
+        | IrOp::LoopCx { .. }
+        | IrOp::SetIf { .. }
+        | IrOp::SetDf { .. }
+        | IrOp::SetCf { .. }
+        | IrOp::Lahf
+        | IrOp::Sahf
+        | IrOp::Bcd { .. }
+        | IrOp::Fence { .. } => Groups::CORE,
+        IrOp::WriteReg { reg, .. } if reg.gpr_index().is_some() || *reg == Reg::Rip => Groups::CORE,
+        IrOp::WriteReg { .. } => Groups::SEGMENTS,
+        IrOp::X87 { .. } => Groups::X87,
+        IrOp::Legacy(op) => match op {
+            L::I486Gate
+            | L::Checkpoint
+            | L::LiveField { .. }
+            | L::Address { .. }
+            | L::Flat32Address { .. }
+            | L::SegmentedAddress { .. }
+            | L::ReadSelector { .. }
+            | L::Push { .. }
+            | L::Pop { .. }
+            | L::AdjustStack { .. }
+            | L::Flags { .. }
+            | L::All { .. }
+            | L::Loop { .. }
+            | L::Leave { .. }
+            | L::DirectStackAddress { .. }
+            | L::FusedPush { .. }
+            | L::FusedPop { .. }
+            | L::Table { load: false, .. }
+            // A test that raises its fault, or nothing.
+            | L::Privileged {
+                kind: legacy::PrivilegeCheck::Cpl0 | legacy::PrivilegeCheck::Iopl,
+            }
+            | L::Coprocessor { .. }
+            | L::Transfer { cs: None, .. }
+            | L::Return { far: false, .. } => Groups::CORE,
+            L::String { kind, .. } if !matches!(kind, StrOp::Ins | StrOp::Outs) => Groups::CORE,
+            // ENTER keeps its frame-pointer identities in the ledger.
+            L::Enter { .. } => Groups::LEDGER,
+            // A descriptor load keeps the descriptor as read in the ledger
+            // (`legacy::remember`).
+            L::LoadSegment { .. } | L::Return { far: true, .. } => {
+                Groups::SEGMENTS.with(Groups::LEDGER)
+            }
+            // An IRET reloads CS and SS and can clear the data segments.
+            L::Iret { .. } | L::CheckTaskReturn => Groups::SEGMENTS
+                .with(Groups::LEDGER)
+                .with(Groups::NESTED_RETURN),
+            L::Table { load: true, .. } => Groups::TABLES,
+            L::LoadSystemSegment { .. } => Groups::TABLES.with(Groups::LEDGER),
+            // LMSW writes CR0, and `legacy::write_cr0` enters CPL 0 when PE
+            // changes. LMSW cannot clear PE and paging implies it, so a
+            // paged lane never sees that, but the CPL is in `Segments`.
+            L::LoadMsw { .. } => Groups::CONTROL.with(Groups::SEGMENTS),
+            _ => Groups::ALL,
+        },
+        _ => Groups::ALL,
+    }
+}
+
+/// What a Machine instruction that ends early is rolled back to: the
+/// `CpuState` fields of its [`Groups`], outside the bus-handoff [`Ledger`].
+/// Fixed-size and allocation-free.
+#[derive(Clone, Copy)]
+pub(super) struct Destinations {
+    core: Core,
+    io: Option<Io>,
+    segments: Option<Segments>,
+    tables: Option<Tables>,
+    control: Option<Control>,
+    x87: Option<X87>,
+}
+
+impl Destinations {
+    #[inline(always)]
+    pub(super) fn of(cpu: &CpuState, groups: Groups) -> Self {
+        Self {
+            core: Core::of(cpu),
+            io: groups.has(Groups::IO).then(|| Io::of(cpu)),
+            segments: groups.has(Groups::SEGMENTS).then(|| Segments::of(cpu)),
+            tables: groups.has(Groups::TABLES).then(|| Tables::of(cpu)),
+            control: groups.has(Groups::CONTROL).then(|| Control::of(cpu)),
+            x87: groups.has(Groups::X87).then(|| X87::of(cpu)),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn rip(&self) -> u64 {
+        self.core.rip
+    }
+
+    #[inline(always)]
+    pub(super) fn restore(&self, cpu: &mut CpuState) {
+        self.core.restore(cpu);
+        if let Some(io) = &self.io {
+            io.restore(cpu);
+        }
+        if let Some(segments) = &self.segments {
+            segments.restore(cpu);
+        }
+        if let Some(tables) = &self.tables {
+            tables.restore(cpu);
+        }
+        if let Some(control) = &self.control {
+            control.restore(cpu);
+        }
+        if let Some(x87) = &self.x87 {
+            x87.restore(cpu);
+        }
+    }
+}
+
+/// The bus-handoff ledger (`CpuState::mmio_parts` and its completion
+/// slots): its head always, its entries with [`Groups::LEDGER`]. A rollback
+/// of an instruction's destinations keeps it: an already consumed device
+/// answer must not come back.
+#[derive(Clone, Copy)]
+pub(super) struct Ledger {
+    head: LedgerHead,
+    parts: Option<LedgerParts>,
+}
+
+impl Ledger {
+    #[inline(always)]
+    pub(super) fn of(cpu: &CpuState, groups: Groups) -> Self {
+        Self {
+            head: LedgerHead::of(cpu),
+            parts: groups.has(Groups::LEDGER).then(|| LedgerParts::of(cpu)),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn restore(&self, cpu: &mut CpuState) {
+        self.head.restore(cpu);
+        if let Some(parts) = &self.parts {
+            parts.restore(cpu);
+        }
+    }
+}
+
+/// Every group, as it was, to check after a preview or a commit that an
+/// instruction wrote none outside its [`Groups`] (debug builds), and the
+/// fields no group holds: a Machine instruction must leave them unchanged.
 #[cfg(debug_assertions)]
 pub(super) struct Untouched {
+    destinations: Destinations,
+    ledger: Ledger,
     xmm: [u128; 32],
     ymm_hi: [u128; 32],
     zmm_hi: [[u128; 2]; 32],
@@ -2773,6 +3205,8 @@ pub(super) struct Untouched {
 impl Untouched {
     pub(super) fn of(cpu: &CpuState) -> Self {
         Self {
+            destinations: Destinations::of(cpu, Groups::ALL),
+            ledger: Ledger::of(cpu, Groups::ALL),
             xmm: cpu.xmm,
             ymm_hi: cpu.ymm_hi,
             zmm_hi: cpu.zmm_hi,
@@ -2786,8 +3220,24 @@ impl Untouched {
         }
     }
 
-    pub(super) fn check(&self, cpu: &CpuState) {
+    /// `cpu` differs from the image only in `groups`, the core and the
+    /// ledger's head.
+    pub(super) fn check(&self, cpu: &CpuState, groups: Groups) {
         let now = Self::of(cpu);
+        let (before, after) = (&self.destinations, &now.destinations);
+        for (group, same) in [
+            (Groups::IO, before.io == after.io),
+            (Groups::SEGMENTS, before.segments == after.segments),
+            (Groups::TABLES, before.tables == after.tables),
+            (Groups::CONTROL, before.control == after.control),
+            (Groups::X87, before.x87 == after.x87),
+            (Groups::LEDGER, self.ledger.parts == now.ledger.parts),
+        ] {
+            assert!(
+                same || groups.has(group),
+                "a Machine instruction wrote {group:?} outside its rollback groups {groups:?}"
+            );
+        }
         assert!(
             self.xmm == now.xmm
                 && self.ymm_hi == now.ymm_hi
@@ -2866,7 +3316,15 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
         let linear = u64::from((address as u32).wrapping_add(offset as u32));
         let size = (bytes - offset).min(8) as u8;
         if !writing {
-            plan(cpu, mem, linear, size, AccessKind::Read, false)?;
+            plan(
+                cpu,
+                mem,
+                linear,
+                size,
+                AccessKind::Read,
+                false,
+                &mut Fragments::new(),
+            )?;
         }
     }
     if !writing {
@@ -2883,8 +3341,13 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
         bytes: std::cell::RefCell::new(data),
         stored: Cell::new(false),
     };
-    let before = Destinations::of(cpu);
+    // `exec_x87` writes the x87 state and no register outside the core.
+    let before = Destinations::of(cpu, Groups::X87);
+    #[cfg(debug_assertions)]
+    let untouched = Untouched::of(cpu);
     let fault = crate::x87::exec_x87(cpu, &fp, kind, address, sti);
+    #[cfg(debug_assertions)]
+    untouched.check(cpu, Groups::X87);
     debug_assert!(fault.is_none());
     if fp.stored.get() {
         for offset in (0..bytes).step_by(8) {
@@ -2965,8 +3428,8 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
         if !resuming {
             // As `execute_with_retry`'s preview: in place, rolled back from
             // its images.
-            let destinations = Destinations::of(cpu);
-            let ledger = Ledger::of(cpu);
+            let destinations = Destinations::of(cpu, Groups::ALL);
+            let ledger = Ledger::of(cpu, Groups::ALL);
             #[cfg(debug_assertions)]
             let untouched = Untouched::of(cpu);
             let mut preview_tasks = task_switch.clone();
@@ -2982,7 +3445,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
             };
             std::mem::forget(guard);
             #[cfg(debug_assertions)]
-            untouched.check(cpu);
+            untouched.check(cpu, Groups::ALL);
             destinations.restore(cpu);
             ledger.restore(cpu);
             if let Err(exit) = preview {
@@ -3007,7 +3470,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
             tx.preparing = false;
             tx.read_cursor = 0;
         }
-        let before_commit = Destinations::of(cpu);
+        let before_commit = Destinations::of(cpu, Groups::ALL);
         let mut result = if task_switch.context().is_some() {
             tasks::resume(cpu, &mem.address_keyed(), task_switch)
         } else {
@@ -3016,7 +3479,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
         if result.is_ok() {
             let next_ip = cpu.rip;
             if !task_switch.committed {
-                cpu.rip = before_commit.rip;
+                cpu.rip = before_commit.rip();
             }
             if let Err(exit) = commit_ram(cpu, &mem) {
                 if !task_switch.committed {
@@ -3177,8 +3640,7 @@ pub(super) fn task_cr3_loaded<const ROUTED: bool, const ORDER: u8>(
     mem.transaction()
         .expect("paged task transaction")
         .borrow_mut()
-        .plans
-        .clear();
+        .clear_plans();
 }
 
 #[cold]
@@ -3200,6 +3662,7 @@ pub(super) fn task_resident<const ROUTED: bool, const ORDER: u8>(
             (bytes - offset).min(8) as u8,
             AccessKind::Read,
             false,
+            &mut Fragments::new(),
         )?;
     }
     // Plans are keyed by exact span. Retain each image read's translation
@@ -3212,8 +3675,8 @@ pub(super) fn task_resident<const ROUTED: bool, const ORDER: u8>(
             size,
             AccessKind::Read,
             false,
+            &mut Fragments::new(),
         )
-        .map(|_| ())
     };
     if tasks::wide(tss) {
         // 386 PRM §7.1 Fig. 7-1 pp. 7-2–3: CR3, EIP, EFLAGS,
@@ -3309,6 +3772,7 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
             scratch,
             context,
             task_switch,
+            None,
             retry,
         )
     })
@@ -3957,6 +4421,7 @@ pub(super) fn strict_instruction<const ROUTED: bool, const ORDER: u8, const V86:
         temps,
         context,
         task_switch,
+        None,
         retry,
     )
     .map(|(outcome, _)| outcome)
@@ -4046,6 +4511,8 @@ pub(crate) struct Insn {
     pub(super) end: u32,
     pub(super) len: u32,
     pub(super) class: Class,
+    /// The rollback groups its ops write (`Groups::of_ops`).
+    pub(super) writes: Groups,
 }
 
 /// The instruction table of a paged ordinary block: one entry per op,
@@ -4060,6 +4527,7 @@ pub(crate) fn lanes_into(ir: &IrBlock, insns: &mut Vec<Insn>) {
             end: 0,
             len: 0,
             class: Class::Transaction,
+            writes: Groups::ALL,
         },
     );
     let mut at = 0;
@@ -4079,6 +4547,7 @@ pub(crate) fn lanes_into(ir: &IrBlock, insns: &mut Vec<Insn>) {
             end: end as u32,
             len: (next - guest_addr) as u32,
             class: classify(&ops[at..end]),
+            writes: Groups::of_ops(&ops[at..end]),
         };
         at = end;
     }
@@ -4525,65 +4994,58 @@ fn execute_ordinary_from<const ROUTED: bool, const ORDER: u8, const V86: bool>(
 mod tests {
     use super::*;
 
-    /// A rollback from `Destinations` reverts an edit of every field but the
-    /// ledger and the excluded ones, and the ledger image reverts the ledger.
-    /// The capture names every `CpuState` field, so a new one must be placed.
+    /// Each field an instruction writes is in the group named here: an
+    /// image of that group (and the core) reverts an edit of it, an image of
+    /// every other group does not. With every group the images revert every
+    /// field but the excluded ones. The capture names every `CpuState`
+    /// field, so a new one must be placed.
     #[test]
     fn instruction_images_restore_every_field_an_instruction_writes() {
         let base = CpuState::default();
+        let rolled_back = |changed: &CpuState, groups| {
+            let mut changed = changed.clone();
+            Destinations::of(&base, groups).restore(&mut changed);
+            Ledger::of(&base, groups).restore(&mut changed);
+            format!("{changed:?}") == format!("{base:?}")
+        };
+        const GROUPS: [Groups; 6] = [
+            Groups::IO,
+            Groups::SEGMENTS,
+            Groups::TABLES,
+            Groups::CONTROL,
+            Groups::X87,
+            Groups::LEDGER,
+        ];
         macro_rules! restored {
-            ($($edit:expr),* $(,)?) => {$({
+            ($($group:ident: $edit:expr),* $(,)?) => {$({
                 let mut changed = base.clone();
                 let edit: fn(&mut CpuState) = $edit;
                 edit(&mut changed);
-                assert_ne!(format!("{changed:?}"), format!("{base:?}"), "{}", stringify!($edit));
-                Destinations::of(&base).restore(&mut changed);
-                Ledger::of(&base).restore(&mut changed);
-                assert_eq!(format!("{changed:?}"), format!("{base:?}"), "{}", stringify!($edit));
+                let what = stringify!($edit);
+                assert_ne!(format!("{changed:?}"), format!("{base:?}"), "{what}");
+                assert!(rolled_back(&changed, Groups::ALL), "{what}");
+                assert!(rolled_back(&changed, Groups::$group), "{what}");
+                for other in GROUPS.into_iter().filter(|&g| g != Groups::$group) {
+                    let rest = Groups(Groups::ALL.0 & !other.0);
+                    assert_eq!(
+                        rolled_back(&changed, rest),
+                        Groups::$group != other,
+                        "{what} without {other:?}"
+                    );
+                }
             })*};
         }
         restored!(
-            |c| c.gpr[15] = 1,
-            |c| c.rip = 1,
-            |c| c.fs_base = 1,
-            |c| c.gs_base = 1,
-            |c| c.flags.cf = !c.flags.cf,
-            |c| c.flags.set_pf(!c.flags.pf()),
-            |c| c.flags.set_af(!c.flags.af()),
-            |c| c.flags.if_ = !c.flags.if_,
-            |c| c.fpr[7][9] = 1,
-            |c| c.fpu_top ^= 1,
-            |c| c.fpu_cw ^= 1,
-            |c| c.fpu_pad ^= 1,
-            |c| c.pending_mmio = Some(1),
-            |c| c.pending_mmio_write = true,
-            |c| c.pending_port_in = Some(1),
-            |c| c.features = crate::features::GuestCpuFeatures::empty(),
-            |c| c.x87_precision = crate::state::X87Precision::Extended,
-            |c| c.cs ^= 1,
-            |c| c.ds ^= 1,
-            |c| c.es ^= 1,
-            |c| c.ss ^= 1,
-            |c| c.fpu_empty ^= 1,
-            |c| c.fpu_sw ^= 1,
-            |c| c.fpu_fip ^= 1,
-            |c| c.fpu_fdp ^= 1,
-            |c| c.fpu_fop ^= 1,
-            |c| c.fpu_fcs ^= 1,
-            |c| c.fpu_fds ^= 1,
-            |c| c.mmio_parts[63] = (1, 2),
-            |c| c.mmio_parts_len = 1,
-            |c| c.mmio_parts_rip = 1,
-            |c| c.mmio_retry_active = true,
-            |c| c.mmio_retry_cs = 1,
-            |c| c.source_id ^= 1,
-            |c| c.random_state ^= 1,
-            |c| c.rflags_system ^= 0x10000,
-            |c| c.fs ^= 1,
-            |c| c.gs ^= 1,
-            |c| c.mxcsr ^= 1,
-            |c| c.x87_pointer_model = crate::state::X87PointerModel::Amd,
-            |c| {
+            CORE: |c| c.gpr[15] = 1,
+            CORE: |c| c.rip = 1,
+            CORE: |c| c.flags.cf = !c.flags.cf,
+            CORE: |c| c.flags.set_pf(!c.flags.pf()),
+            CORE: |c| c.flags.set_af(!c.flags.af()),
+            CORE: |c| c.flags.if_ = !c.flags.if_,
+            CORE: |c| c.rflags_system ^= 0x10000,
+            CORE: |c| c.legacy.cr2 ^= 1,
+            IO: |c| c.pending_port_in = Some(1),
+            IO: |c| {
                 c.port_string_in = Some(crate::state::PortStringIn {
                     rip: 1,
                     next_ip: 2,
@@ -4598,17 +5060,58 @@ mod tests {
                     value: None,
                 })
             },
-            |c| c.legacy.cr2 ^= 1,
-            |c| c.legacy.segments[5].base ^= 1,
-            |c| c.legacy.tr.cache.limit ^= 1,
-            |c| c.fpu_model = crate::state::FpuModel::None,
-            |c| c.fpu_emulation = !c.fpu_emulation,
-            |c| c.task_io_map_base ^= 1,
-            |c| c.task_debug_trap ^= 1,
-            |c| c.debug_test_registers[7] ^= 1,
-            |c| c.machine_flags_mask ^= 1,
-            |c| c.numeric_error_route = crate::state::NumericErrorRoute::External,
-            |c| c.external_numeric_error.held = !c.external_numeric_error.held,
+            SEGMENTS: |c| c.cs ^= 1,
+            SEGMENTS: |c| c.ds ^= 1,
+            SEGMENTS: |c| c.es ^= 1,
+            SEGMENTS: |c| c.ss ^= 1,
+            SEGMENTS: |c| c.fs ^= 1,
+            SEGMENTS: |c| c.gs ^= 1,
+            SEGMENTS: |c| c.fs_base = 1,
+            SEGMENTS: |c| c.gs_base = 1,
+            SEGMENTS: |c| c.legacy.segments[5].base ^= 1,
+            SEGMENTS: |c| c.legacy.cpl ^= 3,
+            SEGMENTS: |c| c.legacy.reset_fetch ^= 1,
+            TABLES: |c| c.legacy.gdtr.limit ^= 1,
+            TABLES: |c| c.legacy.idtr.base ^= 1,
+            TABLES: |c| c.legacy.ldtr.selector ^= 4,
+            TABLES: |c| c.legacy.tr.cache.limit ^= 1,
+            TABLES: |c| c.task_io_map_base ^= 1,
+            TABLES: |c| c.task_debug_trap ^= 1,
+            CONTROL: |c| c.legacy.cr0 ^= 8,
+            CONTROL: |c| c.legacy.cr3 ^= 0x1000,
+            CONTROL: |c| c.legacy.a20_enabled ^= 1,
+            CONTROL: |c| c.legacy.reserved ^= 1,
+            CONTROL: |c| c.debug_test_registers[7] ^= 1,
+            CONTROL: |c| c.fpu_emulation = !c.fpu_emulation,
+            CONTROL: |c| c.features = crate::features::GuestCpuFeatures::empty(),
+            CONTROL: |c| c.machine_flags_mask ^= 1,
+            CONTROL: |c| c.source_id ^= 1,
+            CONTROL: |c| c.random_state ^= 1,
+            X87: |c| c.fpr[7][9] = 1,
+            X87: |c| c.fpu_top ^= 1,
+            X87: |c| c.fpu_cw ^= 1,
+            X87: |c| c.fpu_pad ^= 1,
+            X87: |c| c.fpu_empty ^= 1,
+            X87: |c| c.fpu_sw ^= 1,
+            X87: |c| c.fpu_fip ^= 1,
+            X87: |c| c.fpu_fdp ^= 1,
+            X87: |c| c.fpu_fop ^= 1,
+            X87: |c| c.fpu_fcs ^= 1,
+            X87: |c| c.fpu_fds ^= 1,
+            X87: |c| c.x87_precision = crate::state::X87Precision::Extended,
+            X87: |c| c.x87_pointer_model = crate::state::X87PointerModel::Amd,
+            X87: |c| c.fpu_model = crate::state::FpuModel::None,
+            X87: |c| c.mxcsr ^= 1,
+            X87: |c| c.numeric_error_route = crate::state::NumericErrorRoute::External,
+            X87: |c| c.external_numeric_error.held = !c.external_numeric_error.held,
+            // The ledger's head is in every image, beside the core.
+            CORE: |c| c.pending_mmio = Some(1),
+            CORE: |c| c.pending_mmio_write = true,
+            CORE: |c| c.mmio_parts_len = 1,
+            CORE: |c| c.mmio_parts_rip = 1,
+            CORE: |c| c.mmio_retry_active = true,
+            CORE: |c| c.mmio_retry_cs = 1,
+            LEDGER: |c| c.mmio_parts[63] = (1, 2),
         );
         // The destinations alone keep the ledger: a consumed device answer
         // stays consumed (`restore_destinations`).
@@ -4616,9 +5119,106 @@ mod tests {
         changed.gpr[0] = 1;
         changed.mmio_parts_len = 1;
         changed.pending_mmio = Some(2);
-        Destinations::of(&base).restore(&mut changed);
+        Destinations::of(&base, Groups::ALL).restore(&mut changed);
         assert_eq!(changed.gpr[0], 0);
         assert_eq!((changed.mmio_parts_len, changed.pending_mmio), (1, Some(2)));
+    }
+
+    /// `Groups::written` of real lifts: the transaction lane's common
+    /// instructions copy the core only; a segment load, a table or control
+    /// register load and an x87 operand add their group; a far transfer
+    /// through a descriptor, an event, a task switch and port input take
+    /// every group. The ledger's entries join wherever a completion is
+    /// pending, the port handoff wherever one is in flight.
+    #[test]
+    fn written_names_the_groups_of_each_instruction() {
+        let mut cpu = CpuState::default();
+        cpu.legacy.cr0 = 0x8000_0011;
+        cpu.legacy.a20_enabled = 1;
+        for (i, cache) in cpu.legacy.segments.iter_mut().enumerate() {
+            cache.base = 0;
+            cache.limit = u32::MAX;
+            cache.attributes = if i == 0 { 0x9b } else { 0x93 } | 0x4000 | 0x8000;
+        }
+        let model = crate::CpuModel::I80386.legacy_model();
+        let context = legacy::derive_legacy_context(model, &cpu).unwrap();
+        let tasks = tasks::SwitchState::default();
+        let written = |bytes: &[u8], cpu: &CpuState| {
+            let ir = crate::lift::legacy::instruction(bytes, 0x1000, context)
+                .unwrap_or_else(|e| panic!("{bytes:02x?}: {e:?}"));
+            Groups::written(Groups::of_ops(&ir.ops), cpu, &tasks)
+        };
+        let seg = Groups::SEGMENTS.with(Groups::LEDGER);
+        let cases: &[(&str, &[u8], Groups)] = &[
+            ("push m", &[0xff, 0x36], Groups::CORE),
+            ("pop m", &[0x8f, 0x07], Groups::CORE),
+            ("call rel", &[0xe8, 0, 1, 0, 0], Groups::CORE),
+            ("ret", &[0xc3], Groups::CORE),
+            ("ret imm", &[0xc2, 8, 0], Groups::CORE),
+            ("pushad", &[0x60], Groups::CORE),
+            ("popad", &[0x61], Groups::CORE),
+            ("pushfd", &[0x9c], Groups::CORE),
+            ("popfd", &[0x9d], Groups::CORE),
+            ("movsd", &[0xa5], Groups::CORE),
+            ("rep movsb", &[0xf3, 0xa4], Groups::CORE),
+            ("cmpsd", &[0xa7], Groups::CORE),
+            ("leave", &[0xc9], Groups::CORE),
+            ("add m", &[0x01, 0x07], Groups::CORE),
+            ("xchg m", &[0x87, 0x06], Groups::CORE),
+            ("bound", &[0x62, 0x06], Groups::ALL),
+            ("enter", &[0xc8, 0x10, 0, 2], Groups::LEDGER),
+            ("sgdt", &[0x0f, 0x01, 0x06], Groups::CORE),
+            ("mov fs m", &[0x8e, 0x26], seg),
+            ("pop ds", &[0x1f], seg),
+            ("lgs", &[0x0f, 0xb5, 0x06], seg),
+            ("retf", &[0xcb], seg),
+            ("lgdt", &[0x0f, 0x01, 0x16], Groups::TABLES),
+            ("lidt", &[0x0f, 0x01, 0x1e], Groups::TABLES),
+            (
+                "lldt m",
+                &[0x0f, 0x00, 0x16],
+                Groups::TABLES.with(Groups::LEDGER),
+            ),
+            (
+                "ltr m",
+                &[0x0f, 0x00, 0x1e],
+                Groups::TABLES.with(Groups::LEDGER),
+            ),
+            (
+                "lmsw m",
+                &[0x0f, 0x01, 0x36],
+                Groups::CONTROL.with(Groups::SEGMENTS),
+            ),
+            ("fld m64", &[0xdd, 0x06], Groups::X87),
+            ("fnstenv", &[0xd9, 0x36], Groups::X87),
+            ("fldcw", &[0xd9, 0x2e], Groups::X87),
+            ("call far m", &[0xff, 0x1e], Groups::ALL),
+            ("jmp tss", &[0xea, 0, 0, 0, 0, 0x20, 0], Groups::ALL),
+            ("iretd", &[0xcf], seg),
+            ("int", &[0xcd, 0x30], Groups::ALL),
+            ("in", &[0xec], Groups::ALL),
+            ("insb", &[0x6c], Groups::ALL),
+        ];
+        let mut answered = cpu.clone();
+        answered.pending_mmio = Some(1);
+        let mut acknowledged = cpu.clone();
+        acknowledged.pending_mmio_write = true;
+        let mut retrying = cpu.clone();
+        retrying.begin_mmio_retry(0x1000);
+        let mut port = cpu.clone();
+        port.pending_port_in = Some(1);
+        // NT set: an IRET is a task return.
+        let mut nested = cpu.clone();
+        nested.rflags_system |= 0x4000;
+        assert_eq!(written(&[0xcf], &nested), Groups::ALL);
+        assert_eq!(written(&[0xcb], &nested), seg);
+        for &(name, bytes, groups) in cases {
+            assert_eq!(written(bytes, &cpu), groups, "{name}");
+            for live in [&answered, &acknowledged, &retrying] {
+                assert_eq!(written(bytes, live), groups.with(Groups::LEDGER), "{name}");
+            }
+            assert_eq!(written(bytes, &port), groups.with(Groups::IO), "{name}");
+        }
     }
 
     /// `supported` admits no op that writes the vector register file, which

@@ -112,6 +112,22 @@ const CASES: &[Case] = &[
     case("fldenv", &[0xd9, 0x26], &[], &[0x037f, 0, 0xffff]),
     case("fnsave", &[0xdd, 0x37], &[], &[]),
     case("frstor", &[0xdd, 0x26], &[], &[0x037f, 0, 0xffff]),
+    // One case per rollback group of its own (`paging::Groups`), each
+    // writing a value its state does not already hold: GDTR and IDTR
+    // (limits 3Fh and 3FFh), TR and the TSS busy bit, CR0.MP, the x87
+    // control word. The segment, task and x87 image cases are above. Each
+    // group write is its instruction's last effect, after every access, so
+    // a group missing from a rollback image shows only in a debug build,
+    // where every preview and commit checks the groups left out
+    // (`paging::Untouched::check`); the commit writes the same value again.
+    // Only the x87 group is also release-visible: "fld m64" from a device
+    // page loads the preview's placeholder into the stack before the
+    // handoff, and only the image puts it back.
+    case("lgdt", &[0x0f, 0x01, 0x16], &[], &[GDT << 16 | 0x3f, 0]),
+    case("lidt", &[0x0f, 0x01, 0x1e], &[], &[IDT << 16 | 0x3ff, 0]),
+    case("ltr", &[0x0f, 0x00, 0x1e], &[], &[NEW_TSS_SELECTOR]),
+    case("lmsw", &[0x0f, 0x01, 0x36], &[], &[0x13]),
+    case("fldcw", &[0xd9, 0x2e], &[], &[0x027f]),
 ];
 
 const fn case(
@@ -441,12 +457,12 @@ fn rollback_at_every_page(model: CpuModel) -> (usize, usize) {
 
 #[test]
 fn every_operand_page_fault_and_device_handoff_restarts_exactly_386() {
-    assert_eq!(rollback_at_every_page(CpuModel::I80386), (202, 145));
+    assert_eq!(rollback_at_every_page(CpuModel::I80386), (222, 159));
 }
 
 #[test]
 fn every_operand_page_fault_and_device_handoff_restarts_exactly_486() {
-    assert_eq!(rollback_at_every_page(CpuModel::I80486Dx), (210, 153));
+    assert_eq!(rollback_at_every_page(CpuModel::I80486Dx), (230, 167));
 }
 
 /// A task switch whose incoming DS is not present faults after its commit

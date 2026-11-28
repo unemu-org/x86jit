@@ -662,7 +662,7 @@ pub enum X87PointerModel {
 }
 
 /// Captured at handoff so a store retry never repeats a device read.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct PortStringIn {
     pub rip: u64,
