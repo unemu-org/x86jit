@@ -244,6 +244,11 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     }
 
     #[cfg(test)]
+    pub(super) fn keys(&self) -> impl Iterator<Item = &K> {
+        self.proofs.keys()
+    }
+
+    #[cfg(test)]
     pub(super) fn values(&self) -> impl Iterator<Item = &V> {
         self.proofs.values().map(|(proof, ..)| proof)
     }

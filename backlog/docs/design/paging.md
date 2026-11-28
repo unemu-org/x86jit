@@ -392,13 +392,36 @@ A20 or model change) advances the generation the same way, so every proof walks
 its code pages again; only an explicit invalidation (the embedder's, a reset, a
 mapping change) drops them. Physical SMC invalidation expires their
 publication generation. CR0.MP/EM/TS are not part of the paged proof
-identity: ESC and WAIT test them when they execute. Replacing a data or stack
+identity: ESC and WAIT test them when they execute. A paged Flat32 proof's context
+identity is reduced to what its lift reads (decision-20 amendment of 2026-11-28,
+accepted; xj-to9.75): the model, CR0.PE/AM/PG, the CPL, A20, the reset-fetch and
+NEC state, the D/B bits of CS, DS, ES and SS, and the class. Selectors, descriptor
+tables, TR, IOPL/NT, the FS and GS caches and CR3 are left to the key (the frame,
+CR0) or read live, so flat kernel code keeps its proofs across data-segment
+reloads, and its id is the identity itself, packed into one word. A paged proof
+key names the bus address the block's first byte translates to (through a TLB
+entry that permits the fetch, or the walk the fetch would make), not CR3: a
+kernel mapped to the same frames in every directory has one proof per block, and
+a linear address another directory maps elsewhere is another key. Paged Segmented, Checked and V86 identities keep the complete stamp
+in a 64-entry table. A stamp that table evicts keeps its id and its proofs: the id
+goes to a retired map of up to 4096 stamps, and an equal stamp that returns gets it
+back, so equal stamps never fork their keys. A full retired map forgets its least
+recently used stamp with that stamp's proofs, one per eviction. The two maps hold at
+most 4,160 stamps of about 200 bytes, about 0.9 MB per vCPU, beside the proof map's
+bound of 16384 blocks or 32 MiB of IR and instruction tables (measured paged blocks
+weigh 1.1-1.3 KiB). That budget leaves out each proof's map entry, page list, code
+registration and source-index entries, so real use is higher; with the unpaged
+map's own 32 MiB, a vCPU that fills both holds about 64 MiB of counted bytes plus
+that overhead. Replacing a data or stack
 entry expires nothing: no proof depends on it, and a fetch through that page
 later walks and marks its own entry (xj-to9.21). This
 also permits the architecturally allowed stale mapping until invalidation or
 replacement; ordinary page-table stores do not independently revoke a token.
-A block lifted at linear L under directory A cannot execute under directory
-B; CR3 alone is also insufficient after equal-value reload, INVLPG or remapping.
+A block lifted at linear L under directory A executes under directory B only
+when B maps every code page of the block to the frames it was fetched from (the
+key names the first byte's frame, and the other pages translate again, xj-to9.75);
+CR3 alone
+is also insufficient after equal-value reload, INVLPG or remapping.
 If a TLB eviction causes a new mapping inside one generation, fresh fetch and
 physical-span identity must reject the old proof even when the bytes are equal.
 Avoid unbounded generation-keyed cache growth: flush/drop paged entries when

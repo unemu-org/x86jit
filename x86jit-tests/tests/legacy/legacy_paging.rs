@@ -1090,11 +1090,13 @@ fn paged_fetch_tlb_eviction_replaces_equal_byte_physical_proof() {
             f.fetch_at(0x400).unwrap();
             let after = f.cpu.paging_cache_for_test();
             assert!(after.0 > before.0);
-            // The 102500h proof stays: its own page still translates.
-            assert_eq!(after.1, before.1 + 1);
+            // The 102500h proof stays: its own page still translates. So
+            // does the old frame's proof, keyed by that frame (xj-to9.75),
+            // its bytes guarded there, until a write or the bound drops it.
+            assert_eq!(after.1, before.1 + 2);
             assert_eq!(after.2, before.2 + 2);
             assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
-            assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+            assert!(f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
             f.vm.write_bytes(u64::from(OTHER_FRAME) + 0x401, &[0x22])
                 .unwrap();
             f.fetch_at(0x400).unwrap();
@@ -1183,9 +1185,10 @@ fn paged_invlpg_of_a_data_page_keeps_proofs_and_of_a_code_page_takes_its_new_fra
         assert_eq!(f.cpu.cpu.gpr[0] & 0xff, 0x22);
         let after = f.cpu.paging_cache_for_test();
         assert_eq!(after.2, before.2 + 1);
-        assert_eq!(after.1, before.1);
+        // The old frame keeps its proof, keyed by that frame (xj-to9.75).
+        assert_eq!(after.1, before.1 + 1);
         assert!(f.vm.mem.is_code_page(u64::from(OTHER_FRAME >> 12)));
-        assert!(!f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
+        assert!(f.vm.mem.is_code_page(u64::from(CODE_FRAME >> 12)));
     }
 }
 
@@ -1319,11 +1322,14 @@ fn paged_user_code_page_made_supervisor_faults_cpl3_fetch_after_invlpg() {
 }
 
 #[test]
-fn paged_context_table_evicts_the_least_recent_identity_and_only_its_proofs() {
-    // Paging design §3.5 bounded retention (xj-to9.70): more paged context
-    // stamps than the 64 retained (here a data selector per stamp, as a
-    // guest's processes bring their own) evict the least recently used
-    // identity and its proofs; the hot identity keeps its proof.
+fn paged_context_table_evicts_the_least_recent_identity_and_keeps_its_proofs() {
+    // Paging design §3.5 bounded retention (xj-to9.70, xj-to9.75): more
+    // paged context stamps than the 64 retained (here a data selector per
+    // stamp of the Checked reference entry, which keeps the complete stamp,
+    // as a guest's processes bring their own) evict the least recently used
+    // identity from the table; the hot identity keeps its proof. An evicted
+    // stamp keeps its id and its proofs: when it returns it lifts nothing,
+    // so an equal stamp never forks its keys.
     for model in MODELS {
         let mut f = Fixture::new(model, true, 0);
         f.code_mapping(0, CODE_FRAME);
@@ -1348,10 +1354,17 @@ fn paged_context_table_evicts_the_least_recent_identity_and_only_its_proofs() {
                     "hot proof lost at {i}"
                 );
             }
-            assert!(f.cpu.paging_cache_for_test().1 <= 65);
         }
         // Every cold identity lifted its NOP once, the hot one nothing.
         assert_eq!(f.cpu.paging_cache_for_test().2, start + COLD);
+        // The first cold identities were evicted long ago; their proofs
+        // and ids remain.
+        for i in 0..8 {
+            f.cpu.cpu.ds = 0x100 + 8 * i as u16;
+            f.fetch_at(0x600).unwrap();
+        }
+        assert_eq!(f.cpu.paging_cache_for_test().2, start + COLD);
+        assert_eq!(f.cpu.paging_cache_for_test().1, 1 + COLD as usize);
     }
 }
 
@@ -1423,6 +1436,8 @@ fn paged_fetch_proofs_are_bounded_and_reset_discards_them() {
     // Bounded retention/reset are derived-state policies (paging design §§3.5, 3.7).
     for model in MODELS {
         let mut f = Fixture::new(model, true, 0);
+        // The bound at 4096 of its 16384 (xj-to9.75), so two pages exceed it.
+        f.cpu.set_paged_proof_bound_for_test(4096);
         // Two code pages of INC EAX: more one-byte proofs than the 4096 kept.
         f.code_mapping(0, CODE_FRAME);
         f.code_mapping(0x1000, 0xd000);
@@ -5074,6 +5089,14 @@ fn tlb_cpl_denial_handler_repairs_pte_and_iret_retries_fetch() {
 
 #[test]
 fn paged_context_capacity_is_bounded_without_expiring_translations() {
+    // xj-to9.75: 4,400 stamps (one data selector each) pass through the 64
+    // retained identities and the 4,096 retired ones without a TLB
+    // generation advance. A full retired map forgets a stamp with its
+    // proofs, so the stamps held bound the proofs (one each here, below the
+    // paged map's own bound); a stamp evicted from the table returns to its
+    // id and proof, and the first one, which the full retired map has
+    // forgotten, lifts again.
+    const STAMPS: u16 = 4400;
     for model in MODELS {
         let mut f = Fixture::new(model, true, 0);
         f.code_mapping(0, CODE_FRAME);
@@ -5081,15 +5104,20 @@ fn paged_context_capacity_is_bounded_without_expiring_translations() {
             .unwrap();
         f.fetch_at(0x400).unwrap();
         let generation = f.cpu.paging_cache_for_test().0;
-        for selector in 1..=80 {
+        for selector in 1..STAMPS {
             f.cpu.cpu.ds = selector;
             f.fetch_at(0x400).unwrap();
             let proof = f.cpu.paging_cache_for_test();
             assert_eq!(proof.0, generation);
-            assert!(proof.1 <= 64);
+            assert!(proof.1 <= 64 + 4096, "{} proofs at {selector}", proof.1);
         }
-        f.cpu.cpu.ds = 0;
         let lifts = f.cpu.paging_cache_for_test().2;
+        assert_eq!(lifts, u64::from(STAMPS));
+        // Evicted from the table 100 stamps ago, still retired.
+        f.cpu.cpu.ds = STAMPS - 100;
+        f.fetch_at(0x400).unwrap();
+        assert_eq!(f.cpu.paging_cache_for_test().2, lifts);
+        f.cpu.cpu.ds = 0;
         f.fetch_at(0x400).unwrap();
         assert_eq!(f.cpu.paging_cache_for_test().2, lifts + 1);
     }

@@ -225,8 +225,8 @@ fn reloading_fs_keeps_flat32_proofs() {
 }
 
 /// A paged loop: a hot inner loop of 10 blocks, which links, then a sweep
-/// of 4200 blocks, more than the 4096 paged proofs kept, each adding its own
-/// immediate. The sweep fills the map, which drops a quarter of its proofs
+/// of 4200 blocks, more than the 4096 paged proofs a test bound keeps, each
+/// adding its own immediate. The sweep fills the map, which drops a quarter of its proofs
 /// (the links into them end with the map's version); the hot loop entered
 /// again relinks, and every block executes its own bytes, so the sum is
 /// exact, and most sweep proofs stay (xj-to9.53).
@@ -274,6 +274,8 @@ fn a_full_paged_proof_map_drops_a_quarter_and_relinks() {
     }
     cpu.cpu.legacy.cr3 = PD;
     cpu.cpu.legacy.cr0 = 0x8000_0001;
+    // The bound at 4096 of its 16384 (xj-to9.75), so the sweep exceeds it.
+    cpu.set_paged_proof_bound_for_test(4096);
     vm.relift_diagnostics(true);
     Vcpu::take_machine_counters_for_test();
     run(&vm, &mut cpu);
@@ -414,4 +416,84 @@ fn a_paged_loop_that_turns_the_tlb_over_lifts_each_block_once() {
     assert_eq!(d.keys.keys, d.keys.sites, "{d}");
     // The dispatcher's context notes reach the paged diagnostics.
     assert!(d.contexts.switches >= u64::from(ITERATIONS), "{d}");
+}
+
+/// The churn loop's rotating variants (xj-to9.75, `paged_churn::setup_with`):
+/// each iteration first loads DS, ES, FS and GS from a table of flat aliases,
+/// non-flat data segments and the null selector, as a kernel's 16-bit and
+/// V86 transitions do. Flat ring-0 code keeps its paged proofs across those
+/// reloads; the Segmented phases, where ES is not flat, keep the complete
+/// stamp, which names every cache and selector. After two passes over the
+/// table, a run five times longer lifts only the sweep's wrap blocks (once
+/// per 51 iterations) under the Segmented sets that had not wrapped yet.
+/// The 128-set table cycles through more Segmented stamps than the 64
+/// retained identities: an evicted stamp keeps its id and its proofs, so
+/// no key is ever lifted twice (distinct keys equal lifts).
+#[test]
+fn a_paged_loop_that_reloads_its_data_segments_keeps_its_flat_proofs() {
+    use x86jit_tests::paged_churn;
+    let lifts = |rotations: u32, iterations: u32| {
+        let (vm, mut cpu) = paged_churn::setup_with(CpuModel::I80486Dx, iterations, rotations);
+        vm.relift_diagnostics(true);
+        run(&vm, &mut cpu);
+        let d = vm.relift_diagnostics(true);
+        assert_eq!(
+            cpu.retired_instructions(),
+            paged_churn::expected_retired_with(iterations, rotations),
+            "{d}"
+        );
+        assert_eq!(cpu.cpu.gpr[5] as u32, paged_churn::expected_sum(iterations));
+        let paged = Some(ProofClass::Paged);
+        let first = d.lifts(paged, ReliftCause::First);
+        assert_eq!(d.total(paged), first, "{d}");
+        assert_eq!(d.keys.keys as u64, first, "{d}");
+        first
+    };
+    for (rotations, bound) in [(paged_churn::ROTATE, 300), (paged_churn::ROTATE_MANY, 2400)] {
+        let short = lifts(rotations, 2 * rotations);
+        let long = lifts(rotations, 10 * rotations);
+        // At most the wrap's blocks (the JB fall-through, its MOV and the
+        // alias blocks after it), per wrap of the long run.
+        let wraps = u64::from(10 * rotations / 51 + 1);
+        assert!(long >= short && long - short <= 3 * wraps, "{short} {long}");
+        // Most are the Segmented phases' blocks, once per set. With the
+        // complete stamp the Flat32 blocks lifted under every set too, and
+        // the sets outran the 64 retained identities: about 25 lifts per
+        // iteration, under ever new identity ids.
+        assert!(short < bound, "{short}");
+    }
+}
+
+/// The churn loop's wide variant (xj-to9.75, `paged_churn::setup_wide`): a
+/// flat ring-0 kernel loop of many blocks, entered under one of several
+/// page directories that all map it to the same frames, as a kernel runs
+/// under each process's address space. The paged proof key names the frame
+/// its first byte is fetched from, not CR3, so each block is lifted once
+/// whatever the CR3; 5000 blocks, more than the 4096 the paged map held
+/// before, stay proved without a bound sweep.
+#[test]
+fn a_kernel_under_many_address_spaces_lifts_each_block_once() {
+    use x86jit_tests::paged_churn;
+    for (blocks, directories) in [(512, 8), (5000, 1)] {
+        const ITERATIONS: u32 = 16;
+        let (vm, mut cpu) =
+            paged_churn::setup_wide(CpuModel::I80486Dx, ITERATIONS, blocks, directories);
+        vm.relift_diagnostics(true);
+        run(&vm, &mut cpu);
+        let d = vm.relift_diagnostics(true);
+        assert_eq!(
+            cpu.retired_instructions(),
+            paged_churn::expected_retired_wide(ITERATIONS, blocks),
+            "{d}"
+        );
+        let paged = Some(ProofClass::Paged);
+        let first = d.lifts(paged, ReliftCause::First);
+        assert_eq!(d.total(paged), first, "{d}");
+        // Each block once, the loop's tail, and an entry where a page
+        // boundary splits a block (one per 4 KiB page of 512 blocks).
+        assert!(
+            first <= u64::from(blocks + blocks / 64 + 16),
+            "{blocks} {directories}: {first}"
+        );
+    }
 }

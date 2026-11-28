@@ -10,11 +10,22 @@
 //! IRETD into a short V86 body whose IN traps to a ring-0 #GP monitor; and a
 //! second flat data selector, so the loop runs under several context stamps.
 //!
+//! The rotating variants (`setup_with(.., ROTATE)` and `ROTATE_MANY`,
+//! xj-to9.75) also model the data-segment reloads of an operating system's
+//! 16-bit and V86 transitions: each iteration first loads DS, ES, FS and GS
+//! from a table of 32 or 128 entries, DS with one of four flat aliases, ES
+//! with a flat alias or a byte-granular data segment, FS and GS with the
+//! null selector, a flat alias or a non-flat data segment. The same kernel
+//! code then runs under that many data segment sets, Flat32 while ES is flat
+//! and Segmented while it is not. `ROTATE` keeps under 64 distinct Segmented
+//! stamps; `ROTATE_MANY` (five non-flat ES of eight) cycles through about
+//! 240, more than the 64 paged identities retained, so they are evicted.
+//!
 //! Layout (identity-mapped, every page user/writable): GDT at 500h, IDT at
 //! 800h, ring-0 stack below 9000h, TSS at 5000h, kernel code at 10000h, V86
 //! code at 20000h (CS 2000h), the #GP monitor at 30000h, V86 data and stack at
-//! 40000h (DS = SS = 4000h), page directory 1000h, tables 2000h-3fffh, and
-//! the sweep at 100000h-4fffffh.
+//! 40000h (DS = SS = 4000h), page directory 1000h, tables 2000h-3fffh, the
+//! selector table at 7100h, and the sweep at 100000h-4fffffh.
 use x86jit_core::legacy::{SegmentCache, SystemSegment};
 use x86jit_core::{CpuModel, CpuState, Prot, RegionKind, Vcpu, Vm, VmConfig};
 
@@ -34,14 +45,61 @@ const SWEEP_END: u32 = 0x50_0000;
 /// Data pages each iteration reads, one block each.
 pub const READS: u32 = 20;
 const STACK: u32 = 0x9000;
+/// The rotating variants' selector table: entries of DS, ES, FS and GS, one
+/// word each.
+const TABLE: u32 = 0x7100;
+/// `setup_with` without rotation.
+pub const FIXED: u32 = 0;
+/// `setup_with` rotating through 32 data segment sets.
+pub const ROTATE: u32 = 32;
+/// `setup_with` rotating through 128 data segment sets.
+pub const ROTATE_MANY: u32 = 128;
+
+/// Entry `i` of a table of `rotations`: DS, ES, FS, GS. 10h, 18h, 28h and
+/// 30h are flat data; 38h, 48h, 50h, 58h and 60h byte-granular 32-bit data
+/// segments at 7800h, 7900h, 7A00h, 7B00h and 7C00h, 40h a 16-bit one at
+/// 7C00h; 0 is the null selector, which FS and GS may hold.
+fn rotation(i: u32, rotations: u32) -> [u16; 4] {
+    const DS: [u16; 4] = [0x10, 0x18, 0x28, 0x30];
+    const ES: [u16; 8] = [0x10, 0x18, 0x28, 0x38, 0x48, 0x50, 0x58, 0x60];
+    const FS_GS: [u16; 4] = [0, 0x10, 0x38, 0x40];
+    let i = i as usize;
+    if rotations == ROTATE_MANY {
+        return [
+            DS[i % 4],
+            ES[(i / 4) % 8],
+            FS_GS[(i / 32) % 4],
+            FS_GS[(i / 2) % 4],
+        ];
+    }
+    [
+        DS[i % 4],
+        ES[(i / 4) % 4],
+        FS_GS[(i / 16) % 2 + 2 * (i % 2)],
+        FS_GS[(i / 2) % 4],
+    ]
+}
 
 /// The kernel loop: `iterations` in EDI; HLT at ring 0 when done.
-fn kernel() -> Vec<u8> {
+fn kernel(rotations: u32) -> Vec<u8> {
     use iced_x86::code_asm::*;
     let mut a = CodeAssembler::new(32).unwrap();
     let mut top = a.create_label();
     let mut swept = a.create_label();
     a.set_label(&mut top).unwrap();
+    if rotations != FIXED {
+        // This iteration's data segments, DS last: the table is read
+        // through the flat DS the monitor loaded.
+        a.mov(eax, edi).unwrap();
+        a.and(eax, (rotations - 1) as i32).unwrap();
+        for (k, segment) in [(1, es), (2, fs), (3, gs)] {
+            a.movzx(ecx, word_ptr(eax * 8 + (TABLE + 2 * k) as i32))
+                .unwrap();
+            a.mov(segment, ecx).unwrap();
+        }
+        a.movzx(ecx, word_ptr(eax * 8 + TABLE as i32)).unwrap();
+        a.mov(ds, ecx).unwrap();
+    }
     for k in 0..READS {
         // One block per data page: read it, fold it in, end the block.
         let mut next = a.create_label();
@@ -138,17 +196,27 @@ fn monitor(back: u32) -> Vec<u8> {
 
 /// A VM and a vCPU at the kernel loop's entry, ring 0, paged, for `model`.
 pub fn setup(model: CpuModel, iterations: u32) -> (Vm, Vcpu) {
+    setup_with(model, iterations, FIXED)
+}
+
+/// `setup` (`FIXED`), or a rotating variant (`ROTATE`, `ROTATE_MANY`), which
+/// loads DS, ES, FS and GS from the selector table at the top of each
+/// iteration.
+pub fn setup_with(model: CpuModel, iterations: u32, rotations: u32) -> (Vm, Vcpu) {
+    assert!(matches!(rotations, FIXED | ROTATE | ROTATE_MANY));
     let mut vm = Vm::new(VmConfig::flat(MEMORY));
     vm.set_cpu_model(model);
     vm.map(0, MEMORY as usize, Prot::RWX, RegionKind::Ram)
         .unwrap();
-    let code = kernel();
+    let code = kernel(rotations);
     vm.write_bytes(u64::from(KERNEL), &code).unwrap();
     vm.write_bytes(u64::from(V86_CS) << 4, &v86()).unwrap();
     vm.write_bytes(u64::from(MONITOR), &monitor(kernel_back(&code)))
         .unwrap();
-    // GDT (SDM Vol 3A §3.4.5): 8 flat ring-0 code, 10h and 18h flat data,
-    // 20h the busy 32-bit TSS at 5000h.
+    // GDT (SDM Vol 3A §3.4.5): 8 flat ring-0 code, 10h, 18h, 28h and 30h
+    // flat data, 20h the busy 32-bit TSS at 5000h, 38h data at 7800h (limit
+    // 7FFh, B set, G clear), 40h data at 7C00h (limit 3FFh, B clear), 48h,
+    // 50h, 58h and 60h data at 7900h, 7A00h, 7B00h and 7C00h (B set).
     vm.write_bytes(0x508, &0x00cf_9b00_0000_ffffu64.to_le_bytes())
         .unwrap();
     vm.write_bytes(0x510, &0x00cf_9300_0000_ffffu64.to_le_bytes())
@@ -157,6 +225,23 @@ pub fn setup(model: CpuModel, iterations: u32) -> (Vm, Vcpu) {
         .unwrap();
     vm.write_bytes(0x520, &0x0000_8b00_5000_0067u64.to_le_bytes())
         .unwrap();
+    for (at, descriptor) in [
+        (0x528, 0x00cf_9300_0000_ffffu64),
+        (0x530, 0x00cf_9300_0000_ffff),
+        (0x538, 0x0040_9300_7800_07ff),
+        (0x540, 0x0000_9300_7c00_03ff),
+        (0x548, 0x0040_9300_7900_06ff),
+        (0x550, 0x0040_9300_7a00_05ff),
+        (0x558, 0x0040_9300_7b00_04ff),
+        (0x560, 0x0040_9300_7c00_03ff),
+    ] {
+        vm.write_bytes(at, &descriptor.to_le_bytes()).unwrap();
+    }
+    let table: Vec<u8> = (0..rotations)
+        .flat_map(|i| rotation(i, rotations))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    vm.write_bytes(u64::from(TABLE), &table).unwrap();
     // IDT vector 13: 32-bit interrupt gate, DPL 0, to 8:MONITOR.
     let gate =
         u64::from(MONITOR & 0xffff) | (8 << 16) | (0x8e00 << 32) | (u64::from(MONITOR >> 16) << 48);
@@ -212,7 +297,7 @@ pub fn setup(model: CpuModel, iterations: u32) -> (Vm, Vcpu) {
         };
     }
     cpu.cpu.legacy.gdtr.base = 0x500;
-    cpu.cpu.legacy.gdtr.limit = 0x27;
+    cpu.cpu.legacy.gdtr.limit = 0x67;
     cpu.cpu.legacy.idtr.base = 0x800;
     cpu.cpu.legacy.idtr.limit = 0x7ff;
     cpu.cpu.legacy.tr = SystemSegment {
@@ -240,7 +325,15 @@ pub fn setup(model: CpuModel, iterations: u32) -> (Vm, Vcpu) {
 /// in V86 (the faulting IN retires none), 7 in the monitor, CLTS, 2 for the
 /// CR3 reload, DEC, JNZ.
 pub fn expected_retired(iterations: u32) -> u64 {
-    let per = 3 * u64::from(READS) + 4 + 6 + 3 + 10 + 4 + 7 + 5;
+    expected_retired_with(iterations, FIXED)
+}
+
+/// `expected_retired` of `setup_with`: a rotating variant adds 10 per
+/// iteration (MOV, AND, then a MOVZX and a segment load for each of ES, FS,
+/// GS and DS).
+pub fn expected_retired_with(iterations: u32, rotations: u32) -> u64 {
+    let rotate = if rotations == FIXED { 0 } else { 10 };
+    let per = 3 * u64::from(READS) + 4 + 6 + 3 + 10 + 4 + 7 + 5 + rotate;
     let pages = (SWEEP_END - SWEEP) / 0x1000;
     let mut start = 0;
     let mut wraps = 0;
@@ -272,4 +365,86 @@ pub fn expected_sum(iterations: u32) -> u32 {
         }
     }
     sum
+}
+
+/// The wide variant (xj-to9.75): a flat ring-0 loop of `blocks` blocks
+/// (ADD EBP,EBX; INC EBX; JMP to the next), then a CR3 load from a table of
+/// `directories` page directories that all map the same identity tables,
+/// as a kernel entered from many processes runs the same code under each
+/// address space. Its working set is `blocks` code blocks under
+/// `directories` CR3 values. Directories at 8000h + 1000h k, the CR3 table
+/// at 7000h, the stack below 80000h, the code at 100000h.
+pub fn setup_wide(model: CpuModel, iterations: u32, blocks: u32, directories: u32) -> (Vm, Vcpu) {
+    use iced_x86::code_asm::*;
+    assert!(directories.is_power_of_two() && directories <= 32);
+    let mut vm = Vm::new(VmConfig::flat(MEMORY));
+    vm.set_cpu_model(model);
+    vm.map(0, MEMORY as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    for _ in 0..blocks {
+        let mut next = a.create_label();
+        a.add(ebp, ebx).unwrap();
+        a.inc(ebx).unwrap();
+        a.jmp(next).unwrap();
+        a.set_label(&mut next).unwrap();
+    }
+    // 80386 PRM §5.2.5 p. 5-11: the load flushes the TLB.
+    a.mov(eax, edi).unwrap();
+    a.and(eax, (directories - 1) as i32).unwrap();
+    a.mov(eax, dword_ptr(eax * 4 + 0x7000)).unwrap();
+    a.mov(cr3, eax).unwrap();
+    a.dec(edi).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    let code = a.assemble(0x10_0000).unwrap();
+    vm.write_bytes(0x10_0000, &code).unwrap();
+    // 80386 PRM §5.2 pp. 5-7-11: each directory names the same two tables,
+    // which identity-map 8 MiB, present, writable, user.
+    let mut entries = Vec::with_capacity(8 * 1024);
+    for page in 0..(MEMORY >> 12) as u32 {
+        entries.extend(((page << 12) | 7).to_le_bytes());
+    }
+    vm.write_bytes(0x2000, &entries).unwrap();
+    for k in 0..directories {
+        let directory = 0x8000 + 0x1000 * k;
+        for table in 0..2u32 {
+            vm.write_bytes(
+                u64::from(directory + 4 * table),
+                &((0x2000 + 0x1000 * table) | 7).to_le_bytes(),
+            )
+            .unwrap();
+        }
+        vm.write_bytes(u64::from(0x7000 + 4 * k), &directory.to_le_bytes())
+            .unwrap();
+    }
+    let mut cpu = vm.new_vcpu();
+    cpu.cpu.legacy.cr0 = 0x8000_0011;
+    cpu.cpu.legacy.cr3 = 0x8000;
+    cpu.cpu.legacy.cpl = 0;
+    cpu.cpu.cs = 8;
+    cpu.cpu.ds = 0x10;
+    cpu.cpu.es = 0x10;
+    cpu.cpu.ss = 0x10;
+    for (i, cache) in cpu.cpu.legacy.segments.iter_mut().enumerate() {
+        *cache = SegmentCache {
+            base: 0,
+            limit: u32::MAX,
+            attributes: (if i == 0 { 0x9b } else { 0x93 }) | 0x4000 | 0x8000,
+            ..Default::default()
+        };
+    }
+    cpu.set_a20_enabled(true);
+    cpu.cpu.rip = 0x10_0000;
+    cpu.cpu.gpr[4] = 0x8_0000;
+    cpu.cpu.gpr[7] = u64::from(iterations);
+    (vm, cpu)
+}
+
+/// Guest instructions `setup_wide` retires: 3 per block and 6 per
+/// iteration, and the final HLT.
+pub fn expected_retired_wide(iterations: u32, blocks: u32) -> u64 {
+    (3 * u64::from(blocks) + 6) * u64::from(iterations) + 1
 }

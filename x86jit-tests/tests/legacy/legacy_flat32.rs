@@ -1454,11 +1454,11 @@ fn cpl3_block_lifted_before_am_is_not_reused_after_the_kernel_sets_it() {
                 let (run, lifts, _) = steps(&mut cpu, 2);
                 assert_eq!(run.steps(), 2, "{case}");
                 // The IRET loads CS and SS caches with G set (C0FBh, C0F3h)
-                // where the entry had it clear: an unpaged Flat32 identity
-                // names neither G nor the selectors (xj-to9.56), so the
-                // entry's proof serves the return; the paged and Checked
-                // identities name the whole stamp and lift again.
-                if paged || checked {
+                // where the entry had it clear: a Flat32 identity, unpaged
+                // or paged, names neither G nor the selectors (xj-to9.56,
+                // xj-to9.75), so the entry's proof serves the return; the
+                // Checked identity names the whole stamp and lifts again.
+                if checked {
                     assert_ne!(lifts, 0, "{case}: the block's first lift after a return");
                 } else {
                     assert_eq!(lifts, 0, "{case}: the entry's proof serves the return");
@@ -1674,17 +1674,19 @@ fn paged_context_instructions_keep_translation_and_reuse_blocks() {
 fn paged_smc_expires_blocks_in_every_retained_context_without_flushing_tlb() {
     for model in [CpuModel::I80386, CpuModel::I80486Dx] {
         let (vm, mut cpu) = paged_setup(model, b"\x40\xeb\xfd", false);
-        for flags in [0, 0x3000] {
+        // Two contexts: Flat32, and Segmented by a 64 KiB DS limit (a paged
+        // Flat32 identity leaves IOPL to live checks, xj-to9.75).
+        for limit in [u32::MAX, 0xffff] {
             cpu.cpu.rip = 0x1000;
-            cpu.cpu.rflags_system = flags;
+            cpu.cpu.legacy.segments[1].limit = limit;
             fixture::steps(&mut cpu, &vm, 1);
         }
         let before = cpu.paging_cache_for_test();
         assert_eq!(before.1, 2);
         vm.write_bytes(0x1000, b"\x43").unwrap(); // INC EBX in both contexts.
-        for flags in [0, 0x3000] {
+        for limit in [u32::MAX, 0xffff] {
             cpu.cpu.rip = 0x1000;
-            cpu.cpu.rflags_system = flags;
+            cpu.cpu.legacy.segments[1].limit = limit;
             let eax = cpu.cpu.gpr[0];
             let ebx = cpu.cpu.gpr[3];
             fixture::steps(&mut cpu, &vm, 1);
@@ -1768,6 +1770,21 @@ fn second_gdt(vm: &Vm, cpu: &mut Vcpu) {
 // under Flat32 and Segmented.
 #[test]
 fn a_reduced_identity_reuses_its_proofs_exactly() {
+    reduced_identity_cases(false);
+}
+
+// xj-to9.75: a paged Flat32 identity leaves out the same fields, and the
+// same cases reuse their proofs under paging (identity pages, 80386 PRM
+// §5.2), MOV from CR3 too: its state B loads another directory that maps
+// the code to the same frame, and the paged proof key names the frame, not
+// CR3. Paged Segmented identities keep the complete stamp, so only Flat32
+// runs.
+#[test]
+fn a_paged_reduced_identity_reuses_its_proofs_exactly() {
+    reduced_identity_cases(true);
+}
+
+fn reduced_identity_cases(paged: bool) {
     let cases = [
         ReuseCase {
             name: "CLI/STI, IOPL",
@@ -1920,7 +1937,13 @@ fn a_reduced_identity_reuses_its_proofs_exactly() {
             user: false,
             budget: 1,
             a: |_, _| {},
-            b: |_, c| c.cpu.legacy.cr3 = 0x7000,
+            b: |vm, c| {
+                if c.cpu.legacy.cr0 & (1 << 31) != 0 {
+                    // Paged: 7000h holds a copy of the directory.
+                    put(vm, 0x7000, get(vm, PD));
+                }
+                c.cpu.legacy.cr3 = 0x7000;
+            },
         },
         ReuseCase {
             name: "FLD1, CR0.TS",
@@ -1947,6 +1970,9 @@ fn a_reduced_identity_reuses_its_proofs_exactly() {
     // Segmented (64 KiB data and stack limits) as well as Flat32: its
     // identity also names the caches, so only the G and A case lifts again.
     for segmented in [false, true] {
+        if paged && segmented {
+            continue;
+        }
         let class_of = if segmented {
             SegmentClass::Segmented
         } else {
@@ -1956,7 +1982,9 @@ fn a_reduced_identity_reuses_its_proofs_exactly() {
             let name = format!("{} ({class_of:?})", case.name);
             let caches = case.name.contains("G and A");
             let (vm, mut warm) = if case.user {
-                user_setup(CpuModel::I80486Dx, case.code, false, false)
+                user_setup(CpuModel::I80486Dx, case.code, paged, false)
+            } else if paged {
+                paged_setup(CpuModel::I80486Dx, case.code, false)
             } else {
                 setup(CpuModel::I80486Dx, case.code, false)
             };
@@ -2004,6 +2032,199 @@ fn a_reduced_identity_reuses_its_proofs_exactly() {
                 "{name}"
             );
             assert_eq!(warm_memory, cold_memory, "{name}");
+        }
+    }
+}
+
+/// One witness case of `a_paged_flat32_proof_checks_the_segments_it_reads`:
+/// the code, its step budget, the two states, whether state B lifts again,
+/// and the exception it raises, if any.
+struct SegmentCase {
+    name: &'static str,
+    code: &'static [u8],
+    budget: u64,
+    a: fn(&Vm, &mut Vcpu),
+    b: fn(&Vm, &mut Vcpu),
+    relifts: bool,
+    raises: Option<u8>,
+}
+
+/// A 32-bit writable data cache at `base` with inclusive `limit` (SDM Vol 3A
+/// §3.4.5: B set, G clear, so the limit is byte-granular).
+fn data_cache(base: u32, limit: u32) -> x86jit_core::SegmentCache {
+    x86jit_core::SegmentCache {
+        base,
+        limit,
+        attributes: 0x4093,
+        ..Default::default()
+    }
+}
+
+fn set_segment(c: &mut Vcpu, segment: usize, base: u32, limit: u32) {
+    c.cpu.legacy.segments[segment] = data_cache(base, limit);
+}
+
+// xj-to9.75: a paged Flat32 identity leaves out every data-segment field
+// but D/B, so a proof whose block reads a segment must check it. Lifted
+// under state A, the same code runs under state B, which changes one
+// segment the block reads, and must do what a vCPU that never saw A does:
+// FS and GS overrides read the live caches (`Address` ops) and keep the
+// proof through a base change, a limit that now faults (#GP(0), SDM Vol 3A
+// §6.3) and a null selector (§3.4.2); a DS, ES or SS cache that is no
+// longer flat makes the state Segmented, which lifts again with the new
+// cache: a moved base, a DS or ES limit the operand or string element now
+// exceeds (#GP(0)), a stack limit PUSH now exceeds (#SS(0), §6.3).
+#[test]
+fn a_paged_flat32_proof_checks_the_segments_it_reads() {
+    const FS: usize = 4;
+    const GS: usize = 5;
+    let cases = [
+        SegmentCase {
+            name: "FS override load, base",
+            // MOV EAX,FS:[10h]; NOP.
+            code: b"\x64\x8b\x05\x10\x00\x00\x00\x90",
+            budget: 2,
+            a: |_, c| set_segment(c, FS, 0x6000, 0xfff),
+            b: |_, c| set_segment(c, FS, 0x6800, 0xfff),
+            relifts: false,
+            raises: None,
+        },
+        SegmentCase {
+            name: "FS override load, limit",
+            code: b"\x64\x8b\x05\x10\x00\x00\x00\x90",
+            budget: 2,
+            a: |_, c| set_segment(c, FS, 0x6000, 0xfff),
+            b: |_, c| set_segment(c, FS, 0x6000, 0x11),
+            relifts: false,
+            raises: Some(13),
+        },
+        SegmentCase {
+            name: "GS override store, null",
+            // MOV GS:[10h],EAX; NOP.
+            code: b"\x65\x89\x05\x10\x00\x00\x00\x90",
+            budget: 2,
+            a: |_, c| set_segment(c, GS, 0x6000, 0xfff),
+            b: |_, c| {
+                c.cpu.gs = 0;
+                c.cpu.legacy.segments[GS] = x86jit_core::SegmentCache {
+                    unusable: 1,
+                    ..Default::default()
+                };
+            },
+            relifts: false,
+            raises: Some(13),
+        },
+        SegmentCase {
+            name: "DS load, base",
+            // MOV EAX,[10h]; NOP.
+            code: b"\x8b\x05\x10\x00\x00\x00\x90",
+            budget: 2,
+            a: |_, _| {},
+            b: |_, c| set_segment(c, 1, 0x6800, 0xffff),
+            relifts: true,
+            raises: None,
+        },
+        SegmentCase {
+            name: "DS load, limit",
+            code: b"\x8b\x05\x10\x00\x00\x00\x90",
+            budget: 2,
+            a: |_, _| {},
+            b: |_, c| set_segment(c, 1, 0, 0x11),
+            relifts: true,
+            raises: Some(13),
+        },
+        SegmentCase {
+            name: "STOSD, ES limit",
+            // STOSD at EDI 6000h; NOP.
+            code: b"\xab\x90",
+            budget: 2,
+            a: |_, c| c.cpu.gpr[7] = 0x6000,
+            b: |_, c| {
+                c.cpu.gpr[7] = 0x6000;
+                set_segment(c, 2, 0, 0x5fff);
+            },
+            relifts: true,
+            raises: Some(13),
+        },
+        SegmentCase {
+            name: "MOVSB, ES base",
+            // MOVSB from DS:6000h to ES:6100h; NOP.
+            code: b"\xa4\x90",
+            budget: 2,
+            a: |vm, c| {
+                vm.write_bytes(0x6000, &[0x5a]).unwrap();
+                c.cpu.gpr[6] = 0x6000;
+                c.cpu.gpr[7] = 0x6100;
+            },
+            b: |vm, c| {
+                vm.write_bytes(0x6000, &[0xa5]).unwrap();
+                c.cpu.gpr[6] = 0x6000;
+                c.cpu.gpr[7] = 0x6100;
+                set_segment(c, 2, 0x200, 0xffff);
+            },
+            relifts: true,
+            raises: None,
+        },
+        SegmentCase {
+            name: "PUSH, SS limit",
+            // PUSH EAX; NOP.
+            code: b"\x50\x90",
+            budget: 2,
+            a: |_, c| c.cpu.gpr[4] = 0x7000,
+            b: |_, c| {
+                c.cpu.gpr[4] = 0x7000;
+                set_segment(c, 3, 0, 0x6000);
+            },
+            relifts: true,
+            raises: Some(12),
+        },
+    ];
+    for case in &cases {
+        let name = case.name;
+        let (vm, mut warm) = paged_setup(CpuModel::I80486Dx, case.code, false);
+        let start = warm.cpu.clone();
+        (case.a)(&vm, &mut warm);
+        assert_eq!(
+            class(&warm, CpuModel::I80486Dx),
+            SegmentClass::Flat32,
+            "{name}"
+        );
+        warm.run_steps(&vm, case.budget, StepOptions::default())
+            .unwrap();
+        let mut cold = vm.new_vcpu();
+        cold.cpu = start;
+        (case.b)(&vm, &mut cold);
+        let mut memory = vec![0; 0x10000];
+        vm.read_bytes(0, &mut memory).unwrap();
+        warm.cpu = cold.cpu.clone();
+        Vcpu::take_machine_counters_for_test();
+        let warm_run = warm
+            .run_steps(&vm, case.budget, StepOptions::default())
+            .unwrap();
+        let [_, _, lifts, ..] = Vcpu::take_machine_counters_for_test();
+        assert_eq!(lifts != 0, case.relifts, "{name}: {lifts} lifts");
+        let mut warm_memory = vec![0; 0x10000];
+        vm.read_bytes(0, &mut warm_memory).unwrap();
+        vm.write_bytes(0, &memory).unwrap();
+        let cold_run = cold
+            .run_steps(&vm, case.budget, StepOptions::default())
+            .unwrap();
+        let mut cold_memory = vec![0; 0x10000];
+        vm.read_bytes(0, &mut cold_memory).unwrap();
+        assert_eq!(format!("{warm_run:?}"), format!("{cold_run:?}"), "{name}");
+        assert_eq!(
+            format!("{:?}", warm.cpu),
+            format!("{:?}", cold.cpu),
+            "{name}"
+        );
+        assert_eq!(warm_memory, cold_memory, "{name}");
+        match (case.raises, warm_run.stop()) {
+            (Some(vector), StepStop::Exit(Exit::Exception { vector: v, .. })) => {
+                assert_eq!(*v, vector, "{name}");
+                assert_eq!(warm_run.steps(), 0, "{name}");
+            }
+            (None, _) => assert_eq!(warm_run.steps(), case.budget, "{name}: {warm_run:?}"),
+            (Some(_), _) => panic!("{name}: {warm_run:?}"),
         }
     }
 }

@@ -238,11 +238,10 @@ impl LegacyContextStamp {
     /// caches (`lift::legacy::flat32_addresses`), and their caches take no
     /// part in Flat32 admission (`legacy::derive_context` reads CS, DS, ES
     /// and SS), so Flat32 identities leave both segments out: code that
-    /// reloads FS or GS keeps one identity and its proofs. Every other class
-    /// keeps the whole stamp: Segmented proofs bake FS and GS caches
-    /// (`flat32::specialize_segments`).
+    /// reloads FS or GS keeps one identity and its proofs. Segmented proofs
+    /// bake FS and GS caches (`flat32::specialize_segments`).
     ///
-    /// Unpaged Flat32 and Segmented identities go further (xj-to9.56): they
+    /// Flat32 and Segmented identities go further (xj-to9.56): they
     /// name only what their lift reads. A lift reads the guest bytes at the
     /// key's linear fetch address through the CS cache and the A20 line
     /// (`fetch_watched`, `legacy::physical_span`), the `MachineContext`
@@ -258,23 +257,38 @@ impl LegacyContextStamp {
     /// its identity and its proofs. The class itself is part of the
     /// identity, in the output-only CR2 slot.
     ///
+    /// Paged Flat32 identities are reduced the same way (xj-to9.75), with
+    /// CR0.PG added. A paged lift also reads its code through the page
+    /// tables: the proof key names the bus address its first byte
+    /// translates to and CR0 (less MP, EM and TS) itself (`paging::Key`),
+    /// the U/S check of each fetch reads the CPL, named
+    /// here, and a proof translates its code pages again after any TLB
+    /// generation advance (`paging::pages_hold`), so no translation fact
+    /// rests on a field this identity leaves out. A kernel whose 16-bit and
+    /// V86 transitions reload DS, ES, FS and GS while the same flat code
+    /// runs keeps that code's proofs. A paged Segmented identity could be
+    /// reduced by the same argument, but keeps the whole stamp: its complete
+    /// identities carry the derived context and the dispatcher's identity id
+    /// (`Execution::reselect_recent`, `paging_selection`, xj-to9.59), which
+    /// paged far calls and segment reloads lean on.
+    ///
     /// This: whether `class` at this state takes such a reduced identity
-    /// (`reduced_identity`); otherwise the identity is the whole stamp, less
-    /// FS and GS for a paged Flat32 (`drop_fs_gs`).
+    /// (`reduced_identity`); otherwise (Direct, Checked and so V86, and
+    /// paged Segmented) the identity is the whole stamp.
     #[inline(always)]
     fn reduced(cpu: &CpuState, class: crate::SegmentClass) -> bool {
-        matches!(
-            class,
-            crate::SegmentClass::Flat32 | crate::SegmentClass::Segmented
-        ) && cpu.legacy.cr0 & (1 << 31) == 0
+        match class {
+            crate::SegmentClass::Flat32 => true,
+            crate::SegmentClass::Segmented => cpu.legacy.cr0 & (1 << 31) == 0,
+            _ => false,
+        }
     }
 
     /// The identity of a `reduced` class.
     fn reduced_identity(cpu: &CpuState, model: LegacyCpuModel, class: crate::SegmentClass) -> Self {
         let l = &cpu.legacy;
         let mut state = crate::legacy::LegacyCpuState {
-            // PE (bit 0) and AM (bit 18); PG (bit 31) is clear.
-            cr0: l.cr0 & (1 | (1 << 18)),
+            cr0: l.cr0 & REDUCED_IDENTITY_CR0,
             cr2: 1 + class as u32,
             cpl: l.cpl,
             a20_enabled: l.a20_enabled,
@@ -297,6 +311,32 @@ impl LegacyContextStamp {
         }
     }
 
+    /// A Flat32 `reduced_identity` as one word (xj-to9.75), the paged
+    /// identity id of a Flat32 state (`paging::State`): bit 63 set, which no
+    /// interned id (a counter from zero) reaches, then the CPL, A20, the
+    /// reset-fetch and NEC state, the four D/B bits, CR0.PE, AM and PG, the
+    /// class tag and the generation. Equal identities give equal words and
+    /// distinct ones distinct words, but for the model's semantics id, which
+    /// every paged proof key names and whose change drops every paged proof
+    /// and link (`paging::State::reconcile`).
+    fn reduced_word(&self) -> u64 {
+        let s = &self.state;
+        debug_assert_eq!(s.cr2, 1 + crate::SegmentClass::Flat32 as u32);
+        let db = s.segments[..4].iter().enumerate().fold(0, |word, (i, c)| {
+            word | (u64::from(c.attributes >> 14 & 1) << i)
+        });
+        let cr0 = u64::from(s.cr0 & 1) | u64::from(s.cr0 >> 17 & 2) | u64::from(s.cr0 >> 29 & 4);
+        1 << 63
+            | u64::from(s.cpl)
+            | (u64::from(s.a20_enabled) << 8)
+            | (u64::from(s.reset_fetch) << 16)
+            | (u64::from(s.reserved) << 24)
+            | (db << 32)
+            | (cr0 << 36)
+            | (u64::from(s.cr2) << 40)
+            | ((self.model.generation as u64) << 48)
+    }
+
     /// Whether this stamp is the `reduced_identity` of the live state, read
     /// without building it: the steady context check after every
     /// context-changing helper.
@@ -312,7 +352,7 @@ impl LegacyContextStamp {
         let (s, l) = (&self.state, &cpu.legacy);
         self.model == model
             && s.cr2 == 1 + class as u32
-            && s.cr0 == l.cr0 & (1 | (1 << 18))
+            && s.cr0 == l.cr0 & REDUCED_IDENTITY_CR0
             && s.cpl == l.cpl
             && s.a20_enabled == l.a20_enabled
             && s.reset_fetch == l.reset_fetch
@@ -327,14 +367,6 @@ impl LegacyContextStamp {
             }
     }
 
-    // The paged Flat32 identity, in place: the whole stamp but FS and GS.
-    fn drop_fs_gs(&mut self) {
-        for i in [SegmentId::Fs as usize, SegmentId::Gs as usize] {
-            self.selectors[i] = 0;
-            self.state.segments[i] = crate::legacy::SegmentCache::default();
-        }
-    }
-
     fn new(cpu: &CpuState, model: LegacyCpuModel) -> Self {
         let mut state = cpu.legacy;
         state.cr2 = 0; // Output register, not a translation assumption.
@@ -347,7 +379,7 @@ impl LegacyContextStamp {
     }
     #[inline(always)]
     fn matches(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
-        self.compare(cpu, model, false, u32::MAX)
+        self.compare(cpu, model, u32::MAX)
     }
 
     /// The paged proofs' identity (`paging::State`, xj-to9.70): the whole
@@ -362,17 +394,34 @@ impl LegacyContextStamp {
         stamp
     }
 
-    /// Whether this stamp is the paged identity (`new_paged`) of `cpu`.
+    /// Whether this stamp is the paged identity (`new_paged`) of `cpu`. A
+    /// reduced identity carries its class tag in CR2, which this one holds
+    /// zero and `compare` does not compare.
     #[inline(always)]
     fn matches_paged(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
-        self.compare(cpu, model, false, PAGED_IDENTITY_CR0)
+        self.state.cr2 == 0 && self.compare(cpu, model, PAGED_IDENTITY_CR0)
     }
 
-    // `matches`, or with `flat32` whether this is the paged Flat32 identity
-    // of `cpu` (`drop_fs_gs`): FS and GS held cleared. Only the CR0 bits in
-    // `cr0` are compared.
+    /// Whether this stamp is the paged proofs' identity of `cpu` as `class`
+    /// (xj-to9.75): the `reduced_identity` of a reduced class, else the
+    /// `new_paged` stamp.
     #[inline(always)]
-    fn compare(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool, cr0: u32) -> bool {
+    fn is_paged_identity(
+        &self,
+        cpu: &CpuState,
+        model: LegacyCpuModel,
+        class: crate::SegmentClass,
+    ) -> bool {
+        if Self::reduced(cpu, class) {
+            self.is_reduced_identity(cpu, model, class)
+        } else {
+            self.matches_paged(cpu, model)
+        }
+    }
+
+    // `matches`, comparing only the CR0 bits in `cr0`.
+    #[inline(always)]
+    fn compare(&self, cpu: &CpuState, model: LegacyCpuModel, cr0: u32) -> bool {
         #[inline(always)]
         fn cache_bits(c: &crate::legacy::SegmentCache) -> (u64, u64) {
             (
@@ -409,22 +458,15 @@ impl LegacyContextStamp {
         // normalized state. CR2 remains output-only (decision-23 §5).
         let a = &self.state;
         let b = &cpu.legacy;
-        let (fs, gs) = if flat32 { (0, 0) } else { (cpu.fs, cpu.gs) };
         let mut diff = u64::from(self.model != model)
-            | u64::from(self.selectors != [cpu.cs, cpu.ds, cpu.es, cpu.ss, fs, gs])
+            | u64::from(self.selectors != [cpu.cs, cpu.ds, cpu.es, cpu.ss, cpu.fs, cpu.gs])
             | (self.system_flags ^ (cpu.rflags_system & 0x27000))
             | u64::from((a.cr0 ^ b.cr0) & cr0)
             | u64::from(a.cr3 ^ b.cr3)
             | (table_bits(&a.gdtr) ^ table_bits(&b.gdtr))
             | (table_bits(&a.idtr) ^ table_bits(&b.idtr))
             | u64::from(tail_bits(a) ^ tail_bits(b));
-        let cleared = crate::legacy::SegmentCache::default();
-        for (i, (a, b)) in a.segments.iter().zip(&b.segments).enumerate() {
-            let b = if flat32 && i >= SegmentId::Fs as usize {
-                &cleared
-            } else {
-                b
-            };
+        for (a, b) in a.segments.iter().zip(&b.segments) {
             let (a0, a1) = cache_bits(a);
             let (b0, b1) = cache_bits(b);
             diff |= (a0 ^ b0) | (a1 ^ b1);
@@ -437,30 +479,25 @@ impl LegacyContextStamp {
         diff == 0
     }
 
-    /// A prefilter of the complete identity of `cpu` (`new`, less FS and GS
-    /// for a paged Flat32 identity): its selectors, CPL, CR0, CR3 and stamped
-    /// EFLAGS bits folded into one word (xj-to9.59). Equal identities have
-    /// equal words; an equal word only names a candidate, which
-    /// `is_identity_of` confirms field by field.
+    /// A prefilter of the complete identity of `cpu` (`new`): its
+    /// selectors, CPL, CR0, CR3 and stamped EFLAGS bits folded into one word
+    /// (xj-to9.59). Equal identities have equal words; an equal word only
+    /// names a candidate, which `is_identity_of` confirms field by field.
     #[inline(always)]
-    fn quick(cpu: &CpuState, flat32: bool) -> u64 {
-        Self::quick_masked(cpu, flat32, u32::MAX)
+    fn quick(cpu: &CpuState) -> u64 {
+        Self::quick_masked(cpu, u32::MAX)
     }
 
     /// `quick` of the paged identity (`new_paged`).
     #[inline(always)]
     fn quick_paged(cpu: &CpuState) -> u64 {
-        Self::quick_masked(cpu, false, PAGED_IDENTITY_CR0)
+        Self::quick_masked(cpu, PAGED_IDENTITY_CR0)
     }
 
     #[inline(always)]
-    fn quick_masked(cpu: &CpuState, flat32: bool, cr0: u32) -> u64 {
+    fn quick_masked(cpu: &CpuState, cr0: u32) -> u64 {
         let l = &cpu.legacy;
-        let fs_gs = if flat32 {
-            0
-        } else {
-            u64::from(cpu.fs) | (u64::from(cpu.gs) << 16)
-        };
+        let fs_gs = u64::from(cpu.fs) | (u64::from(cpu.gs) << 16);
         let selectors = u64::from(cpu.cs)
             | (u64::from(cpu.ds) << 16)
             | (u64::from(cpu.es) << 32)
@@ -470,19 +507,32 @@ impl LegacyContextStamp {
         selectors ^ tail.rotate_left(8) ^ control.rotate_left(24)
     }
 
-    /// Whether this stamp `==` the complete identity of `cpu` (`new`, then
-    /// `drop_fs_gs` when `flat32`), read without building that stamp. A
-    /// reduced identity (`reduced_identity`) carries its class tag in CR2,
-    /// which a complete one holds zero and `matches` does not compare.
+    /// Whether this stamp `==` the complete identity of `cpu` (`new`), read
+    /// without building that stamp. A reduced identity (`reduced_identity`)
+    /// carries its class tag in CR2, which a complete one holds zero and
+    /// `matches` does not compare.
     #[inline(always)]
-    fn is_identity_of(&self, cpu: &CpuState, model: LegacyCpuModel, flat32: bool) -> bool {
-        self.state.cr2 == 0 && self.compare(cpu, model, flat32, u32::MAX)
+    fn is_identity_of(&self, cpu: &CpuState, model: LegacyCpuModel) -> bool {
+        self.state.cr2 == 0 && self.compare(cpu, model, u32::MAX)
     }
+}
+
+/// Whether CS, DS, ES and SS prove Flat32 at the live CPL
+/// (`legacy::flat32_cache`, as `derive_context` admits the class).
+fn flat32_segments(cpu: &CpuState) -> bool {
+    cpu.legacy.segments[..4]
+        .iter()
+        .enumerate()
+        .all(|(i, c)| crate::legacy::flat32_cache(c, i, cpu.legacy.cpl))
 }
 
 /// CR0 as the paged identity names it: every bit but MP, EM and TS
 /// (`LegacyContextStamp::new_paged`).
 const PAGED_IDENTITY_CR0: u32 = !0xe;
+/// CR0 as a reduced identity names it (`LegacyContextStamp::reduced_identity`):
+/// PE (bit 0), AM (bit 18, `lift::legacy::alignment_mask`) and PG (bit 31,
+/// `MachineContext::paging_enabled`), the bits a lift reads (SDM Vol 3A §2.5).
+const REDUCED_IDENTITY_CR0: u32 = 1 | (1 << 18) | (1 << 31);
 // Decision-20: the firmware-style transition loop uses four contexts. An
 // extended-memory runtime's interrupt reflection walks through more than
 // sixteen stamps (code, data and stack selectors, CR0.PE, IDTR) on every
@@ -1184,13 +1234,12 @@ impl Execution {
         // A complete identity is compared with the live state where it is
         // kept, its `quick` word first, and built only when no retained
         // recent identity is it (xj-to9.59).
-        let flat32 = class == crate::SegmentClass::Flat32;
-        let quick = LegacyContextStamp::quick(cpu, flat32);
+        let quick = LegacyContextStamp::quick(cpu);
         let same = self.recent.quick == quick
             && self
                 .stamp
                 .as_ref()
-                .is_some_and(|s| s.is_identity_of(cpu, model, flat32));
+                .is_some_and(|s| s.is_identity_of(cpu, model));
         #[cfg(feature = "test-hooks")]
         if !same {
             diag::note_context(diag::ContextNote::Switch);
@@ -1222,9 +1271,8 @@ impl Execution {
                     .position(|r| r.as_ref().is_some_and(|r| r.id == current))
             } else {
                 self.recent.slots.iter().position(|r| {
-                    r.as_ref().is_some_and(|r| {
-                        r.quick == quick && r.stamp.is_identity_of(cpu, model, flat32)
-                    })
+                    r.as_ref()
+                        .is_some_and(|r| r.quick == quick && r.stamp.is_identity_of(cpu, model))
                 })
             };
             if let Some(slot) = slot {
@@ -1239,13 +1287,7 @@ impl Execution {
         // A last identity selected as Direct may be retained as well.
         let stamp = match self.stamp {
             Some(stamp) if same => stamp,
-            _ => {
-                let mut stamp = LegacyContextStamp::new(cpu, model);
-                if flat32 {
-                    stamp.drop_fs_gs();
-                }
-                stamp
-            }
+            _ => LegacyContextStamp::new(cpu, model),
         };
         if class != crate::SegmentClass::Direct {
             self.context_id = self.enter_context(stamp, quick);
@@ -1406,10 +1448,10 @@ impl Execution {
         if self.context_epoch == u64::MAX {
             return None;
         }
-        let quick = LegacyContextStamp::quick(cpu, false);
+        let quick = LegacyContextStamp::quick(cpu);
         let slot = self.recent.slots.iter().position(|r| {
             r.as_ref().is_some_and(|r| {
-                r.context.is_some() && r.quick == quick && r.stamp.is_identity_of(cpu, model, false)
+                r.context.is_some() && r.quick == quick && r.stamp.is_identity_of(cpu, model)
             })
         })?;
         self.context_dirty();
@@ -2582,7 +2624,7 @@ impl Vcpu {
     /// the dispatcher's reselection after a walk changed the context with
     /// paging on. A recent complete identity that is the live state's keeps
     /// the context derived for it, which is not derived again (xj-to9.59).
-    /// Unpaged identities are mostly reduced, which keep none.
+    /// Flat32 and Segmented identities are reduced, which keep none.
     #[inline(never)]
     fn reselect_paged_context(&mut self) -> Result<MachineContext, Exit> {
         let model = self.legacy_model.expect("legacy model");
@@ -2626,9 +2668,16 @@ impl Vcpu {
         if execution.task_switch.context().is_none()
             && execution.stamp.as_ref().is_some_and(|stamp| {
                 if LegacyContextStamp::reduced(&self.cpu, class) {
+                    // A Flat32 identity names only the D/B bits, so the
+                    // class holds only while CS, DS, ES and SS still prove
+                    // flat (`derive_context`). A Flat32 walk continues past
+                    // a data-segment load only while it does
+                    // (`reload_continues`); checked here as well, not
+                    // assumed of the walk.
                     stamp.is_reduced_identity(&self.cpu, model, class)
+                        && (class != crate::SegmentClass::Flat32 || flat32_segments(&self.cpu))
                 } else {
-                    stamp.is_identity_of(&self.cpu, model, class == crate::SegmentClass::Flat32)
+                    stamp.is_identity_of(&self.cpu, model)
                 }
             })
         {
@@ -2973,7 +3022,13 @@ impl Vcpu {
             let result = if PAGED {
                 let execution = self.legacy_execution.as_mut().unwrap();
                 let state = execution.paging.get_or_insert_with(Default::default);
-                state.reconcile(vm, &self.cpu, self.legacy_model.unwrap(), None);
+                state.reconcile(
+                    vm,
+                    &self.cpu,
+                    self.legacy_model.unwrap(),
+                    context.segment_class,
+                    None,
+                );
                 if !self.cpu.mmio_retry_active {
                     state.event_transaction = None;
                 }
