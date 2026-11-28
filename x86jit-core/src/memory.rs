@@ -5857,30 +5857,54 @@ mod tests {
     // `zeroed_words` exists to keep the allocator's lazy commit. A 1 TiB span needs
     // 2 x 32 MiB of virtual address space; touching a handful of pages must not make
     // that resident.
+    //
+    // Residency is measured with `mincore` over the two tables' own pages, not
+    // with process RSS: RSS also counts every other allocation the process
+    // faults in meanwhile (the harness, a fresh malloc arena), and with
+    // transparent huge pages one first touch can commit a whole 2 MiB page.
+    // Whether the kernel has a free huge page to hand is up to the host's memory
+    // state, so an RSS bound flaked on CI runners (4268032 bytes = two huge pages
+    // plus 18 small ones). Per-table residency is immune to the first and bounds
+    // the second: one touched word is at most one huge page per table.
     #[cfg(target_os = "linux")]
     #[test]
     fn watch_table_over_a_huge_span_stays_sparse() {
-        fn rss_bytes() -> u64 {
-            let s = std::fs::read_to_string("/proc/self/statm").unwrap();
-            let pages: u64 = s.split_whitespace().nth(1).unwrap().parse().unwrap();
-            pages * 4096
+        unsafe extern "C" {
+            fn mincore(addr: *mut core::ffi::c_void, len: usize, vec: *mut u8) -> i32;
+            fn sysconf(name: i32) -> i64;
+        }
+        const SC_PAGESIZE: i32 = 30; // glibc and musl, <bits/confname.h>
+        fn resident_bytes(table: &[AtomicU64]) -> usize {
+            // SAFETY: sysconf has no preconditions.
+            let page = usize::try_from(unsafe { sysconf(SC_PAGESIZE) }).unwrap();
+            let start = table.as_ptr() as usize & !(page - 1);
+            let end =
+                (table.as_ptr() as usize + std::mem::size_of_val(table)).next_multiple_of(page);
+            let mut vec = vec![0u8; (end - start) / page];
+            // SAFETY: [start, end) lies inside the mapping that holds `table` (a
+            // mapping is page-granular), and `vec` has one byte per page in it.
+            let rc = unsafe { mincore(start as *mut _, end - start, vec.as_mut_ptr()) };
+            assert_eq!(rc, 0, "mincore failed: {}", std::io::Error::last_os_error());
+            vec.iter().filter(|&&b| b & 1 != 0).count() * page
         }
         // A 1 TiB span: 268M pages -> 4.2M words -> 33.5 MiB per bitset.
         const SPAN: u64 = 1 << 40;
-        let before = rss_bytes();
         let w = WatchPages::new(0, SPAN);
         for p in 0..64 {
             w.watch((SPAN >> 1 >> CODE_PAGE_BITS) + p);
         }
-        let grew = rss_bytes().saturating_sub(before);
-        // Two 33.5 MiB tables; only the touched words should be resident. Allow a
-        // generous margin for allocator slack and the test harness itself.
-        assert!(
-            grew < 4 << 20,
-            "watch tables for a 1 TiB span made {grew} bytes resident — the lazy \
-             zero-page commit was defeated (element-wise init?)"
-        );
         assert_eq!(w.take_dirty().len(), 0);
+        // Both tables were touched: `watch` by the registrations, `dirty` by the
+        // drain. Element-wise init would make all 2 x 33.5 MiB resident; the lazy
+        // commit leaves at most one (huge) page per touched word.
+        for (name, table) in [("watch", &w.watch), ("dirty", &w.dirty)] {
+            let grew = resident_bytes(table);
+            assert!(
+                grew < 4 << 20,
+                "the {name} table for a 1 TiB span has {grew} bytes resident — the \
+                 lazy zero-page commit was defeated (element-wise init?)"
+            );
+        }
     }
 
     #[test]

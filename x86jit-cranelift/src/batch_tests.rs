@@ -37,9 +37,24 @@ fn execute(block: CachedBlock, mem: &Memory) -> usize {
     entry.0 as usize
 }
 
+/// Whether retirement has settled: no retired unit left AND no collection pass
+/// in flight.
+///
+/// The background maintenance worker runs `collect_retired_metadata` too. A pass
+/// calls `finish_retirement` (which empties `retired_units`) before it drops the
+/// unit's `retired_metadata` and `retirement_announced` entries, and while it runs
+/// the test's own call returns 0 at once through `collecting`. Waiting on
+/// `retired_units` alone can therefore return in that window, with the worker's
+/// bookkeeping still pending. `collecting` is cleared with `Release` when a pass
+/// ends, so observing it clear (`Acquire`) after the units drained means the pass
+/// that drained them has finished all of its removals.
+fn retirement_settled(shared: &Shared) -> bool {
+    shared.lifetime.retired_units().is_empty() && !shared.collecting.load(Ordering::Acquire)
+}
+
 fn collect_one(jit: &JitBackend) {
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
-    while !jit.shared.lifetime.retired_units().is_empty() {
+    while !retirement_settled(&jit.shared) {
         jit.collect_retired_metadata();
         assert!(Instant::now() < deadline, "metadata retirement stalled");
         std::thread::yield_now();
@@ -520,7 +535,7 @@ fn foreground_observer_can_wait_for_a_background_completion() {
 
 fn wait_reclaimed(shared: &Shared) {
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
-    while !shared.lifetime.retired_units().is_empty() {
+    while !retirement_settled(shared) {
         assert!(Instant::now() < deadline, "automatic reclamation stalled");
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
