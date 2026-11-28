@@ -123,6 +123,11 @@ pub struct Helpers {
     pub machine_store: Helper,
     /// Decision-30 §4: the Machine store barrier (`jit_abi::machine::machine_note`).
     pub machine_note: Helper,
+    /// xj-to9.79: a Machine IN or OUT, PUSHF image and POPF load
+    /// (`jit_abi::machine::machine_port`, `machine_pushf`, `machine_popf`).
+    pub machine_port: Helper,
+    pub machine_pushf: Helper,
+    pub machine_popf: Helper,
     pub cpuid: Helper,
     pub tsc: Helper,
     pub random: Helper,
@@ -239,6 +244,9 @@ impl Helpers {
             machine_load: mk(),
             machine_store: mk(),
             machine_note: mk(),
+            machine_port: mk(),
+            machine_pushf: mk(),
+            machine_popf: mk(),
             cpuid: mk(),
             tsc: mk(),
             random: mk(),

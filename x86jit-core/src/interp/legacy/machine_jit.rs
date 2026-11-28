@@ -73,6 +73,110 @@ pub(crate) fn lowered_op(op: &IrOp) -> bool {
     }
 }
 
+/// An op a compiled Machine block lowers only as the one instruction of a
+/// singleton block outside the ordinary walk (`system_singleton`, xj-to9.79):
+/// the IOPL test of CLI, STI, IN and OUT, read live (decision-30 §7); CLI and
+/// STI; IN and OUT, served by an in-process device in the block or deferred;
+/// PUSHF and POPF. Each can end its block's turn in a way the ordinary walk's
+/// ops cannot (a port exit, the STI shadow, an IF or IOPL change), so they
+/// stay out of `lowered_op`, whose ops leave the default outcome.
+pub(crate) fn system_op(op: &IrOp) -> bool {
+    use crate::legacy::PrivilegeCheck;
+    match op {
+        IrOp::Legacy(L::Privileged { kind }) => {
+            matches!(kind, PrivilegeCheck::Iopl | PrivilegeCheck::IoPort { .. })
+        }
+        IrOp::SetIf { .. } => true,
+        IrOp::PortIo { size, .. } => matches!(size, 1 | 2 | 4),
+        IrOp::Legacy(L::Flags { size, .. }) => matches!(size, 2 | 4),
+        _ => false,
+    }
+}
+
+/// Whether a block outside the ordinary walk is one instruction a compiled
+/// Machine block completes (xj-to9.79): a CLI, STI, IN, OUT, PUSHF or POPF of
+/// Flat32 protected-mode code, its ops lowered under the compiled-fallibility
+/// rule. PUSHF and POPF only at CPL 0 with a 32-bit stack: their stack
+/// operand is `SS:ESP` with SS flat (`SegmentClass::Flat32`), and at CPL 0
+/// no alignment check applies (SDM Vol 3A §7.15, Event 17, p. 7-53).
+pub(crate) fn system_singleton(ir: &IrBlock) -> bool {
+    let Some(context) = ir.legacy_context else {
+        return false;
+    };
+    if ir.icount != 1
+        || context.segment_class != crate::SegmentClass::Flat32
+        || context.regime != crate::MachineRegime::Protected
+    {
+        return false;
+    }
+    let ops = match ir.ops.first() {
+        Some(IrOp::InsnStart { .. }) => &ir.ops[1..],
+        _ => &ir.ops[..],
+    };
+    let stack = context.cpl == 0 && context.stack_address_bits == 32;
+    ops.iter().any(system_op)
+        && ops
+            .iter()
+            .all(|op| !matches!(op, IrOp::Legacy(L::Flags { .. })) || stack)
+        && lowered_instruction(ops)
+}
+
+/// Whether a block takes the ordinary Flat32 walk (`flat32_ordinary`).
+pub(crate) fn ordinary_walk(ir: &IrBlock) -> bool {
+    flat32_ordinary(ir)
+}
+
+/// Whether an op keeps its block off the ordinary Flat32 walk
+/// (`flat32_ordinary`), for the refusal census.
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
+pub(crate) fn outside_ordinary_walk(op: &IrOp) -> bool {
+    match op {
+        IrOp::Legacy(op) => !flat32_ordinary_op(op),
+        op => !supported(op),
+    }
+}
+
+/// A port access the compiled block could not complete in place (decision-32
+/// §9 done-when 1, the DEFER census).
+#[inline(always)]
+pub(crate) fn note_device_defer() {
+    note_cause(|| CAUSE_DEVICE);
+}
+
+/// The PUSHF image at the 80386 and later: SDM Vol 2B §4.3 PUSHF, the pushed
+/// RF and VM bits are zero.
+pub(crate) fn pushf_image(cpu: &CpuState) -> u32 {
+    legacy::flags_image(cpu, crate::CpuGeneration::I386) & !0x30000
+}
+
+/// What a compiled POPF does after its stack read of `image` (`size` bytes):
+/// the interpreter's flag load (`L::Flags`, `privilege::load_flags`, SDM Vol
+/// 2B §4.3 POPF). Returns 0 when the next boundary decides as before, or the
+/// `RET_MACHINE_BOUNDARY` bits plus `BOUNDARY` when the load set IF, changed
+/// any system flag (TF, IOPL, NT, AC, ID) or must report a context change.
+pub(crate) fn popf(cpu: &mut CpuState, image: u32, size: u8) -> u64 {
+    use crate::jit_abi::machine::{BOUNDARY, BOUNDARY_CONTEXT};
+    let mut image = image;
+    if size == 2 {
+        image |= cpu.rflags_system as u32 & cpu.machine_flags_mask;
+    }
+    let before = cpu.rflags_system;
+    let interrupts = cpu.flags.if_;
+    let loaded = privilege::load_flags(cpu, crate::CpuGeneration::I386, image);
+    debug_assert!(loaded.is_ok(), "a Flat32 flag load cannot fault");
+    let changed = before ^ cpu.rflags_system;
+    let context = if changed & 0x7000 != 0 {
+        BOUNDARY_CONTEXT
+    } else {
+        0
+    };
+    if changed != 0 || (cpu.flags.if_ && !interrupts) {
+        BOUNDARY | context
+    } else {
+        0
+    }
+}
+
 /// Whether a lowered op can end its instruction with a defer in compiled code
 /// (decision-30 §3): an access, the 4 GiB operand check, a divide error. A
 /// Flat32 jump, branch or loop cannot fail: its target is masked to the
@@ -83,7 +187,14 @@ fn fallible(op: &IrOp) -> bool {
         IrOp::Load { .. }
             | IrOp::Store { .. }
             | IrOp::Div { .. }
-            | IrOp::Legacy(L::Flat32Address { .. } | L::Address { .. } | L::I486Gate)
+            | IrOp::Legacy(
+                L::Flat32Address { .. }
+                    | L::Address { .. }
+                    | L::I486Gate
+                    | L::Privileged { .. }
+                    | L::Flags { .. }
+            )
+            | IrOp::PortIo { .. }
     )
 }
 
@@ -105,7 +216,8 @@ fn commits(op: &IrOp) -> bool {
             | L::I486Gate
             | L::Checkpoint
             | L::LiveField { .. }
-            | L::ReadSelector { .. },
+            | L::ReadSelector { .. }
+            | L::Privileged { .. },
         ) => false,
         IrOp::Add { set_flags, .. }
         | IrOp::Adc { set_flags, .. }
@@ -137,7 +249,7 @@ pub(crate) fn lowered_instruction(ops: &[IrOp]) -> bool {
     let mut committed = false;
     let mut stored = false;
     for op in ops {
-        if !lowered_op(op) || (committed && fallible(op)) {
+        if !(lowered_op(op) || system_op(op)) || (committed && fallible(op)) {
             return false;
         }
         if matches!(op, IrOp::Store { .. }) {
@@ -426,6 +538,24 @@ pub(crate) fn completed(count: u64) -> Progress {
         retired: count,
         outcome: Some(Ok(Outcome {
             retired: true,
+            ..Outcome::default()
+        })),
+    }
+}
+
+/// The walk result of a CLI/STI or POPF singleton a compiled block completed
+/// with `RET_MACHINE_BOUNDARY` (xj-to9.79): `execute_checked`'s for it, an
+/// outcome that arms the STI shadow or reports a context change.
+pub(crate) fn completed_at_boundary(count: u64, arm_sti: bool, context_changed: bool) -> Progress {
+    Progress {
+        sti_shadow: false,
+        ss_shadow: 0,
+        steps: count,
+        retired: count,
+        outcome: Some(Ok(Outcome {
+            retired: true,
+            arm_sti,
+            context_changed,
             ..Outcome::default()
         })),
     }

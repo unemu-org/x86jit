@@ -25,6 +25,17 @@ pub const ACCESS_DEFER: u64 = 1;
 /// (`BlockPass::commit`).
 pub const ACCESS_STOP: u64 = 2;
 
+/// [`RET_MACHINE_BOUNDARY`](super::RET_MACHINE_BOUNDARY) outcome bit in
+/// `MemCtx::machine_ordinal`: the STI armed its interrupt shadow (SDM Vol 2B
+/// §4.3 STI: interrupts are recognized after the next instruction).
+pub const BOUNDARY_ARM_STI: u64 = 1;
+/// [`RET_MACHINE_BOUNDARY`](super::RET_MACHINE_BOUNDARY) outcome bit: a POPF
+/// changed IOPL or NT, which the interpreted walk reports as a context change.
+pub const BOUNDARY_CONTEXT: u64 = 2;
+/// [`machine_popf`] status bit: the block returns `RET_MACHINE_BOUNDARY`
+/// with the status's outcome bits.
+pub const BOUNDARY: u64 = 4;
+
 /// One slot of a vCPU's compiled TLB view (decision-30 §4, decision-32 §3),
 /// `repr(C)` because compiled loads and stores read it inline. A tag is the
 /// linear page number plus one, so zero is invalid. The supervisor pair
@@ -548,6 +559,68 @@ pub unsafe extern "C" fn machine_note(
     } else {
         ACCESS_DONE
     }
+}
+
+/// Machine port helper (xj-to9.79): a compiled IN or OUT whose privilege
+/// test passed. `meta` holds the size in bits 0-7 and, for OUT, bit 8.
+/// [`ACCESS_DONE`] with an IN's value in `MemCtx::machine_value` when a
+/// device served in process answered with no effect
+/// (`vm::device::in_block_port`), else [`ACCESS_DEFER`]: the interpreter's
+/// re-execution issues the `Exit::PortIo`.
+///
+/// # Safety
+/// As [`machine_load`].
+pub unsafe extern "C" fn machine_port(
+    _cpu: *mut u8,
+    mem: *mut u8,
+    port: u64,
+    value: u64,
+    meta: u64,
+    _time_enabled: u64,
+) -> u64 {
+    // SAFETY: the compiled-block ABI supplies this live, per-vCPU pointer.
+    let ctx = unsafe { &mut *(mem as *mut MemCtx) };
+    // In: the instruction's IP, which the compiled block stored there.
+    let ip = ctx.machine_value;
+    match crate::vm::device::in_block_port(ip, meta & 0x100 != 0, port as u16, meta as u8, value) {
+        Some(answer) => {
+            ctx.machine_value = answer;
+            ACCESS_DONE
+        }
+        None => {
+            crate::interp::legacy::machine_jit::note_device_defer();
+            ACCESS_DEFER
+        }
+    }
+}
+
+/// Machine PUSHF helper (xj-to9.79): the image the interpreter pushes
+/// (`machine_jit::pushf_image`).
+///
+/// # Safety
+/// As [`machine_load`].
+pub unsafe extern "C" fn machine_pushf(cpu: *mut u8, _mem: *mut u8, _time_enabled: u64) -> u64 {
+    // SAFETY: the compiled-block ABI supplies this live, per-vCPU pointer.
+    let cpu = unsafe { &*(cpu as *const CpuState) };
+    u64::from(crate::interp::legacy::machine_jit::pushf_image(cpu))
+}
+
+/// Machine POPF helper (xj-to9.79): load `image`, the `size`-byte stack
+/// value a compiled POPF read, as the interpreter does
+/// (`machine_jit::popf`). Returns 0, or [`BOUNDARY`] with the outcome bits.
+///
+/// # Safety
+/// As [`machine_load`].
+pub unsafe extern "C" fn machine_popf(
+    cpu: *mut u8,
+    _mem: *mut u8,
+    image: u64,
+    size: u64,
+    _time_enabled: u64,
+) -> u64 {
+    // SAFETY: the compiled-block ABI supplies this live, per-vCPU pointer.
+    let cpu = unsafe { &mut *(cpu as *mut CpuState) };
+    crate::interp::legacy::machine_jit::popf(cpu, image as u32, size as u8)
 }
 
 /// The access configuration's routing bit: set, compiled accesses always

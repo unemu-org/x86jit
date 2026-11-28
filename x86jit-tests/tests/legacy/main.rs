@@ -73,3 +73,4 @@ mod machine_j2_devices;
 mod machine_j2b_chains;
 mod machine_j34_paged;
 mod machine_sparse;
+mod machine_system_ops;

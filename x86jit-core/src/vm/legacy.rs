@@ -733,6 +733,11 @@ struct MachineBoundary {
     // (`nmi_after_progress`) on this field, as the fast arm gates its epilogue.
     cold_epilogue: bool,
     irq_pending: bool,
+    /// Test-only: which of the single-step run, a queued A20 change, the
+    /// stop-when-ready option and an external request (bits 0-3) forced
+    /// `one_step`, for the refusal census (`compiled::one_step_class`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    one_step_why: u8,
 }
 
 // Qualified while MachineContext is unchanged. Keeping the Arc prevents
@@ -3509,6 +3514,19 @@ impl Vcpu {
         };
         let irq_pending = self.pending_irq.is_some();
         let a20_pending = execution.pending_a20_enabled.is_some();
+        // `StepOptions::with_stop_when_irq_ready` stops at the first boundary
+        // where `irq_ready` holds, which needs IF = 1 (SDM Vol 3A §7.8.1,
+        // `irq_delivery_ready`). With IF = 0 no boundary before one where an
+        // instruction set IF can stop, so the Machine dispatcher steps one
+        // unit at a time only from IF = 1, caps a block that can set IF
+        // before its last instruction at one unit (`sets_if_before_last`, as
+        // `Run::cap` does under INTR), and refreshes the boundary after
+        // every turn. An IF that a turn's last instruction sets is seen at
+        // the boundary after it, where the service step tests it; a compiled
+        // block that sets IF returns there (`RET_MACHINE_BOUNDARY`)
+        // (xj-to9.79).
+        let stop_one_step =
+            options.stop_when_irq_ready && (KIND != MACHINE_DISPATCH || self.cpu.flags.if_);
         MachineBoundary {
             task_pending,
             single_step,
@@ -3525,7 +3543,7 @@ impl Vcpu {
                 || self.ss_shadow & SS_HOLD != 0
                 || irq_pending
                 || a20_pending
-                || options.stop_when_irq_ready,
+                || stop_one_step,
             service: self.cpu.port_string_in.is_some()
                 || execution.handoff_service != 0
                 || execution.event_retry.is_some()
@@ -3535,6 +3553,10 @@ impl Vcpu {
             // Its I/O eligibility is queried only when a host request exists.
             pending_io: !SINGLE && self.machine_pending_io(task_pending),
             instruction_retry: execution.instruction_retry.is_some(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            one_step_why: u8::from(SINGLE)
+                | u8::from(a20_pending) << 1
+                | u8::from(stop_one_step) << 2,
         }
     }
 
@@ -3749,11 +3771,16 @@ impl Vcpu {
         let mut boundary = MachineBoundary::default();
         let mut refresh_boundary = true;
         // Decision-28 stage 3: a handled MMIO transfer of a shared walk can
-        // complete inside its block (`device::in_block_access`).
+        // complete inside its block (`device::in_block_access`), and in a
+        // compiling run a compiled IN or OUT can (`device::in_block_port`).
         // A run without devices holds an empty slot that has no drop.
         let in_block = super::device::InBlockSlot::<DEVICES>::new(|| {
-            (devices.handler.is_some() && vm.device_table.has_mmio())
-                .then(|| super::device::InBlock::new(vm, self.device_cpu().id))
+            (devices.handler.is_some()
+                && (vm.device_table.has_mmio()
+                    || (KIND == MACHINE_DISPATCH
+                        && ctx.ret_stack != 0
+                        && vm.device_table.has_ports())))
+            .then(|| super::device::InBlock::new(vm, self.device_cpu().id))
         });
         let _in_block_scope = in_block.get().map(super::device::InBlock::publish);
         // Stores wholly inside live fields are absorbed where they are made
@@ -3924,6 +3951,10 @@ impl Vcpu {
                         External::OneStep => {
                             boundary.service = true;
                             boundary.one_step = true;
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            {
+                                boundary.one_step_why |= 8;
+                            }
                         }
                         External::Serviced(next, bus) => {
                             boundary = next;
@@ -4233,7 +4264,11 @@ impl Vcpu {
                     }
                 };
                 let single_step = boundary.single_step;
-                let remaining = if boundary.one_step {
+                let remaining = if boundary.one_step
+                    || (KIND == MACHINE_DISPATCH
+                        && options.stop_when_irq_ready
+                        && crate::vm::device::sets_if_before_last(&ir))
+                {
                     1
                 } else if DEVICES {
                     devices.cap(
@@ -4316,7 +4351,7 @@ impl Vcpu {
                         self.executed += count;
                         self.sti_shadow = false;
                         self.ss_shadow = 0;
-                        refresh_boundary = false;
+                        refresh_boundary = options.stop_when_irq_ready;
                         link_from = linking && ir.link_exit && !stop;
                         #[cfg(test)]
                         self.note_link_exit(&ir);
@@ -4509,6 +4544,7 @@ impl Vcpu {
                     // 8086 Family UM §2.6 p. 2-28: a lifted POPF or IRET can load
                     // TF; the instruction after it is the first one trapped.
                     refresh_boundary = boundary.one_step
+                        || options.stop_when_irq_ready
                         || boundary.pending_io
                         || self.sti_shadow
                         || self.ss_shadow & SS_HOLD != 0

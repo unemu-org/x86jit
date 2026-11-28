@@ -299,6 +299,10 @@ impl Table {
     pub fn has_mmio(&self) -> bool {
         !self.mmio.is_empty()
     }
+    #[inline(always)]
+    pub fn has_ports(&self) -> bool {
+        !self.ports.is_empty()
+    }
     fn rebuild(&mut self) {
         self.ports.clear();
         self.mmio.clear();
@@ -623,7 +627,7 @@ fn may_set_if(op: &crate::IrOp) -> bool {
 }
 /// Whether an instruction before the block's last can set IF. The last one's
 /// effect is first observed at the boundary after the block, as when stepped.
-fn sets_if_before_last(ir: &crate::ir::IrBlock) -> bool {
+pub(crate) fn sets_if_before_last(ir: &crate::ir::IrBlock) -> bool {
     let last = ir
         .ops
         .iter()
@@ -1218,6 +1222,21 @@ fn armed<'h>(
     &'h Vm,
     &'h Arc<crate::ir::IrBlock>,
 )> {
+    armed_for(DeviceSpace::Mmio, ir, address, size)
+}
+/// As `armed`, for a transfer in `space`.
+#[inline(always)]
+fn armed_for<'h>(
+    space: DeviceSpace,
+    ir: *const crate::ir::IrBlock,
+    address: u64,
+    size: u8,
+) -> Option<(
+    &'h InBlock,
+    &'h mut Run<'static>,
+    &'h Vm,
+    &'h Arc<crate::ir::IrBlock>,
+)> {
     if PUBLISHED.load(Ordering::Relaxed) == 0 {
         return None;
     }
@@ -1250,7 +1269,7 @@ fn armed<'h>(
     if run.decided.is_some()
         || run.handler.is_none()
         || vm.devices().poisoned()
-        || !vm.device_table.serves(DeviceSpace::Mmio, address, size)
+        || !vm.device_table.serves(space, address, size)
     {
         return None;
     }
@@ -1288,8 +1307,77 @@ pub(crate) fn in_block_access(
         steps: hook.steps.get() + completed,
     };
     serve(
-        hook, run, vm, ip, position, write, address, size, value, linear,
+        hook,
+        run,
+        vm,
+        ip,
+        DeviceSpace::Mmio,
+        position,
+        position,
+        write,
+        address,
+        size,
+        value,
+        linear,
     )
+}
+/// Decision-30 §4 for port I/O (xj-to9.79): a compiled Machine IN or OUT at
+/// `ip` of the armed block, whose privilege test passed, meets a port served
+/// in process and calls the handler where it stands. Returns the read value
+/// (zero for OUT) when the block continues as the interpreted path's
+/// handoff and completion would leave it; None defers, keeping any result in
+/// `Run::decided` for the re-execution's handoff, which settles it without
+/// calling the handler again. The request names the positions the
+/// interpreted path reports: the IN or OUT retires at its `Exit::PortIo`
+/// (`exec_port_io`), so the request's position counts it and its unit starts
+/// before it (`Vcpu::run_machine`'s port bookkeeping).
+#[cold]
+#[inline(never)]
+pub(crate) fn in_block_port(ip: u64, write: bool, port: u16, size: u8, value: u64) -> Option<u64> {
+    let (hook, run, vm, block) =
+        armed_for(DeviceSpace::Port, std::ptr::null(), u64::from(port), size)?;
+    let completed = instructions_before(block, ip)?;
+    let unit_start = DevicePosition {
+        retired_instructions: hook.retired.get() + completed,
+        steps: hook.steps.get() + completed,
+    };
+    let position = DevicePosition {
+        retired_instructions: unit_start.retired_instructions + 1,
+        steps: unit_start.steps + 1,
+    };
+    serve(
+        hook,
+        run,
+        vm,
+        ip,
+        DeviceSpace::Port,
+        position,
+        unit_start,
+        write,
+        u64::from(port),
+        size,
+        value,
+        None,
+    )
+}
+/// The completed instructions before the one at `ip` in `ir`, each retiring
+/// once and charging one step; a block with a string operation before it
+/// declines, as `sole_access` does.
+fn instructions_before(ir: &crate::ir::IrBlock, ip: u64) -> Option<u64> {
+    use crate::ir::IrOp;
+    use crate::legacy::LegacyOp as L;
+    let mut completed = 0u64;
+    for op in &ir.ops {
+        match op {
+            IrOp::InsnStart { guest_addr } if *guest_addr == ip => return Some(completed),
+            IrOp::InsnStart { .. } => completed += 1,
+            IrOp::RepString { .. }
+            | IrOp::RepStringReal { .. }
+            | IrOp::Legacy(L::String { .. } | L::WrappedString { .. }) => return None,
+            _ => {}
+        }
+    }
+    None
 }
 /// A compiled Machine unit deferred at ordinal `completed` of the block the
 /// hook is armed for (decision-30 §4): the interpreted pass that walks the
@@ -1342,7 +1430,18 @@ pub(crate) fn in_pass_access(
         steps: hook.steps.get() + steps,
     };
     let answer = serve(
-        hook, run, vm, ip, position, write, address, size, value, None,
+        hook,
+        run,
+        vm,
+        ip,
+        DeviceSpace::Mmio,
+        position,
+        position,
+        write,
+        address,
+        size,
+        value,
+        None,
     );
     #[cfg(test)]
     if answer.is_some() {
@@ -1359,7 +1458,9 @@ fn serve(
     run: &mut Run<'static>,
     vm: &Vm,
     ip: u64,
+    space: DeviceSpace,
     position: DevicePosition,
+    unit_start: DevicePosition,
     write: bool,
     address: u64,
     size: u8,
@@ -1368,7 +1469,7 @@ fn serve(
 ) -> Option<u64> {
     let mask = u64::MAX >> (64 - u32::from(size) * 8);
     let request = DeviceRequest {
-        space: DeviceSpace::Mmio,
+        space,
         address,
         direction: if write {
             DeviceDirection::Write
@@ -1388,8 +1489,9 @@ fn serve(
         event: None,
         vcpu_id: hook.vcpu_id,
         position,
-        // An MMIO transfer's unit is its own instruction.
-        unit_start: position,
+        // An MMIO transfer's unit is its own instruction; a port transfer's
+        // is the IN or OUT before it retired (`in_block_port`).
+        unit_start,
         cycles: None,
     };
     let (result, effects) = {

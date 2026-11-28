@@ -884,6 +884,7 @@ fn run_with(
 ) -> MachineJitCounters {
     let (bvm, mut b) = build(Subject::Mode(MachineJitMode::Off));
     let (avm, mut a) = build(subject);
+    a.enable_class_census_for_test();
     let devices = DEVICES.with(std::cell::Cell::get);
     let (mut subject_device, mut reference_device) = (Device::default(), Device::default());
     let mut next_tick = period;
@@ -966,7 +967,29 @@ fn run_with(
         word(0x100),
         word(0x104)
     );
-    a.machine_jit_counters_for_test()
+    let c = a.machine_jit_counters_for_test();
+    println!(
+        "{what}: retired {}, compiled_retired {}",
+        a.retired_instructions(),
+        c.compiled_retired
+    );
+    for ((name, n), r) in MachineJitCounters::REFUSAL_NAMES
+        .iter()
+        .zip(c.refusals)
+        .zip(c.refusals_retired)
+    {
+        if n != 0 {
+            println!("  refusal {name}: {n} turns, {r} retired");
+        }
+    }
+    if let Some(census) = a.class_census_for_test() {
+        let mut rows: Vec<_> = census.classes.into_iter().collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1 .0));
+        for ((row, class), (turns, retired)) in rows {
+            println!("  class {row} / {class}: {turns} turns, {retired} retired");
+        }
+    }
+    c
 }
 
 const SUBJECTS: [Subject; 5] = [

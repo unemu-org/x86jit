@@ -294,6 +294,19 @@ fn print_census(c: &MachineJitCounters, retired: u64) {
     );
 }
 
+/// The class census (xj-to9.79): which instruction classes kept blocks off
+/// the ordinary walk, and which boundary terms forced one step.
+fn print_classes(cpu: &Vcpu) {
+    let Some(census) = cpu.class_census_for_test() else {
+        return;
+    };
+    let mut rows: Vec<_> = census.classes.into_iter().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1 .0));
+    for ((row, class), (turns, retired)) in rows {
+        println!("  class {row} / {class}: {turns} turns, {retired} retired");
+    }
+}
+
 /// Run the subject `a` and the interpreted reference `b` in lockstep to HLT,
 /// asserting INTR every `tick` steps, and compare every call, the device
 /// transcripts and RAM.
@@ -376,6 +389,7 @@ fn host_instructions() -> u64 {
 fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
     let (avm, mut a) = machine(true);
     let (bvm, mut b) = machine(false);
+    a.enable_class_census_for_test();
     let host = lockstep(&avm, &mut a, &bvm, &mut b, TICK);
     println!(
         "host instructions per step {:.1}",
@@ -387,6 +401,7 @@ fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
     assert!(ticks > 10, "{ticks} timer interrupts");
     let c = a.machine_jit_counters_for_test();
     print_census(&c, a.retired_instructions());
+    print_classes(&a);
     assert!(c.compiled > 0, "{c:?}");
     assert!(c.compiled_retired > 0, "{c:?}");
     assert_eq!(

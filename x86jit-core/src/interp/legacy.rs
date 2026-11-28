@@ -2785,23 +2785,26 @@ pub(super) fn live_field(memory: &Memory, bus: u64, bytes: u8, extend: u8) -> Re
 
 pub(crate) fn flat32_ordinary(ir: &IrBlock) -> bool {
     ir.ops.iter().all(|op| match op {
-        IrOp::Legacy(op) => {
-            matches!(
-                op,
-                L::Address { .. }
-                    | L::LiveField { .. }
-                    | L::Flat32Address { .. }
-                    | L::SegmentedAddress { .. }
-                    | L::I486Gate
-                    | L::Checkpoint
-                    | L::ReadSelector { .. }
-                    | L::Transfer { cs: None, .. }
-                    | L::Return { far: false, .. }
-                    | L::Loop { .. }
-            ) || data_segment_load(op).is_some()
-        }
+        IrOp::Legacy(op) => flat32_ordinary_op(op),
         _ => supported(op),
     })
+}
+
+/// A legacy op the ordinary Flat32 walk runs (`flat32_ordinary`).
+pub(crate) fn flat32_ordinary_op(op: &L) -> bool {
+    matches!(
+        op,
+        L::Address { .. }
+            | L::LiveField { .. }
+            | L::Flat32Address { .. }
+            | L::SegmentedAddress { .. }
+            | L::I486Gate
+            | L::Checkpoint
+            | L::ReadSelector { .. }
+            | L::Transfer { cs: None, .. }
+            | L::Return { far: false, .. }
+            | L::Loop { .. }
+    ) || data_segment_load(op).is_some()
 }
 
 /// An op an instruction's MMIO handoff and re-execution repeat with the same

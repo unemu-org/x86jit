@@ -4496,6 +4496,9 @@ impl Shared {
         let machine_load_sig = params(5, true); // (cpu, mem, addr, size, config) -> status
         let machine_store_sig = params(6, true); // (cpu, mem, addr, size, value, config) -> status
         let machine_note_sig = params(4, true); // (cpu, mem, physical, size) -> status
+        let machine_port_sig = params(5, true); // (cpu, mem, port, value, meta) -> status
+        let machine_pushf_sig = params(2, true); // (cpu, mem) -> image
+        let machine_popf_sig = params(4, true); // (cpu, mem, image, size) -> status
         let str_sig = params(8, true); // string(cpu, mem, op, elem, rep, cur_addr, addr_bits, seg_base) -> i64
         let x87_sig = params(6, true); // x87(cpu, mem, kind, addr, sti, cur_addr) -> status + private FDP policy
         let xstate_sig = params(6, true);
@@ -4688,6 +4691,22 @@ impl Shared {
                 machine_note: helper!(
                     machine_note_sig,
                     x86jit_core::jit_abi::machine::machine_note,
+                    NeedsDefault
+                ),
+                // An embedder-owned device callback.
+                machine_port: helper!(
+                    machine_port_sig,
+                    x86jit_core::jit_abi::machine::machine_port,
+                    NeedsDefault
+                ),
+                machine_pushf: helper!(
+                    machine_pushf_sig,
+                    x86jit_core::jit_abi::machine::machine_pushf,
+                    NeedsDefault
+                ),
+                machine_popf: helper!(
+                    machine_popf_sig,
+                    x86jit_core::jit_abi::machine::machine_popf,
                     NeedsDefault
                 ),
                 cpuid: helper!(cpuid_sig, cpuid_helper, IntegerOnly),

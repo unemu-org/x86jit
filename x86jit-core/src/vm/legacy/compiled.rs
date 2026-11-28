@@ -7,7 +7,8 @@ use crate::code_lifetime::MachineTarget;
 use crate::interp::legacy::machine_jit;
 use crate::interp::legacy::Progress;
 use crate::jit_abi::{
-    MemCtx, RET_CHAIN, RET_CONTINUE, RET_LINK, RET_MACHINE_DEFER, RET_MACHINE_STOP, RET_RETURN_MISS,
+    MemCtx, RET_CHAIN, RET_CONTINUE, RET_LINK, RET_MACHINE_BOUNDARY, RET_MACHINE_DEFER,
+    RET_MACHINE_STOP, RET_RETURN_MISS,
 };
 
 use crate::jit_abi::machine::HELPER_DEFER;
@@ -199,6 +200,44 @@ fn tally_refusal(state: &mut Compiling, index: usize) {
     state.row = Some(index as u8);
 }
 
+/// Test-only tally of a refusal's class (`ClassCensus`), when the census is
+/// on, for the walk's retired count to follow.
+#[cfg(any(test, feature = "test-hooks"))]
+#[cold]
+#[inline(never)]
+fn tally_class(state: &mut Compiling, index: usize, class: impl FnOnce() -> &'static str) {
+    if let Some(classes) = state.classes.as_deref_mut() {
+        let key = (MachineJitCounters::REFUSAL_NAMES[index], class());
+        classes.classes.entry(key).or_default().0 += 1;
+        classes.pending = Some(key);
+    }
+}
+
+/// Test-only: the boundary terms that forced one step (`MachineBoundary`'s
+/// `one_step_why`), named for the class census.
+#[cfg(any(test, feature = "test-hooks"))]
+#[cold]
+#[inline(never)]
+fn one_step_class(why: u8) -> &'static str {
+    let names = [
+        "single-step run",
+        "a20 pending",
+        "stop when irq ready",
+        "external one-step",
+    ];
+    let named: Vec<&str> = names
+        .iter()
+        .enumerate()
+        .filter(|(bit, _)| why & (1 << bit) != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if named.is_empty() {
+        "unnamed"
+    } else {
+        intern(named.join(" + "))
+    }
+}
+
 /// Test-only tally of a missing unit (`MachineJitCounters::no_unit`) in
 /// `$counters`, and the row the turn's walk retires into in `$row`
 /// (`Compiling::row`), which exists only with test-hooks.
@@ -230,7 +269,10 @@ const CHAIN_END_DEFER: usize = 7;
 const CHAIN_END_STOP: usize = 8;
 /// Decision-32 §4: a paged chain stays inside its first block's page.
 const CHAIN_END_PAGE: usize = 9;
-const CHAIN_ENDS: usize = 10;
+/// xj-to9.79: a CLI/STI or POPF whose outcome the next boundary must see
+/// (`RET_MACHINE_BOUNDARY`).
+const CHAIN_END_BOUNDARY: usize = 10;
+const CHAIN_ENDS: usize = 11;
 
 impl MachineJitCounters {
     /// The names of [`Self::defer_causes`]' entries, in order.
@@ -294,6 +336,7 @@ impl MachineJitCounters {
         "defer",
         "stop",
         "page",
+        "boundary",
     ];
 }
 
@@ -512,6 +555,96 @@ pub struct ColdCensus {
     pending: Option<ColdKey>,
 }
 
+/// Test-only: the E2 walk refusals by the instruction class that kept their
+/// block off the ordinary walk, and the "E3 other one-step" refusals by the
+/// boundary term that forced one step (xj-to9.79). Keyed by the refusal row's
+/// name (`MachineJitCounters::REFUSAL_NAMES`) and the class; each value is
+/// the turns and the instructions their interpreted walks retired. Recorded
+/// while `Vcpu::enable_class_census_for_test` is on.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct ClassCensus {
+    pub classes: std::collections::BTreeMap<(&'static str, &'static str), (u64, u64)>,
+    pending: Option<(&'static str, &'static str)>,
+}
+
+/// Test-only: `name`, interned for the class census.
+#[cfg(any(test, feature = "test-hooks"))]
+fn intern(name: String) -> &'static str {
+    static NAMES: std::sync::Mutex<Option<std::collections::HashSet<&'static str>>> =
+        std::sync::Mutex::new(None);
+    let mut names = NAMES.lock().unwrap();
+    let names = names.get_or_insert_with(Default::default);
+    if let Some(known) = names.get(name.as_str()) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
+/// Test-only: a short name of the instruction class of an E2 walk refusal's
+/// block: the first op outside the ordinary Flat32 walk (`flat32_ordinary`),
+/// with port accesses, CLI/STI and PUSHF/POPF named by instruction.
+#[cfg(any(test, feature = "test-hooks"))]
+#[cold]
+#[inline(never)]
+fn walk_class(ir: &IrBlock, paged: bool) -> &'static str {
+    use crate::ir::{IrOp, Val};
+    use crate::legacy::LegacyOp as L;
+    let variant = |debug: String| {
+        debug
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or("op")
+            .to_owned()
+    };
+    let name = ir
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            IrOp::PortIo {
+                port,
+                size,
+                dir_out,
+                ..
+            } => Some(format!(
+                "{} {} size {size}",
+                if *dir_out { "OUT" } else { "IN" },
+                if matches!(port, Val::Imm(_)) {
+                    "imm8"
+                } else {
+                    "DX"
+                }
+            )),
+            _ => None,
+        })
+        .or_else(|| {
+            ir.ops.iter().find_map(|op| match op {
+                IrOp::SetIf { value: false } => Some("CLI".to_owned()),
+                IrOp::SetIf { value: true } => Some("STI".to_owned()),
+                IrOp::Hlt => Some("HLT".to_owned()),
+                IrOp::Legacy(L::Flags { pop: false, size }) => Some(format!("PUSHF size {size}")),
+                IrOp::Legacy(L::Flags { pop: true, size }) => Some(format!("POPF size {size}")),
+                IrOp::Legacy(L::Privileged { .. }) | IrOp::InsnStart { .. } => None,
+                IrOp::Legacy(inner) if machine_jit::outside_ordinary_walk(op) => {
+                    Some(variant(format!("{inner:?}")))
+                }
+                op if machine_jit::outside_ordinary_walk(op) => Some(variant(format!("{op:?}"))),
+                _ => None,
+            })
+        })
+        .or_else(|| {
+            ir.ops.iter().find_map(|op| match op {
+                IrOp::Legacy(L::Privileged { kind }) => Some(format!("privileged {kind:?}")),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| "ordinary".to_owned());
+    intern(if paged { format!("paged {name}") } else { name })
+}
+
 /// Slots of the per-vCPU memo: a direct-mapped table keyed by the block a
 /// proof or a link returned (decision-30 §6: no units lookup). A conflict
 /// moves the evicted slot to the victim table (`save_victim`), from which
@@ -666,6 +799,8 @@ pub(super) struct Compiling {
     row: Option<u8>,
     #[cfg(any(test, feature = "test-hooks"))]
     cold: Option<Box<ColdCensus>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    classes: Option<Box<ClassCensus>>,
 }
 
 impl Default for Compiling {
@@ -683,6 +818,8 @@ impl Default for Compiling {
             row: None,
             #[cfg(any(test, feature = "test-hooks"))]
             cold: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            classes: None,
         }
     }
 }
@@ -1093,6 +1230,30 @@ impl Vcpu {
             .and_then(|c| c.cold.as_deref().cloned())
     }
 
+    /// Test-only: record [`ClassCensus`] on this vCPU from its next turn on.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn enable_class_census_for_test(&mut self) {
+        if let Some(execution) = self.legacy_execution.as_mut() {
+            execution
+                .machine_jit
+                .compiling
+                .get_or_insert_with(Box::default)
+                .classes
+                .get_or_insert_with(Box::default);
+        }
+    }
+
+    /// Test-only: the class census, if it was enabled.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn class_census_for_test(&self) -> Option<ClassCensus> {
+        self.legacy_execution
+            .as_ref()
+            .and_then(|e| e.machine_jit.compiling.as_deref())
+            .and_then(|c| c.classes.as_deref().cloned())
+    }
+
     /// Test-only: an interpreted walk that followed a census entry retired
     /// `retired` instructions; charge them to the entry's row.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1117,6 +1278,11 @@ impl Vcpu {
         if let Some(cold) = state.cold.as_deref_mut() {
             if let Some(key) = cold.pending.take() {
                 cold.keys.entry(key).or_default().cold_retired += retired;
+            }
+        }
+        if let Some(classes) = state.classes.as_deref_mut() {
+            if let Some(key) = classes.pending.take() {
+                classes.classes.entry(key).or_default().1 += retired;
             }
         }
     }
@@ -1152,15 +1318,20 @@ impl Vcpu {
         // default MXCSR mode and does not clear RF, which a retiring
         // instruction does (SDM Vol 3B §20.3.1.1), so RF=1 stays interpreted.
         // Paged, E9 and E10 (`paged_entry`).
+        // xj-to9.79: a singleton block outside the ordinary walk whose one
+        // instruction compiled code completes (`system_singleton`): CLI,
+        // STI, IN, OUT, PUSHF, POPF.
         let paged = context.paging_enabled;
         let cpl = self.cpu.legacy.cpl;
+        let system = matches!(walk, BlockWalk::Protected) && machine_jit::system_singleton(ir);
         if !(context.segment_class == crate::SegmentClass::Flat32
             && (cpl == 0 || cpl == 3)
-            && if paged {
-                matches!(walk, BlockWalk::Paged)
-            } else {
-                matches!(walk, BlockWalk::Direct)
-            })
+            && (system
+                || if paged {
+                    matches!(walk, BlockWalk::Paged)
+                } else {
+                    matches!(walk, BlockWalk::Direct)
+                }))
         {
             #[cfg(any(test, feature = "test-hooks"))]
             {
@@ -1171,7 +1342,11 @@ impl Vcpu {
                 } else {
                     walk_refusal(ir)
                 };
-                tally_refusal(execution.machine_jit.compiling(), reason);
+                let state = execution.machine_jit.compiling();
+                tally_refusal(state, reason);
+                if matches!(reason, REFUSE_WALK_STRING | REFUSE_WALK_PORT | REFUSE_WALK) {
+                    tally_class(state, reason, || walk_class(ir, paged));
+                }
             }
             return None;
         }
@@ -1199,6 +1374,9 @@ impl Vcpu {
                     .machine_jit
                     .compiling();
                 tally_refusal(state, reason);
+                if reason == REFUSE_ONE_STEP_OTHER {
+                    tally_class(state, reason, || one_step_class(boundary.one_step_why));
+                }
             }
             return None;
         }
@@ -1287,7 +1465,9 @@ impl Vcpu {
                 // stay in the J2 class: unpaged, CPL 0. Paged and CPL-3
                 // units are witnessed in the Forced, Delayed and background
                 // modes.
-                if paged || cpl != 0 {
+                // Its prefix walk is the ordinary one: singletons outside
+                // it run interpreted (`system_singleton`).
+                if paged || cpl != 0 || system {
                     return None;
                 }
                 let runs = slot.runs;
@@ -1588,8 +1768,9 @@ impl Vcpu {
         #[cfg(not(any(test, feature = "test-hooks")))]
         let before = 0;
         let Some(last) = last else {
-            let result =
-                self.machine_result::<ROUTED, ORDER>(vm, ir, code, ordinal, remaining, exit_word);
+            let result = self.machine_result::<ROUTED, ORDER>(
+                vm, ir, context, code, ordinal, remaining, exit_word,
+            );
             self.count_privilege(paged, cpl, before);
             return Some((result, None));
         };
@@ -1600,6 +1781,7 @@ impl Vcpu {
         let result = self.machine_result::<ROUTED, ORDER>(
             vm,
             &last,
+            context,
             code,
             ordinal,
             remaining - prefix,
@@ -1691,10 +1873,12 @@ impl Vcpu {
     /// A compiled block's return, for `ir`, the block that returned it, with
     /// `remaining` its budget (decision-29 §3; decision-31 Q4: `RET_CHAIN`
     /// that ends a chain, `RET_LINK` and `RET_RETURN_MISS` are completions).
+    #[allow(clippy::too_many_arguments)]
     fn machine_result<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
         ir: &Arc<IrBlock>,
+        context: MachineContext,
         code: u64,
         ordinal: u64,
         remaining: u64,
@@ -1761,7 +1945,32 @@ impl Vcpu {
                     counters.unconditional_defers += 1;
                 }
                 census(counters, CHAIN_END_DEFER);
-                Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word))
+                Compiled::Walk(
+                    self.deferred::<ROUTED, ORDER>(vm, ir, context, c, remaining, exit_word),
+                )
+            }
+            // xj-to9.79: a CLI/STI or POPF singleton completed with an
+            // outcome the next boundary must see. The walk result is the
+            // interpreted walk's for that instruction (`execute_checked`).
+            RET_MACHINE_BOUNDARY => {
+                use crate::jit_abi::machine::{BOUNDARY_ARM_STI, BOUNDARY_CONTEXT};
+                debug_assert!(
+                    static_successor(ir, self.cpu.rip),
+                    "a boundary left RIP at {:#x}, no successor of {:#x}",
+                    self.cpu.rip,
+                    ir.guest_start
+                );
+                #[cfg(any(test, feature = "test-hooks"))]
+                {
+                    counters.continues += 1;
+                    counters.compiled_retired += n;
+                }
+                census(counters, CHAIN_END_BOUNDARY);
+                Compiled::Walk(machine_jit::completed_at_boundary(
+                    n,
+                    ordinal & BOUNDARY_ARM_STI != 0,
+                    ordinal & BOUNDARY_CONTEXT != 0,
+                ))
             }
             other => panic!("compiled Machine block returned invalid ABI code {other}"),
         }
@@ -1773,6 +1982,7 @@ impl Vcpu {
         &mut self,
         vm: &Vm,
         ir: &Arc<IrBlock>,
+        context: MachineContext,
         c: u64,
         remaining: u64,
         exit_word: &AtomicU64,
@@ -1791,6 +2001,37 @@ impl Vcpu {
             crate::vm::device::advance_armed(c);
         }
         let from = machine_jit::instruction_op(ir, c);
+        // xj-to9.79: a singleton outside the ordinary walk takes the walk the
+        // dispatcher gives it (`BlockWalk::Protected`), which raises the
+        // #GP, consults the I/O bitmap and issues the port exit itself.
+        if ir.icount == 1 && !machine_jit::ordinary_walk(ir) {
+            let suffix = if context.paging_enabled {
+                self.execute_paged::<ROUTED, ORDER>(vm, ir, context, remaining, false)
+            } else {
+                let model = self.legacy_model.unwrap();
+                let retired = self.retired;
+                self.legacy_execution
+                    .as_mut()
+                    .unwrap()
+                    .execute_protected_block::<ROUTED, ORDER>(
+                        ir,
+                        &mut self.cpu,
+                        &vm.mem,
+                        &mut self.interp_scratch,
+                        model,
+                        retired,
+                    )
+            };
+            let counters = self
+                .legacy_execution
+                .as_mut()
+                .unwrap()
+                .machine_jit
+                .counters();
+            counters.defers_at_zero += 1;
+            counters.suffix[machine_jit::suffix_kind(&suffix)] += 1;
+            return suffix;
+        }
         // Decision-32 §3: a paged block's rest takes the paged walk, which
         // walks, sets A and D, raises #PF and publishes CR2 itself.
         let suffix = if self.cpu.legacy.cr0 & (1 << 31) != 0 {
@@ -1866,6 +2107,7 @@ impl Vcpu {
             let (result, z) = self.scripted_block::<ROUTED, ORDER>(
                 vm,
                 &cur,
+                context,
                 remaining - prefix,
                 seed,
                 runs.wrapping_add(prefix.wrapping_mul(0x1_0000_0001)),
@@ -1931,10 +2173,12 @@ impl Vcpu {
     }
 
     /// One scripted block (mode 4), and the seeded draw it made.
+    #[allow(clippy::too_many_arguments)]
     fn scripted_block<const ROUTED: bool, const ORDER: u8>(
         &mut self,
         vm: &Vm,
         ir: &Arc<IrBlock>,
+        context: MachineContext,
         remaining: u64,
         seed: u64,
         runs: u64,
@@ -2011,7 +2255,9 @@ impl Vcpu {
         counters.unconditional_defers += 1;
         census(counters, CHAIN_END_DEFER);
         (
-            Compiled::Walk(self.deferred::<ROUTED, ORDER>(vm, ir, c, remaining, exit_word)),
+            Compiled::Walk(
+                self.deferred::<ROUTED, ORDER>(vm, ir, context, c, remaining, exit_word),
+            ),
             z,
         )
     }

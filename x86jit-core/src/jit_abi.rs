@@ -96,6 +96,14 @@ pub const RET_MACHINE_DEFER: u64 = 17;
 /// dispatcher ends the turn there, as the interpreted walk does after a store
 /// that left the dispatch word set.
 pub const RET_MACHINE_STOP: u64 = 18;
+/// Machine profile only (xj-to9.79): the block's instructions completed, the
+/// last one a CLI/STI or POPF that may change what the next boundary decides
+/// (it set IF, armed the STI shadow, set TF or changed IOPL or NT), and RIP
+/// holds its successor. `MemCtx::machine_ordinal` holds the outcome bits
+/// (`machine::BOUNDARY_ARM_STI`, `machine::BOUNDARY_CONTEXT`). The
+/// dispatcher handles the completion as the interpreted walk's outcome of the
+/// same instruction, refreshing the boundary; no chain crosses it.
+pub const RET_MACHINE_BOUNDARY: u64 = 19;
 
 /// Maximum distinct guest-access descriptors in one compiled block or region.
 /// Cranelift user trap codes below 250 are reserved for these descriptors.
@@ -1285,6 +1293,7 @@ mod frozen_application_abi {
         assert_eq!(RET_RETURN_MISS, 16);
         assert_eq!(RET_MACHINE_DEFER, 17);
         assert_eq!(RET_MACHINE_STOP, 18);
+        assert_eq!(RET_MACHINE_BOUNDARY, 19);
         assert_eq!(MAX_GUEST_ACCESS_DESCRIPTORS, 249);
         assert_eq!(RET_STACK_LEN, 64);
         assert_eq!(MEMCTX_BASE, 0);

@@ -587,3 +587,22 @@ the same start ran further but was handed the short unit, which fell through at 
 while the long block's count was charged (an embedder saw retired counts drift ahead of
 execution). With the extent in the key a lift of a different extent never enters another
 extent's unit; chain descriptors already pair each entry with its own IR.
+
+## Note: CLI, STI, IN, OUT, PUSHF and POPF compile as singleton blocks (2026-11-28, xj-to9.79)
+
+The §3 table's "defer" for CLI/STI, IN/OUT and PUSHF/POPF changes for Flat32 protected-mode
+code, paged or not. Each stays a singleton block outside the ordinary walk
+(`BlockWalk::Protected`); a compiled unit is admitted for such a block when its one
+instruction is lowered (`machine_jit::system_singleton`), and a defer at it takes the walk
+the dispatcher gives it. The IOPL test of CLI, STI, IN and OUT is read live (§7 holds: no
+IOPL in the key); CPL > IOPL defers, and the interpreter raises #GP(0) or consults the
+I/O permission bitmap. IN and OUT call `device::in_block_port`, the decision-28 in-block
+contract for ports: a Handled answer with no effects completes in place with the positions
+the interpreted exit reports; anything else defers with the result kept for the
+re-execution's handoff. PUSHF and POPF (CPL 0, 32-bit flat stack) use the interpreter's
+image and flag load. An STI that sets IF, and a POPF that sets IF or changes any system
+flag, return `RET_MACHINE_BOUNDARY`: the dispatcher handles them as the interpreted walk's
+outcome (the STI shadow armed, a context change for IOPL or NT), so no chain crosses a
+boundary that may accept an interrupt. Under `with_stop_when_irq_ready` the Machine
+dispatcher now steps one unit at a time only while IF = 1; with IF = 0 no boundary before
+the one after an IF-setting instruction can stop.

@@ -17,8 +17,12 @@
 use super::*;
 use x86jit_core::jit_abi::machine as abi;
 use x86jit_core::jit_abi::MEMCTX_GUEST_BASE;
-use x86jit_core::jit_abi::{MemCtx, RET_MACHINE_DEFER, RET_MACHINE_STOP};
+use x86jit_core::jit_abi::{MemCtx, RET_MACHINE_BOUNDARY, RET_MACHINE_DEFER, RET_MACHINE_STOP};
 use x86jit_core::legacy::LegacyOp;
+
+/// `Flags::if_` in `CpuState`.
+const IF_FLAG: i32 = (std::mem::offset_of!(x86jit_core::CpuState, flags)
+    + std::mem::offset_of!(x86jit_core::Flags, if_)) as i32;
 
 pub(crate) struct MachineLowering {
     config: u64,
@@ -477,8 +481,177 @@ impl Translator<'_, '_> {
                 self.machine_chain();
                 Some(true)
             }
+            // xj-to9.79: the run-time CPL <= IOPL test of CLI, STI, IN and
+            // OUT (`interp::legacy::privilege::check`), read live
+            // (decision-30 §7). A failing test defers before any effect: the
+            // interpreter raises #GP(0) (SDM Vol 2A CLI, "Protected Mode
+            // Exceptions") or, for IN and OUT, consults the I/O permission
+            // bitmap (SDM Vol 1 §19.5.2; 80386 PRM §8.3.2 pp. 8-5-6).
+            IrOp::Legacy(LegacyOp::Privileged { .. }) => {
+                use x86jit_core::CpuState;
+                let cpl = self.builder.ins().uload8(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    (std::mem::offset_of!(CpuState, legacy)
+                        + std::mem::offset_of!(x86jit_core::legacy::LegacyCpuState, cpl))
+                        as i32,
+                );
+                let rflags = self.builder.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    self.cpu,
+                    std::mem::offset_of!(CpuState, rflags_system) as i32,
+                );
+                let iopl = self.builder.ins().ushr_imm_s(rflags, 12);
+                let iopl = self.builder.ins().band_imm_s(iopl, 3);
+                let deferred = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, cpl, iopl);
+                self.machine_defer_if(deferred);
+                Some(false)
+            }
+            // CLI and STI (SDM Vol 2A CLI; Vol 2B §4.3 STI). An STI that
+            // sets IF arms its shadow: interrupts are recognized after the
+            // next instruction, so the block returns to the dispatcher with
+            // the interpreted walk's outcome (`RET_MACHINE_BOUNDARY`).
+            IrOp::SetIf { value } => {
+                let old = self.load_flag(IF_FLAG);
+                let new = self.builder.ins().iconst(types::I8, i64::from(*value));
+                self.store_flag(IF_FLAG, new);
+                if *value {
+                    let armed = self.builder.ins().icmp_imm_s(IntCC::Equal, old, 0);
+                    let bits = self.iconst(abi::BOUNDARY_ARM_STI);
+                    self.machine_boundary_if(armed, bits);
+                }
+                Some(false)
+            }
+            // IN and OUT (SDM Vol 2A IN; Vol 2B §4.3 OUT): a port an
+            // in-process device serves completes here (`machine_port`);
+            // anything else defers, and the interpreter issues the exit.
+            IrOp::PortIo {
+                port,
+                value,
+                size,
+                dir_out,
+            } => {
+                let port = self.val(*port);
+                let port = self.builder.ins().band_imm_s(port, 0xffff);
+                let value = self.val(*value);
+                let ip = self.iconst(self.cur_addr);
+                self.store_mem(std::mem::offset_of!(MemCtx, machine_value) as i32, ip);
+                let meta = self.iconst(u64::from(*size) | (u64::from(*dir_out) << 8));
+                let call = self.call_helper(
+                    self.helpers.machine_port,
+                    &[self.cpu, self.mem, port, value, meta],
+                );
+                let status = self.builder.inst_results(call)[0];
+                let deferred =
+                    self.builder
+                        .ins()
+                        .icmp_imm_s(IntCC::NotEqual, status, abi::ACCESS_DONE as i64);
+                self.machine_defer_if(deferred);
+                if !*dir_out {
+                    // `Vcpu::complete_port_in`: the accumulator of the size.
+                    let answer = self.load_mem(std::mem::offset_of!(MemCtx, machine_value) as i32);
+                    self.write_gpr(RAX, answer, *size);
+                }
+                Some(false)
+            }
+            IrOp::Legacy(LegacyOp::Flags { size, pop: false }) => {
+                self.machine_pushf(*size);
+                Some(false)
+            }
+            IrOp::Legacy(LegacyOp::Flags { size, pop: true }) => {
+                self.machine_popf(*size);
+                Some(false)
+            }
             _ => None,
         }
+    }
+
+    /// A run-time `RET_MACHINE_BOUNDARY` after the block's one instruction,
+    /// with outcome `bits`, in a cold block that ends.
+    fn machine_boundary_if(&mut self, cond: Value, bits: Value) {
+        let ok = self.begin_trap_fork(cond);
+        let cold = self.builder.current_block().unwrap();
+        self.builder.set_cold_block(cold);
+        let end = self.iconst(self.guest_end);
+        self.store_cpu(self.offsets.rip, end);
+        self.store_mem(std::mem::offset_of!(MemCtx, machine_ordinal) as i32, bits);
+        self.ret(RET_MACHINE_BOUNDARY);
+        self.builder.switch_to_block(ok);
+    }
+
+    /// The flat stack operand at `sp` of `size` bytes: the whole-operand
+    /// check of a Flat32 push or pop (`interp::legacy::flat32_address`); an
+    /// operand past FFFFFFFFh defers and the interpreter raises #SS.
+    fn machine_stack_check(&mut self, sp: Value, size: u8) {
+        let last = u64::from(u32::MAX) - u64::from(size - 1);
+        let deferred = self
+            .builder
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, sp, last as i64);
+        self.machine_defer_if(deferred);
+    }
+
+    /// PUSHF/PUSHFD at CPL 0 with a 32-bit flat stack (SDM Vol 2B §4.3
+    /// PUSHF): the interpreter's image (`machine_pushf`), stored at
+    /// ESP - size, then ESP written, its only commit after the store.
+    fn machine_pushf(&mut self, size: u8) {
+        self.sync_guest_fault_state();
+        let call = self.call_helper(self.helpers.machine_pushf, &[self.cpu, self.mem]);
+        let image = self.builder.inst_results(call)[0];
+        let esp = self.read_gpr(RSP);
+        let sp = self.builder.ins().iadd_imm_s(esp, -i64::from(size));
+        let sp = self.builder.ins().band_imm_s(sp, 0xffff_ffff);
+        self.machine_stack_check(sp, size);
+        let config = self.machine.as_ref().unwrap().config;
+        let stopped = if config & abi::CONFIG_ROUTED == 0 {
+            self.machine_inline_store(sp, image, size, config)
+        } else {
+            self.machine_helper_store(sp, image, size, config)
+        };
+        let machine = self.machine.as_mut().unwrap();
+        machine.stored = true;
+        let stop = machine.stop;
+        let before = self.builder.use_var(stop);
+        let after = self.builder.ins().bor(before, stopped);
+        self.builder.def_var(stop, after);
+        self.write_gpr(RSP, sp, 4);
+    }
+
+    /// POPF/POPFD at CPL 0 with a 32-bit flat stack (SDM Vol 2B §4.3
+    /// POPF): the read at ESP, the interpreter's flag load
+    /// (`machine_popf`), then ESP + size. A load that set IF, changed a
+    /// system flag or IOPL returns `RET_MACHINE_BOUNDARY` with its outcome.
+    fn machine_popf(&mut self, size: u8) {
+        let esp = self.read_gpr(RSP);
+        let sp = self.builder.ins().band_imm_s(esp, 0xffff_ffff);
+        self.machine_stack_check(sp, size);
+        let config = self.machine.as_ref().unwrap().config;
+        let image = if config & abi::CONFIG_ROUTED == 0 {
+            self.machine_inline_load(sp, size, config)
+        } else {
+            self.machine_helper_load(sp, size, config)
+        };
+        self.sync_guest_fault_state();
+        let width = self.iconst(u64::from(size));
+        let call = self.call_helper(
+            self.helpers.machine_popf,
+            &[self.cpu, self.mem, image, width],
+        );
+        let status = self.builder.inst_results(call)[0];
+        let next = self.builder.ins().iadd_imm_s(sp, i64::from(size));
+        let next = self.builder.ins().band_imm_s(next, 0xffff_ffff);
+        self.write_gpr(RSP, next, 4);
+        let boundary = self.builder.ins().icmp_imm_s(IntCC::NotEqual, status, 0);
+        let bits = self.builder.ins().band_imm_s(
+            status,
+            (abi::BOUNDARY_ARM_STI | abi::BOUNDARY_CONTEXT) as i64,
+        );
+        self.machine_boundary_if(boundary, bits);
     }
 
     /// A static exit (decision-31 §2.1): RIP holds the target; chain through
