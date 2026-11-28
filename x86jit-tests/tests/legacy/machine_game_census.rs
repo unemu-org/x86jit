@@ -612,5 +612,8 @@ fn a_wide_working_set_reaches_the_threshold() {
         reached >= 2 * ROUTINE_COUNT as usize,
         "{reached} keys reached T1"
     );
-    assert!(most < 2 * 50, "a key stayed cold for {most} turns");
+    // A Busy answer from the background queue makes a block count T1 again
+    // (xj-to9.82), so a loaded host can add a recount or two; restarted
+    // counts left keys cold for thousands of turns.
+    assert!(most < 5 * 50, "a key stayed cold for {most} turns");
 }
