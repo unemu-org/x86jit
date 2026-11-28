@@ -1616,8 +1616,9 @@ impl Vm {
     }
 
     /// Fallible sparse backing with an injected backend (§4.1).
-    /// All instructions use the checked interpreter path, including when a
-    /// JIT backend is selected. Existing Flat/Reserved constructors are unchanged.
+    /// Application code uses the checked interpreter path even when a JIT
+    /// backend is selected; compiled Machine blocks run on it (decision-33).
+    /// Existing Flat/Reserved constructors are unchanged.
     pub fn with_backend_sparse(
         config: VmConfig,
         backend: Box<dyn Backend>,
