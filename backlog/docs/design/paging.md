@@ -406,11 +406,22 @@ a linear address another directory maps elsewhere is another key. Paged Segmente
 in a 64-entry table. A stamp that table evicts keeps its id and its proofs: the id
 goes to a retired map of up to 4096 stamps, and an equal stamp that returns gets it
 back, so equal stamps never fork their keys. A full retired map forgets its least
-recently used stamp with that stamp's proofs, one per eviction. The two maps hold at
-most 4,160 stamps of about 200 bytes, about 0.9 MB per vCPU, beside the proof map's
-bound of 16384 blocks or 32 MiB of IR and instruction tables (measured paged blocks
-weigh 1.1-1.3 KiB). That budget leaves out each proof's map entry, page list, code
-registration and source-index entries, so real use is higher; with the unpaged
+recently used stamp with that stamp's proofs, one per eviction. Recorded writes and
+evictions cost their own work, not the number of proofs held (xj-to9.85): the proof
+map indexes each proof's registered bytes by 64-byte granule in chains a proof leaves
+in constant time, so a drained store visits only the proofs whose bytes share its
+granules; a stamp's proofs form a chain of their own, and the retired map is also
+ordered by last use, so forgetting a stamp walks only its proofs. A proof's
+per-instruction source ranges are joined where they touch before they are split into
+granules, and a 32-byte node names its proof by a slot, not by its key: the index
+measured 116-230 bytes per paged proof (`machine32_paged_churn` with `test-hooks`),
+2.0 MB for 16,322 flat blocks and 2.2 MB for 15,445 proofs under 8,000 Segmented
+stamps, about 2 MB per vCPU at the bound. The two maps hold at
+most 4,160 stamps of about 200 bytes, about 1 MB per vCPU with that order, beside the proof map's
+bound of 16384 blocks or 32 MiB of IR, instruction tables and index nodes and slots
+(`flat32::weight`; measured paged blocks weigh 1.1-1.3 KiB). That budget leaves out
+each proof's map entry, the index's chain heads, its code registration and
+source-index entries, so real use is higher; with the unpaged
 map's own 32 MiB, a vCPU that fills both holds about 64 MiB of counted bytes plus
 that overhead. Replacing a data or stack
 entry expires nothing: no proof depends on it, and a fetch through that page

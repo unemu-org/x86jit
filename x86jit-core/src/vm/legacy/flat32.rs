@@ -59,11 +59,16 @@ pub(super) const MAX_PROOFS: usize = 8192;
 pub(super) const MAX_PROOF_BYTES: usize = 32 << 20;
 
 /// A proof's weight against `MAX_PROOF_BYTES`: its IR (the block, its ops
-/// at their capacity) and its registered source ranges.
-pub(super) fn weight(ir: &IrBlock, sources: usize) -> usize {
+/// at their capacity) and what its key over `sources` adds to the map's
+/// source index (`proof_map::index_weight`).
+pub(super) fn weight<K: super::proof_map::ProofKey>(
+    ir: &IrBlock,
+    key: &K,
+    sources: &[(u64, u32)],
+) -> usize {
     std::mem::size_of::<IrBlock>()
         + ir.ops.capacity() * std::mem::size_of::<IrOp>()
-        + sources * std::mem::size_of::<(u64, u64)>()
+        + super::proof_map::index_weight(key, sources)
 }
 
 struct Proof {
@@ -239,7 +244,7 @@ impl State {
             let mut ir = ir;
             // The lift's spare capacity would count against the budget.
             ir.ops.shrink_to_fit();
-            let weight = weight(&ir, sources.len());
+            let weight = weight(&ir, &key, &sources);
             if self
                 .blocks
                 .make_room(MAX_PROOFS, MAX_PROOF_BYTES, weight, why!(Bound), |proof| {

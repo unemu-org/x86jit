@@ -464,6 +464,71 @@ fn a_paged_loop_that_reloads_its_data_segments_keeps_its_flat_proofs() {
     }
 }
 
+/// The store variant (xj-to9.85, `paged_churn::setup_stores`): a flat
+/// ring-0 loop of 1500 blocks over a few code pages, every tenth block
+/// storing beside its own page's code (or on a page without code). A store
+/// overlaps no block's bytes, so no proof drops for it: the loop lifts each
+/// block entry once, whichever page it writes (a code-page store ends its
+/// block's run, and the walk enters the rest of the block there).
+#[test]
+fn a_store_beside_a_page_of_code_drops_no_proof() {
+    use x86jit_tests::paged_churn::{self, Stores};
+    const ITERATIONS: u32 = 3;
+    const BLOCKS: u32 = 1500;
+    for stores in [Stores::CodePage, Stores::Data] {
+        let (vm, mut cpu) =
+            paged_churn::setup_stores(CpuModel::I80486Dx, ITERATIONS, BLOCKS, 10, stores);
+        vm.relift_diagnostics(true);
+        run(&vm, &mut cpu);
+        let d = vm.relift_diagnostics(true);
+        assert_eq!(
+            cpu.retired_instructions(),
+            paged_churn::expected_retired_stores(ITERATIONS, BLOCKS, 10),
+            "{stores:?} {d}"
+        );
+        let paged = Some(ProofClass::Paged);
+        let first = d.lifts(paged, ReliftCause::First);
+        assert_eq!(d.total(paged), first, "{stores:?} {d}");
+        // Each block once, the rest of each storing block, the tail and the
+        // page boundaries.
+        assert!(
+            first <= u64::from(BLOCKS + BLOCKS / 10) + 16,
+            "{stores:?}: {first}"
+        );
+    }
+}
+
+/// The context variant (xj-to9.85, `paged_churn::setup_contexts`): 300
+/// resident flat blocks, then a loop through 100 Segmented stamps, one ES
+/// data segment each, twice. The stamps fit the retained and retired
+/// identities, so the second pass lifts nothing.
+#[test]
+fn a_returning_segmented_stamp_keeps_its_proofs() {
+    use x86jit_tests::paged_churn;
+    const BLOCKS: u32 = 300;
+    const STAMPS: u32 = 100;
+    let lifts = |iterations: u32| {
+        let (vm, mut cpu) =
+            paged_churn::setup_contexts(CpuModel::I80486Dx, iterations, BLOCKS, STAMPS);
+        vm.relift_diagnostics(true);
+        run(&vm, &mut cpu);
+        let d = vm.relift_diagnostics(true);
+        assert_eq!(
+            cpu.retired_instructions(),
+            paged_churn::expected_retired_contexts(iterations, BLOCKS),
+            "{d}"
+        );
+        let paged = Some(ProofClass::Paged);
+        let first = d.lifts(paged, ReliftCause::First);
+        assert_eq!(d.total(paged), first, "{d}");
+        first
+    };
+    let once = lifts(STAMPS);
+    // Every stamp lifts its Segmented blocks.
+    assert!(once >= u64::from(BLOCKS + 2 * STAMPS), "{once}");
+    assert_eq!(lifts(2 * STAMPS), once);
+}
+
 /// The churn loop's wide variant (xj-to9.75, `paged_churn::setup_wide`): a
 /// flat ring-0 kernel loop of many blocks, entered under one of several
 /// page directories that all map it to the same frames, as a kernel runs

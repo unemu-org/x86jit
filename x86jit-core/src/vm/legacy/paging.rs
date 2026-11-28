@@ -15,8 +15,9 @@ use std::cell::Cell;
 // blocks once its proofs stopped being dropped and relifted under new
 // contexts (xj-to9.75): a loop over more blocks than the bound relifts a
 // quarter of them per pass. 16384 blocks, as the unpaged map's 8192 plus
-// room for a kernel's 16-bit and V86 paths, and at most 32 MiB of IR and
-// instruction tables (`flat32::weight`), the unpaged map's budget:
+// room for a kernel's 16-bit and V86 paths, and at most 32 MiB of IR,
+// instruction tables and source-index nodes (`flat32::weight`), the
+// unpaged map's budget:
 // measured paged blocks of 3-10 instructions weigh 1.1-1.3 KiB, so the
 // count binds first; 1000 blocks of 32 instructions reach the bytes.
 const MAX_BLOCKS: usize = 16384;
@@ -24,7 +25,8 @@ const MAX_BLOCK_BYTES: usize = 32 << 20;
 const MAX_CONTEXTS: usize = 64;
 // Evicted complete stamps whose ids (and proofs) are kept for their return
 // (`State::evict_context`). A stamp is about 200 bytes: the two maps hold
-// at most 4,160, about 0.9 MB per vCPU, beside the proof map's 32 MiB.
+// at most 4,160, about 1 MB per vCPU with the retired order, beside the
+// proof map's 32 MiB.
 const MAX_RETIRED: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,17 @@ impl super::diag::DiagKey for Key {
             ("cr0", u64::from(self.cr0)),
         ]);
         fields
+    }
+}
+
+// A complete stamp's proofs leave together when a full retired map forgets
+// it (`State::evict_context`): its id is their group. A Flat32 identity's id
+// (`LegacyContextStamp::reduced_word`, bit 63 set) is never forgotten.
+impl super::proof_map::ProofKey for Key {
+    #[inline]
+    fn group(&self) -> Option<u64> {
+        let id = self.decode.context_id;
+        (id >> 63 == 0).then_some(id)
     }
 }
 
@@ -106,7 +119,10 @@ pub(super) struct State {
     // with its last use. A Flat32 identity is not interned: its id is its
     // stamp (`LegacyContextStamp::reduced_word`).
     contexts: EngineMap<LegacyContextStamp, (u64, u64)>,
-    retired: EngineMap<LegacyContextStamp, (u64, u64)>,
+    retired: EngineMap<Arc<LegacyContextStamp>, (u64, u64)>,
+    // `retired` by last use and id, least recent first (xj-to9.85): a full
+    // map finds the stamp it forgets without a scan.
+    retired_by_use: std::collections::BTreeMap<(u64, u64), Arc<LegacyContextStamp>>,
     next_context: u64,
     model: Option<LegacyCpuModel>,
     memory: usize,
@@ -285,6 +301,7 @@ impl State {
         self.synced = None;
         self.contexts.clear();
         self.retired.clear();
+        self.retired_by_use.clear();
         self.next_context = 0;
         *self.recent = [None; 4];
     }
@@ -507,7 +524,10 @@ impl State {
             let id = self
                 .retired
                 .remove(&stamp)
-                .map(|(id, _)| id)
+                .map(|(id, used)| {
+                    self.retired_by_use.remove(&(used, id));
+                    id
+                })
                 .unwrap_or_else(|| {
                     let id = self.next_context;
                     self.next_context += 1;
@@ -573,10 +593,11 @@ impl State {
     // full `retired` forgets its least recently used stamp, and only that
     // stamp's proofs leave with it: no stamp can name its id again. The
     // recent entries' uses are the latest; the map records the rest. Once
-    // `retired` is full, each new complete stamp scans every proof here
-    // (`remove_where`, up to `MAX_BLOCKS`) and the retired map: a cost only
-    // a guest cycling through more than 4,160 complete stamps pays, once
-    // per stamp, beside that stamp's lift.
+    // `retired` is full, each new complete stamp forgets the first of
+    // `retired_by_use` and walks the forgotten id's proofs
+    // (`ProofMap::remove_group`, xj-to9.85): no scan of the proofs or the
+    // retired stamps. Each selection takes the next use, so uses are
+    // distinct and the order is the least recent use's.
     #[cold]
     fn evict_context(&mut self) {
         for recent in self.recent.iter().flatten() {
@@ -595,15 +616,14 @@ impl State {
             }
         }
         if self.retired.len() == MAX_RETIRED {
-            if let Some((&oldest, &(gone, _))) =
-                self.retired.iter().min_by_key(|(_, &(_, used))| used)
-            {
-                self.retired.remove(&oldest);
-                self.blocks
-                    .remove_where(|key| key.decode.context_id == gone, why!(ContextEvicted));
+            if let Some(((_, gone), oldest)) = self.retired_by_use.pop_first() {
+                self.retired.remove(&*oldest);
+                self.blocks.remove_group(gone, why!(ContextEvicted));
                 self.lane_slots.clear();
             }
         }
+        let stamp = Arc::new(stamp);
+        self.retired_by_use.insert((used, id), stamp.clone());
         self.retired.insert(stamp, (id, used));
     }
 
@@ -870,7 +890,7 @@ impl State {
                 continue;
             }
             let lanes = ordinary.then(|| crate::interp::legacy::paging::lanes(&ir));
-            let weight = super::flat32::weight(&ir, sources.len())
+            let weight = super::flat32::weight(&ir, &key, &sources)
                 + lanes
                     .as_ref()
                     .map_or(0, |l| l.len() * std::mem::size_of::<Insn>());
@@ -1792,6 +1812,17 @@ impl Vcpu {
                     s.blocks.len(),
                 )
             })
+    }
+
+    /// The bytes the paged proof map's source index holds now
+    /// (`ProofMap::index_bytes`). Diagnostics only.
+    #[doc(hidden)]
+    #[cfg(feature = "test-hooks")]
+    pub fn paged_proof_index_bytes_for_test(&self) -> usize {
+        self.legacy_execution
+            .as_ref()
+            .and_then(|e| e.paging.as_ref())
+            .map_or(0, |s| s.blocks.index_bytes())
     }
 
     /// Internal proof diagnostics: translation generation, retained blocks, lifts.
@@ -2875,6 +2906,7 @@ mod tests {
             ids.push(at(&mut state, ds));
             assert!(state.contexts.len() <= MAX_CONTEXTS);
             assert!(state.retired.len() <= MAX_RETIRED);
+            assert_eq!(state.retired_by_use.len(), state.retired.len());
             assert!(state.blocks.len() <= MAX_BLOCKS);
         }
         assert_eq!(state.lifts, u64::from(STAMPS));

@@ -377,10 +377,7 @@ pub fn expected_sum(iterations: u32) -> u32 {
 pub fn setup_wide(model: CpuModel, iterations: u32, blocks: u32, directories: u32) -> (Vm, Vcpu) {
     use iced_x86::code_asm::*;
     assert!(directories.is_power_of_two() && directories <= 32);
-    let mut vm = Vm::new(VmConfig::flat(MEMORY));
-    vm.set_cpu_model(model);
-    vm.map(0, MEMORY as usize, Prot::RWX, RegionKind::Ram)
-        .unwrap();
+    let (vm, mut cpu) = flat_ring0(model, directories);
     let mut a = CodeAssembler::new(32).unwrap();
     let mut top = a.create_label();
     a.set_label(&mut top).unwrap();
@@ -401,6 +398,20 @@ pub fn setup_wide(model: CpuModel, iterations: u32, blocks: u32, directories: u3
     a.hlt().unwrap();
     let code = a.assemble(0x10_0000).unwrap();
     vm.write_bytes(0x10_0000, &code).unwrap();
+    cpu.cpu.rip = 0x10_0000;
+    cpu.cpu.gpr[7] = u64::from(iterations);
+    (vm, cpu)
+}
+
+// A VM of `MEMORY` bytes of RAM, `directories` page directories at 8000h +
+// 1000h k that all name the same two tables, which identity-map 8 MiB,
+// present, writable, user, and their CR3 values at 7000h; and a vCPU at
+// ring 0 under the first, flat CS, DS, ES and SS, the stack below 80000h.
+fn flat_ring0(model: CpuModel, directories: u32) -> (Vm, Vcpu) {
+    let mut vm = Vm::new(VmConfig::flat(MEMORY));
+    vm.set_cpu_model(model);
+    vm.map(0, MEMORY as usize, Prot::RWX, RegionKind::Ram)
+        .unwrap();
     // 80386 PRM §5.2 pp. 5-7-11: each directory names the same two tables,
     // which identity-map 8 MiB, present, writable, user.
     let mut entries = Vec::with_capacity(8 * 1024);
@@ -437,10 +448,187 @@ pub fn setup_wide(model: CpuModel, iterations: u32, blocks: u32, directories: u3
         };
     }
     cpu.set_a20_enabled(true);
-    cpu.cpu.rip = 0x10_0000;
     cpu.cpu.gpr[4] = 0x8_0000;
+    (vm, cpu)
+}
+
+// Bytes of each code page the store and context variants fill with blocks
+// before the JMP to the next page; the store variant's data words follow.
+const PAGE_CODE: usize = 0xf00;
+// A code page's data words: 8 dwords, past every byte its blocks fetch.
+const PAGE_DATA: u32 = 0xf80;
+// The non-code data page the store variant's `Stores::Data` writes.
+const DATA_PAGE: u32 = 0x30_0000;
+const CODE: u32 = 0x10_0000;
+
+/// Where `setup_stores` writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stores {
+    /// A data word on the store's own code page, past its code: every store
+    /// is a code-page write, drained and reconciled against the proofs.
+    CodePage,
+    /// A word of a page no code is fetched from.
+    Data,
+}
+
+// `blocks` blocks (ADD EBP,EBX; INC EBX; JMP to the next), each `stride`th
+// one led by `MOV [target],EBX` (`store(page, i)` names the target), filled
+// page by page from `CODE` (`PAGE_CODE` bytes each), the last JMP to `tail`.
+fn block_pages(
+    blocks: u32,
+    stride: u32,
+    tail: u32,
+    store: impl Fn(u32, u32) -> Option<u32>,
+) -> Vec<(u32, Vec<u8>)> {
+    use iced_x86::code_asm::*;
+    let mut pages = Vec::new();
+    let mut i = 0;
+    let mut page = CODE;
+    while i < blocks {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut size = 0;
+        // Each block is at most 11 bytes; the page's last JMP rel32 is 5.
+        loop {
+            if stride != 0 && i % stride == 0 {
+                if let Some(target) = store(page, i) {
+                    a.mov(dword_ptr(target), ebx).unwrap();
+                    size += 6;
+                }
+            }
+            a.add(ebp, ebx).unwrap();
+            a.inc(ebx).unwrap();
+            size += 3;
+            i += 1;
+            if i == blocks || size + 2 + 11 + 5 > PAGE_CODE {
+                break;
+            }
+            let mut next = a.create_label();
+            a.jmp(next).unwrap();
+            a.set_label(&mut next).unwrap();
+            size += 2;
+        }
+        let next = if i < blocks { page + 0x1000 } else { tail };
+        a.jmp(u64::from(next)).unwrap();
+        pages.push((page, a.assemble(u64::from(page)).unwrap()));
+        page += 0x1000;
+    }
+    pages
+}
+
+/// The store variant (xj-to9.85): a flat ring-0 loop of `blocks` blocks
+/// over consecutive code pages (up to 768 a page), each `stride`th of which
+/// first stores EBX to a data word: on its own code page past the code
+/// (`Stores::CodePage`), as an operating system's data sits beside its
+/// code, or on a page without code (`Stores::Data`). A code-page store
+/// overlaps no block, so no proof drops; each is drained and reconciled
+/// against every proof held. One CR3, no TLB churn.
+pub fn setup_stores(
+    model: CpuModel,
+    iterations: u32,
+    blocks: u32,
+    stride: u32,
+    stores: Stores,
+) -> (Vm, Vcpu) {
+    use iced_x86::code_asm::*;
+    let (vm, mut cpu) = flat_ring0(model, 1);
+    let tail = CODE + 0x1000 * blocks.div_ceil(250);
+    let pages = block_pages(blocks, stride, tail, |page, i| {
+        Some(match stores {
+            Stores::CodePage => page + PAGE_DATA + 4 * ((i / stride) % 8),
+            Stores::Data => DATA_PAGE + 4 * ((i / stride) % 1024),
+        })
+    });
+    assert!(pages.last().unwrap().0 < tail);
+    for (page, code) in &pages {
+        assert!(code.len() <= PAGE_CODE);
+        vm.write_bytes(u64::from(*page), code).unwrap();
+    }
+    let mut a = CodeAssembler::new(32).unwrap();
+    a.dec(edi).unwrap();
+    a.jne(u64::from(CODE)).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(u64::from(tail), &a.assemble(u64::from(tail)).unwrap())
+        .unwrap();
+    cpu.cpu.rip = u64::from(CODE);
     cpu.cpu.gpr[7] = u64::from(iterations);
     (vm, cpu)
+}
+
+/// Guest instructions `setup_stores` retires: 3 per block (the page's last
+/// JMP counts as its block's), 1 per store, 2 per iteration, and the HLT.
+pub fn expected_retired_stores(iterations: u32, blocks: u32, stride: u32) -> u64 {
+    let stores = if stride == 0 {
+        0
+    } else {
+        blocks.div_ceil(stride)
+    };
+    (3 * u64::from(blocks) + u64::from(stores) + 2) * u64::from(iterations) + 1
+}
+
+/// The context variant (xj-to9.85): `blocks` flat ring-0 blocks run once
+/// (resident proofs), then a loop that loads ES with the next of `stamps`
+/// byte-granular data segments at distinct bases (selector 18h + 8 k),
+/// runs two blocks in that Segmented state and reloads the flat ES. Each
+/// iteration's paged identity is a complete stamp that names ES, so more
+/// stamps than the 64 retained and 4,096 retired ones evict a retained
+/// identity and forget a retired one, with its proofs, every iteration.
+/// GDT at 400000h.
+pub fn setup_contexts(model: CpuModel, iterations: u32, blocks: u32, stamps: u32) -> (Vm, Vcpu) {
+    use iced_x86::code_asm::*;
+    assert!((1..=8189).contains(&stamps));
+    let (vm, mut cpu) = flat_ring0(model, 1);
+    let tail = CODE + 0x1000 * blocks.div_ceil(250).max(1);
+    for (page, code) in block_pages(blocks, 0, tail, |_, _| None) {
+        vm.write_bytes(u64::from(page), &code).unwrap();
+    }
+    let mut a = CodeAssembler::new(32).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.xor(edx, edx).unwrap();
+    a.mov(eax, edi).unwrap();
+    a.mov(ecx, stamps).unwrap();
+    a.div(ecx).unwrap();
+    a.lea(eax, dword_ptr(edx * 8 + 0x18)).unwrap();
+    a.mov(es, eax).unwrap();
+    for _ in 0..2 {
+        let mut next = a.create_label();
+        a.add(ebp, ebx).unwrap();
+        a.inc(ebx).unwrap();
+        a.jmp(next).unwrap();
+        a.set_label(&mut next).unwrap();
+    }
+    a.mov(eax, 0x10u32).unwrap();
+    a.mov(es, eax).unwrap();
+    a.dec(edi).unwrap();
+    a.jne(top).unwrap();
+    a.hlt().unwrap();
+    vm.write_bytes(u64::from(tail), &a.assemble(u64::from(tail)).unwrap())
+        .unwrap();
+    // GDT (SDM Vol 3A §3.4.5): 8 flat ring-0 code, 10h flat data, 18h + 8 k
+    // data at 10h k (limit FFFFh, B set, G clear).
+    const GDT: u32 = 0x40_0000;
+    let mut gdt = Vec::with_capacity(8 * (3 + stamps as usize));
+    gdt.extend(0u64.to_le_bytes());
+    gdt.extend(0x00cf_9b00_0000_ffffu64.to_le_bytes());
+    gdt.extend(0x00cf_9300_0000_ffffu64.to_le_bytes());
+    for k in 0..u64::from(stamps) {
+        let base = 0x10 * k;
+        let descriptor = 0x0040_9300_0000_ffff | ((base & 0xff_ffff) << 16) | ((base >> 24) << 56);
+        gdt.extend(descriptor.to_le_bytes());
+    }
+    vm.write_bytes(u64::from(GDT), &gdt).unwrap();
+    cpu.cpu.legacy.gdtr.base = GDT;
+    cpu.cpu.legacy.gdtr.limit = (gdt.len() - 1) as u16;
+    cpu.cpu.rip = u64::from(CODE);
+    cpu.cpu.gpr[7] = u64::from(iterations);
+    (vm, cpu)
+}
+
+/// Guest instructions `setup_contexts` retires: 3 per warm block, then 16
+/// per iteration (6 to select and load ES, 6 in two blocks, 2 to reload ES,
+/// DEC, JNZ), and the HLT.
+pub fn expected_retired_contexts(iterations: u32, blocks: u32) -> u64 {
+    3 * u64::from(blocks) + 16 * u64::from(iterations) + 1
 }
 
 /// Guest instructions `setup_wide` retires: 3 per block and 6 per
