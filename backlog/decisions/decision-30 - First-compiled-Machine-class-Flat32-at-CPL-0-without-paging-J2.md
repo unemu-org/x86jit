@@ -502,7 +502,9 @@ supervisor; the rest await review. None changes an answered question.
    request state live in a per-vCPU direct-mapped memo of 256 slots keyed by the block a proof
    or a link returns (`vm/legacy/compiled.rs`), not in `flat32::Proof` and `links::Link`. Both
    paths return the same `Arc<IrBlock>`, so one memo serves both, and neither structure
-   changes. A conflict costs a recount and one cold lookup of the shared unit.
+   changes. A conflict costs a recount and one cold lookup of the shared unit. Since
+   xj-to9.78 a conflict moves the evicted slot to a per-vCPU victim table (4,096 slots, about
+   352 KiB, allocated at the first conflict and not counted by the cache), so its count survives.
 2. **Machine units in the cache (Q10).** As accepted: `MachineBlockKey`, a Machine map
    beside `map`, and a second `SourceIndex` instance (made generic over its key) with Machine
    pending and suppression sets, under the one spans lock (`cache.rs`). Application's

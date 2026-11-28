@@ -12,6 +12,10 @@
 //! §10.9.1. The embedder loop runs fixed slices, raises INTR at a fixed
 //! step interval and injects the vector at `IntrReady`.
 //!
+//! A second game calls 512 small routines once a frame, a working set of
+//! about 1,500 blocks, wider than the per-vCPU memo, with a timer interrupt
+//! every 3,000 steps; its cold census counts the turns by block key.
+//!
 //! The subject uses the production background tier-up; an interpreted
 //! reference runs the same calls, and every call's stop, state, retired
 //! count and RAM must agree.
@@ -197,6 +201,10 @@ impl DeviceIo for Ports {
 }
 
 fn machine(background: bool) -> (Vm, Vcpu) {
+    machine_with(pieces(), background)
+}
+
+fn machine_with(pieces: Vec<(u64, Vec<u8>)>, background: bool) -> (Vm, Vcpu) {
     let mut vm = Vm::with_backend(VmConfig::flat(SIZE), Box::new(JitBackend::new()));
     vm.map(0, SIZE as usize, Prot::RWX, RegionKind::Ram)
         .unwrap();
@@ -210,7 +218,7 @@ fn machine(background: bool) -> (Vm, Vcpu) {
         vm.set_tier_up_after(Some(50));
         vm.set_tier_up_background(true);
     }
-    for (at, code) in pieces() {
+    for (at, code) in pieces {
         vm.write_bytes(at, &code).unwrap();
     }
     descriptor(&vm, 0x2008, 0, u32::MAX, 0xc09b);
@@ -249,14 +257,27 @@ fn print_census(c: &MachineJitCounters, retired: u64) {
         c.entries,
         c.refused
     );
-    for (name, n) in MachineJitCounters::REFUSAL_NAMES.iter().zip(c.refusals) {
+    for ((name, n), r) in MachineJitCounters::REFUSAL_NAMES
+        .iter()
+        .zip(c.refusals)
+        .zip(c.refusals_retired)
+    {
         if n != 0 {
-            println!("  refusal {name}: {n}");
+            println!("  refusal {name}: {n} turns, {r} retired");
         }
     }
-    for (name, n) in MachineJitCounters::NO_UNIT_NAMES.iter().zip(c.no_unit) {
+    for ((name, n), r) in MachineJitCounters::NO_UNIT_NAMES
+        .iter()
+        .zip(c.no_unit)
+        .zip(c.no_unit_retired)
+    {
         if n != 0 {
-            println!("  no unit {name}: {n}");
+            println!("  no unit {name}: {n} turns, {r} retired");
+        }
+    }
+    for (name, n) in MachineJitCounters::CHAIN_END_NAMES.iter().zip(c.chain_ends) {
+        if n != 0 {
+            println!("  chain end {name}: {n}");
         }
     }
     for (name, n) in MachineJitCounters::DEFER_CAUSE_NAMES
@@ -273,20 +294,25 @@ fn print_census(c: &MachineJitCounters, retired: u64) {
     );
 }
 
-#[test]
-fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
-    let (avm, mut a) = machine(true);
-    let (bvm, mut b) = machine(false);
+/// Run the subject `a` and the interpreted reference `b` in lockstep to HLT,
+/// asserting INTR every `tick` steps, and compare every call, the device
+/// transcripts and RAM.
+/// Returns the host instructions the subject's calls took (macOS only, 0
+/// elsewhere): the process's count, background compiles included.
+fn lockstep(avm: &Vm, a: &mut Vcpu, bvm: &Vm, b: &mut Vcpu, tick: u64) -> u64 {
     let (mut ad, mut bd) = (Ports::default(), Ports::default());
+    let mut host = 0;
     let mut steps = 0;
-    let mut next_tick = TICK;
+    let mut next_tick = tick;
     for call in 0.. {
         assert!(call < 100_000, "the game did not end");
+        let start = host_instructions();
         let ar = a
-            .run_steps_with_devices(&avm, SLICE, StepOptions::default(), Some(&mut ad))
+            .run_steps_with_devices(avm, SLICE, StepOptions::default(), Some(&mut ad))
             .unwrap();
+        host += host_instructions() - start;
         let br = b
-            .run_steps_with_devices(&bvm, SLICE, StepOptions::default(), Some(&mut bd))
+            .run_steps_with_devices(bvm, SLICE, StepOptions::default(), Some(&mut bd))
             .unwrap();
         let what = format!("call {call}");
         assert_eq!(
@@ -301,7 +327,7 @@ fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
         match ar.into_stop() {
             StepStop::Exit(Exit::BudgetExhausted) => {}
             StepStop::Exit(Exit::Device(DeviceStop::IntrReady)) => {
-                for cpu in [&mut a, &mut b] {
+                for cpu in [&mut *a, &mut *b] {
                     cpu.inject_irq(0x20);
                     cpu.set_intr(false);
                 }
@@ -312,7 +338,7 @@ fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
         if steps >= next_tick {
             a.set_intr(true);
             b.set_intr(true);
-            next_tick += TICK;
+            next_tick += tick;
         }
     }
     assert_eq!(ad.requests, bd.requests, "device transcripts differ");
@@ -321,6 +347,40 @@ fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
     avm.read_bytes(0, &mut am).unwrap();
     bvm.read_bytes(0, &mut bm).unwrap();
     assert!(am == bm, "RAM differs");
+    host
+}
+
+/// The process's retired host instructions.
+#[cfg(target_os = "macos")]
+fn host_instructions() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: V4 writes the matching structure, read only after success.
+    unsafe {
+        if libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            usage.as_mut_ptr().cast(),
+        ) != 0
+        {
+            return 0;
+        }
+        usage.assume_init().ri_instructions
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn host_instructions() -> u64 {
+    0
+}
+
+#[test]
+fn a_flat_game_loop_runs_compiled_and_its_refusals_are_counted() {
+    let (avm, mut a) = machine(true);
+    let (bvm, mut b) = machine(false);
+    let host = lockstep(&avm, &mut a, &bvm, &mut b, TICK);
+    println!(
+        "host instructions per step {:.1}",
+        host as f64 / a.retired_instructions() as f64
+    );
     let frames = fixture::value(&avm, u64::from(FRAMES), 4);
     let ticks = fixture::value(&avm, u64::from(TICKS), 4);
     assert_eq!(frames, u64::from(FRAME_COUNT));
@@ -396,4 +456,161 @@ fn background_units_are_counted_and_retire_compiled() {
     assert_eq!(after.refused, before.refused, "{after:?}");
     assert_eq!(format!("{:?}", a.cpu), format!("{:?}", b.cpu));
     assert_eq!(a.retired_instructions(), b.retired_instructions());
+}
+
+const ROUTINES: u64 = 0x10000;
+const TABLE: u64 = 0x18000;
+/// Routines the second game calls once a frame, each of three blocks.
+const ROUTINE_COUNT: u32 = 512;
+const ROUTINE_FRAMES: u32 = 1500;
+/// Steps between timer INTR assertions in the second game.
+const ROUTINE_TICK: u64 = 3_000;
+
+/// The second game: per frame, a short tight loop, then each of
+/// `ROUTINE_COUNT` small routines called once through a table (as a game's
+/// entity, sound and input handlers are), a keyboard read and a short
+/// palette upload; the timer interrupt every `ROUTINE_TICK` steps. Each
+/// routine is three blocks, so the frame's working set is about 1,500
+/// blocks, every one of them run `ROUTINE_FRAMES` times.
+fn routine_pieces() -> Vec<(u64, Vec<u8>)> {
+    let main = asm(32, MAIN, |a| {
+        let mut frame = a.create_label();
+        let mut inner = a.create_label();
+        let mut calls = a.create_label();
+        let mut palette = a.create_label();
+        a.sti().unwrap();
+        a.set_label(&mut frame).unwrap();
+        a.mov(ecx, 100u32).unwrap();
+        a.set_label(&mut inner).unwrap();
+        a.add(eax, ecx).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(inner).unwrap();
+        a.mov(esi, TABLE as u32).unwrap();
+        a.mov(ebp, ROUTINE_COUNT).unwrap();
+        a.set_label(&mut calls).unwrap();
+        a.call(dword_ptr(esi)).unwrap();
+        a.add(esi, 4).unwrap();
+        a.dec(ebp).unwrap();
+        a.jne(calls).unwrap();
+        a.in_(al, 0x60).unwrap();
+        a.movzx(edx, al).unwrap();
+        a.add(dword_ptr(KEYS), edx).unwrap();
+        a.mov(dx, 0x3c8).unwrap();
+        a.xor(al, al).unwrap();
+        a.out(dx, al).unwrap();
+        a.inc(dx).unwrap();
+        a.mov(ecx, 6u32).unwrap();
+        a.set_label(&mut palette).unwrap();
+        a.mov(al, cl).unwrap();
+        a.out(dx, al).unwrap();
+        a.dec(ecx).unwrap();
+        a.jne(palette).unwrap();
+        a.inc(dword_ptr(FRAMES)).unwrap();
+        a.cmp(dword_ptr(FRAMES), ROUTINE_FRAMES).unwrap();
+        a.jb(frame).unwrap();
+        a.cli().unwrap();
+        a.hlt().unwrap();
+    });
+    let mut pieces = vec![(MAIN, main)];
+    let mut table = Vec::new();
+    for i in 0..ROUTINE_COUNT {
+        let at = ROUTINES + u64::from(i) * 32;
+        // `add eax, i; test al, 1; jz skip; xor ebx, eax; rol ebx, 1; skip: ret`.
+        pieces.push((
+            at,
+            asm(32, at, |a| {
+                let mut skip = a.create_label();
+                a.add(eax, i * 7 + 1).unwrap();
+                a.test(al, 1).unwrap();
+                a.je(skip).unwrap();
+                a.xor(ebx, eax).unwrap();
+                a.rol(ebx, 1).unwrap();
+                a.set_label(&mut skip).unwrap();
+                a.ret().unwrap();
+            }),
+        ));
+        table.extend((at as u32).to_le_bytes());
+    }
+    pieces.push((TABLE, table));
+    pieces.push((
+        HANDLER,
+        asm(32, HANDLER, |a| {
+            a.push(eax).unwrap();
+            a.inc(dword_ptr(TICKS)).unwrap();
+            a.mov(al, 0x20).unwrap();
+            a.out(0x20, al).unwrap();
+            a.pop(eax).unwrap();
+            a.iretd().unwrap();
+        }),
+    ));
+    pieces
+}
+
+/// Bead xj-to9.78: the cold census of a working set larger than the
+/// per-vCPU memo. Prints the census, the distinct cold block keys against
+/// the cold turns, and how many keys reached the threshold.
+#[test]
+fn a_wide_working_set_reaches_the_threshold() {
+    let (avm, mut a) = machine_with(routine_pieces(), true);
+    let (bvm, mut b) = machine_with(routine_pieces(), false);
+    a.enable_cold_census_for_test();
+    let host = lockstep(&avm, &mut a, &bvm, &mut b, ROUTINE_TICK);
+    let frames = fixture::value(&avm, u64::from(FRAMES), 4);
+    assert_eq!(frames, u64::from(ROUTINE_FRAMES));
+    let c = a.machine_jit_counters_for_test();
+    let retired = a.retired_instructions();
+    print_census(&c, retired);
+    println!(
+        "host instructions per step {:.1}",
+        host as f64 / retired as f64
+    );
+    let census = a.cold_census_for_test().unwrap();
+    let cold: Vec<_> = census.keys.values().filter(|k| k.cold_turns != 0).collect();
+    let turns: u64 = cold.iter().map(|k| k.cold_turns).sum();
+    let reached = census.keys.values().filter(|k| k.reached).count();
+    let never = cold.iter().filter(|k| !k.reached).count();
+    let slots: u64 = census.keys.values().map(|k| k.slots).sum();
+    println!(
+        "cold keys {} ({turns} cold turns, {} retired), keys {}, reached T1 {reached}, \
+         cold keys that never did {never}",
+        cold.len(),
+        cold.iter().map(|k| k.cold_retired).sum::<u64>(),
+        census.keys.len(),
+    );
+    println!(
+        "memo slots {slots}: over empty {}, conflict {} ({} evicted a cold count), \
+         dropped block {}, counts restored {}",
+        census.slots_empty,
+        census.slots_conflict,
+        census.conflicts_cold,
+        census.slots_dropped,
+        census.victims_restored
+    );
+    let mut by_hot = std::collections::BTreeMap::<u32, (usize, u64)>::new();
+    for k in cold.iter().filter(|k| !k.reached) {
+        let bucket = match k.max_hot {
+            0..=4 => 4,
+            5..=9 => 9,
+            10..=24 => 24,
+            _ => 49,
+        };
+        let e = by_hot.entry(bucket).or_default();
+        e.0 += 1;
+        e.1 += k.cold_turns;
+    }
+    for (bucket, (keys, turns)) in by_hot {
+        println!("  never reached, max hot <= {bucket}: {keys} keys, {turns} cold turns");
+    }
+    let coverage = c.compiled_retired as f64 / retired as f64;
+    println!("coverage {:.1} %", 100.0 * coverage);
+    let most = cold.iter().map(|k| k.cold_turns).max().unwrap_or(0);
+    println!("most cold turns of one key {most}");
+    // Every routine's entry block and its RET block run once a frame, so at
+    // least 2 * ROUTINE_COUNT keys pass T1 = 50. Counts that memo conflicts
+    // restarted would leave them cold for thousands of turns each.
+    assert!(
+        reached >= 2 * ROUTINE_COUNT as usize,
+        "{reached} keys reached T1"
+    );
+    assert!(most < 2 * 50, "a key stayed cold for {most} turns");
 }

@@ -29,6 +29,9 @@ pub(crate) use legacy::live::absorb_at_store;
 pub(crate) use legacy::paging_generation;
 #[doc(hidden)]
 pub use legacy::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use legacy::{ColdCensus, ColdKey, ColdKeyStats};
 mod nec;
 use crate::legacy::{ExecutionProfile, LegacyCpuModel};
 use crate::lift::{

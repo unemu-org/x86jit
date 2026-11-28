@@ -113,6 +113,14 @@ pub struct MachineJitCounters {
     /// Turns of an admitted, eligible block that ran the interpreted walk
     /// because it had no unit to enter, named by [`Self::NO_UNIT_NAMES`].
     pub no_unit: [u64; NO_UNITS],
+    /// The instructions the interpreted walks of [`Self::refusals`]' turns
+    /// retired, row by row. Counted, as `refusals` is, only with test-hooks;
+    /// zero without.
+    pub refusals_retired: [u64; REFUSALS],
+    /// The instructions the interpreted walks of [`Self::no_unit`]'s turns
+    /// retired, row by row. Counted, as `no_unit` is, only with test-hooks;
+    /// zero without.
+    pub no_unit_retired: [u64; NO_UNITS],
 }
 
 /// Entry refusals (`MachineJitCounters::refusals`): E2's class tests, then
@@ -151,7 +159,9 @@ const NO_UNIT_AWAITING: usize = 1;
 const NO_UNIT_FAILED: usize = 2;
 const NO_UNIT_DEMOTED: usize = 3;
 const NO_UNIT_DELAYED: usize = 4;
-const NO_UNITS: usize = 5;
+/// Counting toward T1 again after the backend refused the request as busy.
+const NO_UNIT_BUSY: usize = 5;
+const NO_UNITS: usize = 6;
 
 /// Test-only: which E2 walk refusal a block outside the ordinary walk is.
 #[cfg(any(test, feature = "test-hooks"))]
@@ -180,15 +190,28 @@ fn walk_refusal(ir: &IrBlock) -> usize {
     }
 }
 
-/// Test-only tally of a refusal or a missing unit.
+/// Test-only tally of a refusal (`MachineJitCounters::refusals`), and the
+/// row the turn's walk retires into (`Compiling::row`).
+#[cfg(any(test, feature = "test-hooks"))]
 #[inline(always)]
-fn tally(counts: &mut [u64], index: usize) {
-    #[cfg(any(test, feature = "test-hooks"))]
-    {
-        counts[index] += 1;
-    }
-    #[cfg(not(any(test, feature = "test-hooks")))]
-    let _ = (counts, index);
+fn tally_refusal(state: &mut Compiling, index: usize) {
+    state.counters.refusals[index] += 1;
+    state.row = Some(index as u8);
+}
+
+/// Test-only tally of a missing unit (`MachineJitCounters::no_unit`) in
+/// `$counters`, and the row the turn's walk retires into in `$row`
+/// (`Compiling::row`), which exists only with test-hooks.
+macro_rules! tally_no_unit {
+    ($counters:expr, $row:expr, $index:expr) => {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            $counters.no_unit[$index] += 1;
+            *$row = Some((REFUSALS + $index) as u8);
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = (&$counters, $index);
+    };
 }
 
 /// Chain-end reasons (decision-31 §8): the edge's budget test, the dispatch
@@ -250,8 +273,14 @@ impl MachineJitCounters {
     pub const FIRST_ENTRY_REFUSAL: usize = REFUSE_TRAP_FLAG;
 
     /// The names of [`Self::no_unit`]'s entries, in order.
-    pub const NO_UNIT_NAMES: [&'static str; NO_UNITS] =
-        ["cold", "awaiting", "failed", "demoted", "delayed"];
+    pub const NO_UNIT_NAMES: [&'static str; NO_UNITS] = [
+        "cold",
+        "awaiting",
+        "failed",
+        "demoted",
+        "delayed",
+        "busy recount",
+    ];
 
     /// The names of [`Self::chain_ends`]' entries, in order.
     pub const CHAIN_END_NAMES: [&'static str; CHAIN_ENDS] = [
@@ -432,17 +461,157 @@ pub(super) struct Slot {
     looked: bool,
     /// The block's bus address, the key's `physical_pc`, once computed.
     bus: u64,
+    /// The backend refused this slot's last request as busy, and the slot
+    /// counts toward T1 again (the census's "busy recount").
+    busy: bool,
+}
+
+/// A block's identity in the cold census: its bus address (`u64::MAX` if the
+/// TLB holds none), its EIP and its key flags (`MachineBlockKey`'s parts that
+/// vary within one run).
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub type ColdKey = (u64, u32, u32);
+
+/// Test-only: one block key's history in [`ColdCensus`].
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColdKeyStats {
+    /// Its "no_unit cold" turns.
+    pub cold_turns: u64,
+    /// The instructions those turns' interpreted walks retired.
+    pub cold_retired: u64,
+    /// Memo slots created for it: its first, and one after each conflict or
+    /// relift that took its slot.
+    pub slots: u64,
+    /// The highest hotness one of its slots reached.
+    pub max_hot: u32,
+    /// Whether one of its slots reached the threshold or found a unit.
+    pub reached: bool,
+}
+
+/// Test-only: where the "no_unit cold" turns of a vCPU went, by block key,
+/// and what each new memo slot replaced. Recorded while
+/// `Vcpu::enable_cold_census_for_test` is on.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct ColdCensus {
+    pub keys: std::collections::HashMap<ColdKey, ColdKeyStats>,
+    /// New slots over an empty index.
+    pub slots_empty: u64,
+    /// New slots over another live block's slot (a memo conflict).
+    pub slots_conflict: u64,
+    /// New slots over a dropped block's slot.
+    pub slots_dropped: u64,
+    /// Conflicts that evicted a slot without a unit and with a count.
+    pub conflicts_cold: u64,
+    /// Slot changes that took the block's slot back from the victim table.
+    pub victims_restored: u64,
+    pending: Option<ColdKey>,
 }
 
 /// Slots of the per-vCPU memo: a direct-mapped table keyed by the block a
 /// proof or a link returned (decision-30 §6: no units lookup). A conflict
-/// only costs a recount and a cold lookup of the shared unit.
+/// moves the evicted slot to the victim table (`save_victim`), from which
+/// its block's next turn takes it back.
 const MEMO: usize = 256;
 
 #[inline(always)]
 fn memo_index(ir: &Arc<IrBlock>) -> usize {
     let address = Arc::as_ptr(ir) as usize as u64;
     (address.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - MEMO.trailing_zeros())) as usize
+}
+
+/// The victim table (xj-to9.78): slots that memo conflicts evicted, kept for
+/// their blocks. A working set wider than the memo would otherwise restart
+/// every count a conflict evicts, and a block run fewer than T1 times between
+/// two conflicts would never be compiled. A kept slot holds its block weakly,
+/// as the memo does: a dropped proof leaves it dead, so the count still
+/// restarts with a new proof (decision-27 §2.1 item 2, "stable").
+/// `VICTIM_SETS` sets of `VICTIM_WAYS`, indexed by a hash of the block's
+/// address independent of `memo_index`, so that the blocks that share a memo
+/// slot spread over the sets.
+///
+/// Cost: 4,096 slots of at most 88 bytes, about 352 KiB per vCPU that
+/// compiles, allocated at its first memo conflict and freed only when its
+/// code lifetime changes (`State::begin_run`). The cache's byte accounting
+/// does not count it. A kept slot of a dropped block is pruned when its set
+/// is next scanned (`prune`); until then its weak reference keeps the
+/// block's allocation, which the proof maps count as freed.
+const VICTIM_SETS: usize = 512;
+const VICTIM_WAYS: usize = 8;
+const _: () = assert!(std::mem::size_of::<Option<Slot>>() <= 88);
+
+#[inline(always)]
+fn victim_set(ir: *const IrBlock) -> usize {
+    let address = ir as usize as u64;
+    let set = address.wrapping_mul(0xbf58_476d_1ce4_e5b9) >> (64 - VICTIM_SETS.trailing_zeros());
+    set as usize * VICTIM_WAYS
+}
+
+/// What keeping a slot saves: nothing for a dead block's; little for one
+/// with a unit, which a fresh slot finds again by one lookup (decision-32
+/// Q7); its count, request or failure for one without, which a fresh slot
+/// would restart.
+fn victim_value(slot: &Slot) -> u32 {
+    if slot.ir.strong_count() == 0 {
+        0
+    } else if slot.entry.is_some() {
+        1
+    } else {
+        slot.hot.saturating_add(2)
+    }
+}
+
+/// Drop the kept slots of dropped blocks in a set: their weak references
+/// would keep the blocks' allocations, which the proof maps count as freed.
+#[inline(always)]
+fn prune(ways: &mut [Option<Slot>]) {
+    for way in ways {
+        if way.as_ref().is_some_and(|slot| slot.ir.strong_count() == 0) {
+            *way = None;
+        }
+    }
+}
+
+/// Keep a slot a memo conflict evicts, over the way of its set that saves
+/// the least, if it saves at least as much.
+#[cold]
+#[inline(never)]
+fn save_victim(victims: &mut Option<Box<[Option<Slot>]>>, slot: Slot) {
+    let victims =
+        victims.get_or_insert_with(|| (0..VICTIM_SETS * VICTIM_WAYS).map(|_| None).collect());
+    let set = victim_set(slot.ir.as_ptr());
+    let ways = &mut victims[set..set + VICTIM_WAYS];
+    prune(ways);
+    let (way, least) = ways
+        .iter()
+        .enumerate()
+        .map(|(i, way)| (i, way.as_ref().map_or(0, victim_value)))
+        .min_by_key(|&(_, value)| value)
+        .unwrap();
+    if victim_value(&slot) >= least {
+        ways[way] = Some(slot);
+    }
+}
+
+/// The slot a memo conflict kept for `ir`, taken out of the table.
+#[inline(always)]
+fn take_victim(victims: &mut Option<Box<[Option<Slot>]>>, ir: &Arc<IrBlock>) -> Option<Slot> {
+    let victims = victims.as_deref_mut()?;
+    let set = victim_set(Arc::as_ptr(ir));
+    let ways = &mut victims[set..set + VICTIM_WAYS];
+    prune(ways);
+    // A kept slot's weak reference keeps its block's allocation, so an equal
+    // address is this very block, alive while `ir` holds it.
+    ways.iter_mut()
+        .find(|way| {
+            way.as_ref()
+                .is_some_and(|slot| std::ptr::eq(slot.ir.as_ptr(), Arc::as_ptr(ir)))
+        })?
+        .take()
 }
 
 /// One vCPU's view of the shared compiled Machine units (decision-30 §2).
@@ -478,6 +647,9 @@ pub(super) struct State {
 pub(super) struct Compiling {
     pub(super) counters: MachineJitCounters,
     memo: Box<[Option<Slot>]>,
+    /// Slots that memo conflicts evicted (`save_victim`), allocated at the
+    /// first such conflict.
+    victims: Option<Box<[Option<Slot>]>>,
     hot_pages: [HotPage; 16],
     /// The compiled view of the TLB (decision-30 §4), at a stable address
     /// for `MemCtx::ret_stack` (its Machine meaning), and the mapping its entries were filled from.
@@ -487,6 +659,13 @@ pub(super) struct Compiling {
     /// The epoch the shadow return ring's continuation slots belong to: a new
     /// epoch discards them (decision-31 §5), as Application's `fast_clear`.
     ring_epoch: u64,
+    /// Test-only: the census row this turn went to, for its walk's retired
+    /// count (`Vcpu::census_retired`): a refusal index, or `REFUSALS` plus a
+    /// no-unit index.
+    #[cfg(any(test, feature = "test-hooks"))]
+    row: Option<u8>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    cold: Option<Box<ColdCensus>>,
 }
 
 impl Default for Compiling {
@@ -494,11 +673,16 @@ impl Default for Compiling {
         Self {
             counters: MachineJitCounters::default(),
             memo: (0..MEMO).map(|_| None).collect(),
+            victims: None,
             hot_pages: [HotPage::default(); 16],
             tlb: crate::jit_abi::machine::MachineTlb::default(),
             mapping: None,
             fill: None,
             ring_epoch: 0,
+            #[cfg(any(test, feature = "test-hooks"))]
+            row: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            cold: None,
         }
     }
 }
@@ -553,6 +737,14 @@ impl Compiling {
 }
 
 impl State {
+    /// The share of a run that compiles: it exists.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn compiling(&mut self) -> &mut Compiling {
+        self.compiling
+            .as_deref_mut()
+            .expect("compiled Machine state outside a compiling run")
+    }
+
     /// The counters of a run that compiles: its share exists.
     pub(super) fn counters(&mut self) -> &mut MachineJitCounters {
         &mut self
@@ -598,6 +790,7 @@ impl State {
             return;
         }
         compiling.memo.iter_mut().for_each(|slot| *slot = None);
+        compiling.victims = None;
         // Epoch numbers belong to a domain.
         compiling.tlb.ring.sp = 0;
         compiling.ring_epoch = 0;
@@ -864,6 +1057,58 @@ impl Vcpu {
             .map_or_else(MachineJitCounters::default, |c| c.counters)
     }
 
+    /// Test-only: record [`ColdCensus`] on this vCPU from its next turn on.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn enable_cold_census_for_test(&mut self) {
+        if let Some(execution) = self.legacy_execution.as_mut() {
+            execution
+                .machine_jit
+                .compiling
+                .get_or_insert_with(Box::default)
+                .cold
+                .get_or_insert_with(Box::default);
+        }
+    }
+
+    /// Test-only: the cold census, if it was enabled.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn cold_census_for_test(&self) -> Option<ColdCensus> {
+        self.legacy_execution
+            .as_ref()
+            .and_then(|e| e.machine_jit.compiling.as_deref())
+            .and_then(|c| c.cold.as_deref().cloned())
+    }
+
+    /// Test-only: an interpreted walk that followed a census entry retired
+    /// `retired` instructions; charge them to the entry's row.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[cold]
+    #[inline(never)]
+    pub(super) fn census_retired(&mut self, retired: u64) {
+        let Some(state) = self
+            .legacy_execution
+            .as_mut()
+            .and_then(|e| e.machine_jit.compiling.as_deref_mut())
+        else {
+            return;
+        };
+        if let Some(row) = state.row.take() {
+            let row = usize::from(row);
+            if row < REFUSALS {
+                state.counters.refusals_retired[row] += retired;
+            } else {
+                state.counters.no_unit_retired[row - REFUSALS] += retired;
+            }
+        }
+        if let Some(cold) = state.cold.as_deref_mut() {
+            if let Some(key) = cold.pending.take() {
+                cold.keys.entry(key).or_default().cold_retired += retired;
+            }
+        }
+    }
+
     /// Decision-29 §2: the walk result of this turn's block from a compiled
     /// unit, or `None` for the interpreted walk.
     #[inline(never)]
@@ -914,7 +1159,7 @@ impl Vcpu {
                 } else {
                     walk_refusal(ir)
                 };
-                tally(&mut execution.machine_jit.counters().refusals, reason);
+                tally_refusal(execution.machine_jit.compiling(), reason);
             }
             return None;
         }
@@ -935,17 +1180,31 @@ impl Vcpu {
             #[cfg(any(test, feature = "test-hooks"))]
             {
                 let reason = self.refusal(vm, ir, boundary, remaining, paged);
-                let counters = self
+                let state = self
                     .legacy_execution
                     .as_mut()
                     .unwrap()
                     .machine_jit
-                    .counters();
-                tally(&mut counters.refusals, reason);
+                    .compiling();
+                tally_refusal(state, reason);
             }
             return None;
         }
         let index = memo_index(ir);
+        #[cfg(any(test, feature = "test-hooks"))]
+        let census_key = execution
+            .machine_jit
+            .compiling
+            .as_deref()
+            .is_some_and(|state| state.cold.is_some())
+            .then(|| {
+                (
+                    block_bus(&self.cpu, execution.paging.as_deref(), context, ir)
+                        .unwrap_or(u64::MAX),
+                    ir.guest_start as u32,
+                    key_flags(context, &self.cpu),
+                )
+            });
         {
             // `begin_run` allocated the share: this run compiles.
             let state = execution.machine_jit.compiling.as_deref_mut().unwrap();
@@ -964,7 +1223,33 @@ impl Vcpu {
                 .as_ref()
                 .is_some_and(|slot| std::ptr::eq(slot.ir.as_ptr(), Arc::as_ptr(ir)))
             {
-                state.memo[index] = Some(Slot {
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let (Some(key), Some(cold)) = (census_key, state.cold.as_deref_mut()) {
+                    match &state.memo[index] {
+                        None => cold.slots_empty += 1,
+                        Some(old) if old.ir.strong_count() != 0 => {
+                            cold.slots_conflict += 1;
+                            cold.conflicts_cold += u64::from(
+                                old.entry.is_none() && old.request == Request::None && old.hot != 0,
+                            );
+                        }
+                        Some(_) => cold.slots_dropped += 1,
+                    }
+                    cold.keys.entry(key).or_default().slots += 1;
+                }
+                // Take this block's kept slot before saving the evicted one,
+                // which may land in the same set and would otherwise replace it.
+                let kept = take_victim(&mut state.victims, ir);
+                if let Some(old) = state.memo[index].take() {
+                    if old.ir.strong_count() != 0 {
+                        save_victim(&mut state.victims, old);
+                    }
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let Some(cold) = state.cold.as_deref_mut() {
+                    cold.victims_restored += u64::from(kept.is_some());
+                }
+                state.memo[index] = Some(kept.unwrap_or_else(|| Slot {
                     ir: Arc::downgrade(ir),
                     entry: None,
                     hot: 0,
@@ -976,7 +1261,8 @@ impl Vcpu {
                     runs: 0,
                     looked: false,
                     bus: 0,
-                });
+                    busy: false,
+                }));
             }
             let slot = state.memo[index].as_mut().unwrap();
             slot.runs += 1;
@@ -1029,7 +1315,7 @@ impl Vcpu {
             && physical()
                 .is_none_or(|bus| state.demoted(bus >> crate::memory::CODE_PAGE_BITS, retired));
         if cold {
-            tally(&mut state.counters.no_unit, NO_UNIT_DEMOTED);
+            tally_no_unit!(state.counters, &mut state.row, NO_UNIT_DEMOTED);
             return None;
         }
         let Compiling {
@@ -1038,6 +1324,10 @@ impl Vcpu {
             tlb,
             ring_epoch,
             fill: next_fill,
+            #[cfg(any(test, feature = "test-hooks"))]
+                row: census_row,
+            #[cfg(any(test, feature = "test-hooks"))]
+                cold: cold_census,
             ..
         } = state;
         let slot = memo[index].as_mut().unwrap();
@@ -1066,7 +1356,7 @@ impl Vcpu {
             Some(entry) if slot.delay == 0 => entry,
             Some(_) => {
                 slot.delay -= 1;
-                tally(&mut counters.no_unit, NO_UNIT_DELAYED);
+                tally_no_unit!(counters, census_row, NO_UNIT_DELAYED);
                 return None;
             }
             None => {
@@ -1098,12 +1388,28 @@ impl Vcpu {
                 };
                 if !ready {
                     let reason = match slot.request {
+                        Request::None if slot.busy => NO_UNIT_BUSY,
                         Request::None => NO_UNIT_COLD,
                         Request::Waiting(_) => NO_UNIT_AWAITING,
                         Request::Failed => NO_UNIT_FAILED,
                     };
-                    tally(&mut counters.no_unit, reason);
+                    tally_no_unit!(counters, census_row, reason);
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    if let (Some(key), Some(cold)) = (census_key, cold_census.as_deref_mut()) {
+                        let stats = cold.keys.entry(key).or_default();
+                        stats.max_hot = stats.max_hot.max(slot.hot);
+                        if reason == NO_UNIT_COLD {
+                            stats.cold_turns += 1;
+                            cold.pending = Some(key);
+                        }
+                    }
                     return None;
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                if let (Some(key), Some(cold)) = (census_key, cold_census.as_deref_mut()) {
+                    let stats = cold.keys.entry(key).or_default();
+                    stats.max_hot = stats.max_hot.max(slot.hot);
+                    stats.reached = true;
                 }
                 let physical = physical()?;
                 let (found, compiled) = if let Some(found) = found {
@@ -1123,7 +1429,7 @@ impl Vcpu {
                         } else {
                             NO_UNIT_AWAITING
                         };
-                        tally(&mut counters.no_unit, reason);
+                        tally_no_unit!(counters, census_row, reason);
                         return None;
                     };
                     unit
@@ -1132,7 +1438,7 @@ impl Vcpu {
                 slot.entry = Some((found, epoch));
                 slot.bus = physical;
                 if slot.delay != 0 {
-                    tally(&mut counters.no_unit, NO_UNIT_DELAYED);
+                    tally_no_unit!(counters, census_row, NO_UNIT_DELAYED);
                     return None;
                 }
                 found
@@ -1736,12 +2042,14 @@ fn tier_up(
         match vm.backend.tier_up_async(request) {
             crate::TierUpSubmit::Queued => {
                 vm.cache.record_tier_bg_submitted();
+                slot.busy = false;
                 slot.hot = 0;
                 slot.request = Request::Waiting(seen);
             }
             crate::TierUpSubmit::Busy => {
                 vm.cache.machine_request(id);
                 vm.cache.abandon_machine_tier_up(key, &vm.mem);
+                slot.busy = true;
                 slot.hot = 0;
             }
             crate::TierUpSubmit::Unsupported => {

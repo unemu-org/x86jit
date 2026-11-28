@@ -257,6 +257,9 @@ pub use vm::{
 #[doc(hidden)]
 pub use vm::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
 #[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use vm::{ColdCensus, ColdKey, ColdKeyStats};
+#[cfg(feature = "test-hooks")]
 pub use vm::{
     GapKind, LiveDemotion, LiveFieldStats, LiveRefusal, ProbeFailure, ProofClass, RefusalRecord,
     ReliftCause, ReliftDiagnostics, ReliftRecord, RetryKind, StoreClass, TlbAdvance, TlbStats,

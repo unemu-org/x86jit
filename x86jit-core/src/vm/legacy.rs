@@ -31,6 +31,8 @@ pub(crate) fn paging_generation() -> u64 {
 }
 
 pub use compiled::{ChainEdgeAction, MachineJitCounters, MachineJitMode};
+#[cfg(feature = "test-hooks")]
+pub use compiled::{ColdCensus, ColdKey, ColdKeyStats};
 use nmi::External;
 pub(super) use nmi::{NMI_BLOCKED, NMI_REMEMBERED};
 
@@ -4272,6 +4274,8 @@ impl Vcpu {
                     None => None,
                 };
                 let compiled_stop = compiled.as_ref().is_some_and(|(_, stop)| *stop);
+                #[cfg(any(test, feature = "test-hooks"))]
+                let census = compiled.is_none() && KIND == MACHINE_DISPATCH && ctx.ret_stack != 0;
                 let progress = if let Some((progress, _)) = compiled {
                     progress
                 } else if direct20 {
@@ -4371,6 +4375,10 @@ impl Vcpu {
                         execute_block!(false)
                     }
                 };
+                #[cfg(any(test, feature = "test-hooks"))]
+                if census {
+                    self.census_retired(progress.retired);
+                }
                 if DEVICES {
                     let port = progress.outcome.as_ref().is_some_and(|o| {
                         o.as_ref()
