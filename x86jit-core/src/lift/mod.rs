@@ -790,14 +790,63 @@ pub(crate) fn lift_block_context(
     source: &crate::memory::LiftSource<'_>,
     context: Option<crate::MachineContext>,
 ) -> Result<IrBlock, LiftError> {
+    lift_block_ops(mem, at, mode, details, source, context, Vec::new())
+}
+
+/// [`lift_block_watched`] into `ops`, an empty list whose capacity the
+/// block keeps (xj-to9.71).
+pub(crate) fn lift_block_reusing(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
+    ops: Vec<IrOp>,
+) -> Result<IrBlock, LiftError> {
+    lift_block_ops(mem, at, mode, details, source, None, ops)
+}
+
+fn lift_block_ops(
+    mem: &Memory,
+    at: FetchAddr,
+    mode: CpuMode,
+    details: &mut Option<FetchFailure>,
+    source: &crate::memory::LiftSource<'_>,
+    context: Option<crate::MachineContext>,
+    mut ops: Vec<IrOp>,
+) -> Result<IrBlock, LiftError> {
     loop {
         let permit = mem.fetch_permit();
         *details = None;
-        let result = lift_block_attempt(mem, at, mode, details, source, context);
+        let result = lift_block_attempt(
+            mem,
+            at,
+            mode,
+            details,
+            source,
+            context,
+            std::mem::take(&mut ops),
+        );
         let valid = source.validate();
         if valid && permit.as_ref().is_none_or(|p| p.is_current()) {
             return result;
         }
+        // A retry refills the discarded attempt's list.
+        if let Ok(block) = result {
+            ops = block.ops;
+            ops.clear();
+        }
+    }
+}
+
+/// The capacity a list of ops grown one entry at a time from empty has once
+/// it held `peak` entries: amortized doubling from four (pinned by
+/// `fresh_capacity_is_the_growth_of_an_empty_list`).
+fn fresh_capacity(peak: usize) -> usize {
+    if peak == 0 {
+        0
+    } else {
+        peak.next_power_of_two().max(4)
     }
 }
 
@@ -808,7 +857,14 @@ fn lift_block_attempt(
     details: &mut Option<FetchFailure>,
     source: &crate::memory::LiftSource<'_>,
     context: Option<crate::MachineContext>,
+    mut ops: Vec<IrOp>,
 ) -> Result<IrBlock, LiftError> {
+    debug_assert!(ops.is_empty());
+    // A reused list (xj-to9.71) must end at the capacity a fresh one would
+    // have: the cache's memory statistics count op capacity. Every lowering
+    // grows the list one op at a time; it shrinks only by truncation.
+    let reused = ops.capacity() != 0;
+    let mut peak = 0;
     let start = at.ip;
     let mut window = FetchWindow::<BLOCK_FETCH_WINDOW>::new(mode, start);
     if !window.refill::<true>(mem, at.pa, Some(source)) {
@@ -818,7 +874,6 @@ fn lift_block_attempt(
     let code = window.code();
     let mut decoder = Decoder::with_ip(mode.bits(), code, start, decoder_options(mode));
 
-    let mut ops = Vec::new();
     let mut tg = TempGen::new();
     let mut descriptors = 0;
     let mut mmx_sequence = mmx::Sequence::default();
@@ -906,6 +961,7 @@ fn lift_block_attempt(
             Err(e) => {
                 // Lowering can emit ops before discovering an unsupported operand.
                 // None may execute; dispatch retries this instruction after the prefix.
+                peak = peak.max(ops.len());
                 ops.truncate(ops_start);
                 if !lower_real16_esc_gap(&insn, code, start, mode, &mut ops, &mut tg)? {
                     if icount > 0 {
@@ -920,6 +976,7 @@ fn lift_block_attempt(
         fill_ir_bytes(&insn, code, start, &mut ops[ops_start..]);
         let instruction_descriptors = guest_access_descriptors(&ops[ops_start..]);
         if icount > 0 && descriptors + instruction_descriptors > MAX_GUEST_ACCESS_DESCRIPTORS {
+            peak = peak.max(ops.len());
             ops.truncate(ops_start);
             break;
         }
@@ -932,6 +989,14 @@ fn lift_block_attempt(
         if terminated || (mode.wraps_16() && insn.next_ip() == 0x1_0000) {
             break;
         }
+    }
+    // A list reused for a block of another shape is replaced: one allocation
+    // when the shape changes, none while a key relifts to the same ops.
+    let fresh = fresh_capacity(peak.max(ops.len()));
+    if reused && ops.capacity() != fresh {
+        let mut exact = Vec::with_capacity(fresh);
+        exact.append(&mut ops);
+        ops = exact;
     }
 
     Ok(IrBlock {
@@ -1167,6 +1232,40 @@ pub(crate) fn lift_child(
 mod tests {
     use super::*;
     use crate::memory::{MemoryModel, Prot, RegionKind};
+
+    // A reused op list is matched to `fresh_capacity`, so the cache's op
+    // accounting equals a fresh lift's only while this holds for `Vec`.
+    #[test]
+    fn fresh_capacity_is_the_growth_of_an_empty_list() {
+        let mut ops = Vec::new();
+        assert_eq!(ops.capacity(), fresh_capacity(0));
+        for peak in 1..=1024 {
+            ops.push(IrOp::Hlt);
+            assert_eq!(ops.capacity(), fresh_capacity(peak), "{peak} ops");
+        }
+    }
+
+    // SMC relifts reuse a dropped block's list (xj-to9.71): a list of
+    // another capacity ends as a fresh lift's, an equal one is kept.
+    #[test]
+    fn a_reused_op_list_ends_at_a_fresh_lift_capacity() {
+        let mut mem = Memory::new(MemoryModel::Flat { size: 0x2_0000 });
+        mem.map(0, 0x2_0000, Prot::RWX, RegionKind::Ram).unwrap();
+        // mov byte [0x7c06],0x42; mov al,0; jmp 0x7c00
+        mem.write_bytes(0x7c00, &[0xc6, 6, 6, 0x7c, 0x42, 0xb0, 0, 0xeb, 0xf7])
+            .unwrap();
+        let at = FetchAddr::real16(0, 0x7c00);
+        let fresh = lift_block(&mem, at, CpuMode::Real16).unwrap().ops;
+        for capacity in [1, 4, fresh.capacity(), 64] {
+            let source = crate::memory::LiftSource::new(&mem);
+            let reused = Vec::with_capacity(capacity);
+            let lifted = lift_block_reusing(&mem, at, CpuMode::Real16, &mut None, &source, reused)
+                .unwrap()
+                .ops;
+            assert_eq!(lifted.len(), fresh.len());
+            assert_eq!(lifted.capacity(), fresh.capacity(), "reused {capacity}");
+        }
+    }
 
     #[test]
     fn mmx_sequences_check_once_and_transition_before_commit() {
@@ -1838,9 +1937,15 @@ fn lift_region_attempt(
             }
             // Region compilation is a JIT tier-up path; Real16 never JITs (§17.6, it
             // stays on the interpreter), so successor addresses are flat here.
-            if let Ok(b) =
-                lift_block_attempt(mem, FetchAddr::flat(s), mode, &mut None, source, None)
-            {
+            if let Ok(b) = lift_block_attempt(
+                mem,
+                FetchAddr::flat(s),
+                mode,
+                &mut None,
+                source,
+                None,
+                Vec::new(),
+            ) {
                 let count = guest_access_descriptors(&b.ops);
                 if *descriptors + count > MAX_GUEST_ACCESS_DESCRIPTORS {
                     continue;
@@ -1866,7 +1971,15 @@ fn lift_region_attempt(
         post.push(addr); // finished: post-order
     }
 
-    let first = lift_block_attempt(mem, FetchAddr::flat(entry), mode, details, source, None)?;
+    let first = lift_block_attempt(
+        mem,
+        FetchAddr::flat(entry),
+        mode,
+        details,
+        source,
+        None,
+        Vec::new(),
+    )?;
     let mut descriptors = guest_access_descriptors(&first.ops);
     let mut icount = first.icount;
     let mut blocks = HashMap::from([(entry, first)]);

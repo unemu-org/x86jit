@@ -122,6 +122,10 @@ struct CoverageIndex {
     root: Option<CoverageNode>,
     height: u32,
     bytes: u64,
+    // The overlap counts the last page to stop sharing bytes released, all
+    // zero, for the next overlap (xj-to9.71): a loop that relifts overlapping
+    // units reallocates none. Outside `bytes`: it covers no page.
+    spare_extra: Option<Box<ExtraCoverage>>,
     #[cfg(test)]
     uncovered_ranges: usize,
 }
@@ -290,6 +294,7 @@ impl CoverageIndex {
             self.set_page(page, bits);
             return;
         }
+        let mut spare = self.spare_extra.take();
         let coverage = self.page_mut(page);
         let before = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
         for word in lo / 64..=(hi - 1) / 64 {
@@ -297,10 +302,12 @@ impl CoverageIndex {
             let mut shared = coverage.bits[word] & mask;
             if shared != 0 {
                 let extra = coverage.extra.get_or_insert_with(|| {
-                    Box::new(ExtraCoverage {
-                        counts: [0; 2048],
-                        overflow: Vec::new(),
-                        shared_bytes: 0,
+                    spare.take().unwrap_or_else(|| {
+                        Box::new(ExtraCoverage {
+                            counts: [0; 2048],
+                            overflow: Vec::new(),
+                            shared_bytes: 0,
+                        })
                     })
                 });
                 while shared != 0 {
@@ -312,6 +319,7 @@ impl CoverageIndex {
         }
         let after = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
         self.bytes = self.bytes - before + after;
+        self.spare_extra = spare;
     }
 
     fn uncover(&mut self, page: u64, lo: usize, hi: usize) {
@@ -336,15 +344,21 @@ impl CoverageIndex {
             }
             coverage.bits[word] = (coverage.bits[word] & !mask) | keep;
         }
+        let mut released = None;
         if coverage
             .extra
             .as_ref()
             .is_some_and(|extra| extra.shared_bytes == 0)
         {
-            coverage.extra = None;
+            released = coverage.extra.take();
         }
         let after = coverage.extra.as_ref().map_or(0, |extra| extra.bytes());
         self.bytes = self.bytes - before + after;
+        // No byte is shared: every count is zero and the overflow is consumed.
+        // One with overflow capacity is freed, so a reused one accounts as new.
+        if self.spare_extra.is_none() {
+            self.spare_extra = released.filter(|extra| extra.overflow.capacity() == 0);
+        }
     }
 
     fn remove_page(&mut self, page: u64) {
@@ -509,6 +523,11 @@ struct SpanIndex {
     // check on the interpreter's code-write paths is one test of this, and
     // a VM that compiles no Machine code allocates nothing for it.
     machine: Option<Box<MachineSpans>>,
+    // Kept between invalidations, so a steady self-modifying loop allocates
+    // nothing for them (xj-to9.71): the victim list of a drained write, and
+    // dropped single-span lists for `TranslationCache::insert_checked_span`.
+    victims: Vec<BlockKey>,
+    spare_spans: Vec<Vec<(u64, u32)>>,
 }
 
 impl SpanIndex {
@@ -710,8 +729,14 @@ impl<K: Copy + Eq + std::hash::Hash> SourceIndex<K> {
 
     fn victims(&self, lo: u64, hi: u64) -> Vec<K> {
         let mut keys = Vec::new();
+        self.victims_into(lo, hi, &mut keys);
+        keys
+    }
+
+    /// [`Self::victims`], appended to `keys`.
+    fn victims_into(&self, lo: u64, hi: u64, keys: &mut Vec<K>) {
         if lo >= hi || self.units.is_empty() {
-            return keys;
+            return;
         }
         let first = lo >> crate::memory::CODE_PAGE_BITS;
         let last = (hi - 1) >> crate::memory::CODE_PAGE_BITS;
@@ -756,7 +781,6 @@ impl<K: Copy + Eq + std::hash::Hash> SourceIndex<K> {
                 }
             }
         }
-        keys
     }
 }
 
@@ -842,7 +866,19 @@ pub struct TranslationCache {
     // interpreted entry), their in-flight requests by id, a count of their
     // publications, which a vCPU waiting for one compares, and of requests.
     machine: std::sync::OnceLock<Box<MachineCache>>,
+    // Interpreted blocks dropped by a code write while nothing else held
+    // them, by key, their op lists emptied, for the next lift to refill
+    // (`take_recycled_block`, xj-to9.71). A leaf lock.
+    recycled: Mutex<Vec<(BlockKey, Arc<IrBlock>)>>,
 }
+
+/// Interpreted blocks [`TranslationCache`] keeps for reuse, and the op
+/// capacity above which a block's list is freed instead.
+const RECYCLED_BLOCKS: usize = 8;
+const RECYCLED_OPS: usize = 64;
+/// Dropped single-span lists, and victim keys, kept between invalidations.
+const SPARE_SPANS: usize = 8;
+const VICTIMS_RETAINED: usize = 64;
 
 /// The compiled Machine units' share of the cache, out of line so that the
 /// Application fields keep their layout.
@@ -1038,6 +1074,36 @@ impl TranslationCache {
             tier_up_latency_count: AtomicU64::new(0),
             tier_bg_rejected: AtomicU64::new(0),
             machine: std::sync::OnceLock::new(),
+            recycled: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// An interpreted block a code write dropped (xj-to9.71), not shared and
+    /// with an empty op list of retained capacity, for a lift to refill:
+    /// `key`'s own when kept, whose list fits a relift of the same shape.
+    pub(crate) fn take_recycled_block(&self, key: BlockKey) -> Option<Arc<IrBlock>> {
+        let mut recycled = self.recycled.lock().unwrap();
+        let at = recycled.iter().rposition(|(kept, _)| *kept == key);
+        let at = at.or_else(|| recycled.len().checked_sub(1))?;
+        Some(recycled.swap_remove(at).1)
+    }
+
+    // A dropped unit nothing else holds keeps its allocations for the next
+    // lift: no shared copy can observe the emptied op list.
+    fn recycle(&self, key: BlockKey, block: CachedBlock) {
+        let CachedBlock::Interpreted(mut ir) = block else {
+            return;
+        };
+        let Some(inner) = Arc::get_mut(&mut ir) else {
+            return;
+        };
+        if inner.ops.capacity() > RECYCLED_OPS {
+            return;
+        }
+        inner.ops.clear();
+        let mut recycled = self.recycled.lock().unwrap();
+        if recycled.len() < RECYCLED_BLOCKS {
+            recycled.push((key, ir));
         }
     }
 
@@ -2156,7 +2222,37 @@ impl TranslationCache {
         spans: Vec<(u64, u32)>,
         on_mark: impl FnOnce(&[(u64, u32)]) -> bool,
     ) -> bool {
+        let sp = self.spans.write().unwrap();
+        self.insert_locked(sp, key, block, spans, on_mark)
+    }
+
+    /// [`Self::insert_checked`] of a unit with the one span `span`, whose
+    /// list reuses one a code write dropped (xj-to9.71).
+    pub(crate) fn insert_checked_span(
+        &self,
+        key: BlockKey,
+        block: CachedBlock,
+        span: (u64, u32),
+        on_mark: impl FnOnce(&[(u64, u32)]) -> bool,
+    ) -> bool {
         let mut sp = self.spans.write().unwrap();
+        // Exactly one entry, as `vec![span]` allocates: the index accounts capacity.
+        let mut spans = sp
+            .spare_spans
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(1));
+        spans.push(span);
+        self.insert_locked(sp, key, block, spans, on_mark)
+    }
+
+    fn insert_locked(
+        &self,
+        mut sp: std::sync::RwLockWriteGuard<'_, SpanIndex>,
+        key: BlockKey,
+        block: CachedBlock,
+        spans: Vec<(u64, u32)>,
+        on_mark: impl FnOnce(&[(u64, u32)]) -> bool,
+    ) -> bool {
         let mut mp = self.map.write();
         if !on_mark(&spans) {
             self.code_lifetime().discard(&block);
@@ -2190,11 +2286,18 @@ impl TranslationCache {
         hi: u64,
         on_clear_page: impl FnOnce(),
     ) -> Vec<BlockKey> {
-        self.invalidate_range::<false, false>(lo, hi, |empty| {
-            if empty {
-                on_clear_page();
-            }
-        })
+        let mut victims = Vec::new();
+        self.invalidate_range::<false, false>(
+            lo,
+            hi,
+            |empty| {
+                if empty {
+                    on_clear_page();
+                }
+            },
+            Some(&mut victims),
+        );
+        victims
     }
 
     pub(crate) fn invalidate_child_written(
@@ -2205,23 +2308,26 @@ impl TranslationCache {
     ) -> Vec<BlockKey> {
         #[cfg(feature = "test-hooks")]
         let _tag = advance_kind::Tag::new(advance_kind::CHILD);
-        self.invalidate_range::<true, false>(lo, hi, |empty| {
-            if empty {
-                on_clear_page();
-            }
-        })
+        let mut victims = Vec::new();
+        self.invalidate_range::<true, false>(
+            lo,
+            hi,
+            |empty| {
+                if empty {
+                    on_clear_page();
+                }
+            },
+            Some(&mut victims),
+        );
+        victims
     }
 
     // Drained writes serialize with source publication, including victim-free writes.
-    pub(crate) fn invalidate_written(
-        &self,
-        lo: u64,
-        hi: u64,
-        on_write: impl FnOnce(bool),
-    ) -> Vec<BlockKey> {
+    // Returns whether a cached unit dropped.
+    pub(crate) fn invalidate_written(&self, lo: u64, hi: u64, on_write: impl FnOnce(bool)) -> bool {
         #[cfg(feature = "test-hooks")]
         let _tag = advance_kind::Tag::new(advance_kind::UNRECORDED_DRAIN);
-        self.invalidate_range::<false, false>(lo, hi, on_write)
+        self.invalidate_range::<false, false>(lo, hi, on_write, None)
     }
 
     /// [`Self::invalidate_written`], recording the written bytes for private
@@ -2233,16 +2339,18 @@ impl TranslationCache {
         lo: u64,
         hi: u64,
         on_write: impl FnOnce(bool),
-    ) -> Vec<BlockKey> {
-        self.invalidate_range::<false, true>(lo, hi, on_write)
+    ) -> bool {
+        self.invalidate_range::<false, true>(lo, hi, on_write, None)
     }
 
+    // Returns whether a cached unit dropped; `keep` receives the dropped keys.
     fn invalidate_range<const CHILD: bool, const RECORD: bool>(
         &self,
         lo: u64,
         hi: u64,
         on_write: impl FnOnce(bool),
-    ) -> Vec<BlockKey> {
+        keep: Option<&mut Vec<BlockKey>>,
+    ) -> bool {
         self.invalidation_calls.fetch_add(1, Ordering::Relaxed);
         {
             let spans = self.spans.read().unwrap();
@@ -2277,12 +2385,13 @@ impl TranslationCache {
                 if CHILD || self.invalidate_pending_fetches {
                     self.code_lifetime().flush_predictions();
                 }
-                return Vec::new();
+                return false;
             }
         }
         // Recompute after upgrading the lock: publication may have intervened.
         let mut spans = self.spans.write().unwrap();
-        let victims = spans.cached.victims(lo, hi);
+        let mut victims = std::mem::take(&mut spans.victims);
+        spans.cached.victims_into(lo, hi, &mut victims);
         let machine_victims =
             spans.machine.is_some() && self.drop_machine_victims(&mut spans, lo, hi);
         let mut map = (!victims.is_empty()).then(|| self.map.write());
@@ -2308,8 +2417,15 @@ impl TranslationCache {
                     }
                     spans.suppression_bytes = 0;
                 }
-                spans.cached.remove(entry);
-                map.remove(entry);
+                if let Some(mut list) = spans.cached.remove(entry) {
+                    if list.capacity() == 1 && spans.spare_spans.len() < SPARE_SPANS {
+                        list.clear();
+                        spans.spare_spans.push(list);
+                    }
+                }
+                if let Some(block) = map.remove(entry) {
+                    self.recycle(*entry, block);
+                }
                 hotness.remove(entry);
             }
             self.coverage_bytes
@@ -2337,7 +2453,15 @@ impl TranslationCache {
         if CHILD || !victims.is_empty() || machine_victims || self.invalidate_pending_fetches {
             self.code_lifetime().flush_predictions();
         }
-        victims
+        let dropped = !victims.is_empty();
+        if let Some(keep) = keep {
+            keep.extend_from_slice(&victims);
+        }
+        victims.clear();
+        if victims.capacity() <= VICTIMS_RETAINED {
+            spans.victims = victims;
+        }
+        dropped
     }
 }
 
@@ -2569,9 +2693,7 @@ mod tests {
             let result = rx.recv_timeout(Duration::from_secs(5));
             drop(reader);
             writer.join().unwrap();
-            assert!(result
-                .expect("disjoint write must finish with a shared reader")
-                .is_empty());
+            assert!(!result.expect("disjoint write must finish with a shared reader"));
             assert_eq!(c.publication_generation(), generation + 1);
         }
     }
@@ -2704,12 +2826,10 @@ mod tests {
                 let rendezvous = &rendezvous;
                 let c = &c;
                 scope.spawn(move || {
-                    assert!(c
-                        .invalidate_written(lo, lo + 1, |empty| {
-                            assert!(!empty);
-                            rendezvous.wait();
-                        })
-                        .is_empty());
+                    assert!(!c.invalidate_written(lo, lo + 1, |empty| {
+                        assert!(!empty);
+                        rendezvous.wait();
+                    }));
                 });
             }
         });

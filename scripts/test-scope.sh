@@ -107,7 +107,8 @@ legacy_tests=(
     fences flags_at_exit gathers
     irq_shadow locked_misaligned locked_split_device machine_empty_fpu mmio_rmw mmx port_string
     retired_count run_steps
-    same_block_smc smc sparse_backing ss286 string_mmio time_stats vcpu_reset x87_pointers
+    same_block_smc smc smc_coverage sparse_backing ss286 string_mmio time_stats vcpu_reset
+    x87_pointers
 )
 
 path_class() {

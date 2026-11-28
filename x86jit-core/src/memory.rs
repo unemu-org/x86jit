@@ -789,6 +789,8 @@ impl WatchPages {
 }
 
 pub(crate) const DISPATCH_DIRTY: u64 = 1;
+/// Ranges a drained code-write buffer keeps capacity for between drains.
+const DRAINED_RETAINED: usize = 64;
 
 /// The next `Memory::dispatch_identity`; 64 bits never wrap in practice.
 static NEXT_DISPATCH_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -964,6 +966,10 @@ pub struct Memory {
     // `code_range_ptr` for why a watermark and not a table probe.
     code_range: AtomicU64,
     dirty: Mutex<Vec<(u64, u64)>>,
+    // The buffer a drain takes `dirty`'s ranges into, emptied and kept after
+    // each drain, so a steady SMC loop reallocates neither (xj-to9.71).
+    // Taken under `dispatch_words`.
+    drained: Mutex<Vec<(u64, u64)>>,
     dirty_flag: AtomicBool,
     /// A VM over this memory holds a live instruction field: a small code
     /// write may be absorbed at its store site (xj-to9.48, `vm::absorb_at_store`).
@@ -1082,12 +1088,42 @@ impl Drop for CodeRegistration {
     }
 }
 
+/// The code pages one lift watches. Most lifts read one page, which is kept
+/// inline: a lift that stays on one page allocates nothing for it (xj-to9.71).
+#[derive(Default)]
+struct LiftPages {
+    first: Option<u64>,
+    rest: BTreeSet<u64>,
+}
+
+impl LiftPages {
+    /// Whether `page` was not watched yet.
+    fn insert(&mut self, page: u64) -> bool {
+        match self.first {
+            None => {
+                self.first = Some(page);
+                true
+            }
+            Some(first) if first == page => false,
+            Some(_) => self.rest.insert(page),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.first.into_iter().chain(self.rest.iter().copied())
+    }
+}
+
 /// Temporary source ownership lasts through registration/publication. It is
 /// separate from durable cache/request/fetch-policy tags, so discarded lookahead
 /// and failed speculative successors cannot leave permanent code pages (§10).
 pub(crate) struct LiftSource<'a> {
     mem: &'a Memory,
-    pages: RefCell<BTreeSet<u64>>,
+    pages: RefCell<LiftPages>,
     copies: RefCell<Vec<(u64, Vec<u8>)>>,
     epoch: Cell<u64>,
     needs_validation: Cell<bool>,
@@ -1098,7 +1134,7 @@ impl<'a> LiftSource<'a> {
     pub(crate) fn new(mem: &'a Memory) -> Self {
         Self {
             mem,
-            pages: RefCell::new(BTreeSet::new()),
+            pages: RefCell::new(LiftPages::default()),
             copies: RefCell::new(Vec::new()),
             epoch: Cell::new(0),
             needs_validation: Cell::new(false),
@@ -1185,7 +1221,7 @@ impl Drop for LiftSource<'_> {
             return;
         }
         let mut aliases = self.mem.code_aliases.lock().unwrap();
-        for &page in self.pages.get_mut().iter() {
+        for page in self.pages.get_mut().iter() {
             let count = aliases.lifting.get_mut(&page).unwrap();
             *count -= 1;
             if *count == 0 {
@@ -1649,6 +1685,7 @@ impl Memory {
             time_enabled: false,
             code_range: AtomicU64::new(0),
             dirty: Mutex::new(Vec::new()),
+            drained: Mutex::new(Vec::new()),
             dirty_flag: AtomicBool::new(false),
             live_store_site: AtomicBool::new(false),
             absorbed: Mutex::new(Vec::new()),
@@ -2196,17 +2233,36 @@ impl Memory {
         // Alias expansion and dirty-range growth reach the embedder's allocator.
         let _fp = crate::jit_abi::fp::DefaultEnvironment::enter();
         let aliases = self.code_aliases.lock().unwrap();
-        let mut dirty = aliases.written_ranges(lo, hi);
-        dirty.retain(|&(lo, hi)| {
-            observer.note_block_write(lo, (hi - lo) as usize);
+        let tracked = |lo: u64| {
             aliases.translated.contains(&(lo >> CODE_PAGE_BITS))
                 || aliases.lifting.contains_key(&(lo >> CODE_PAGE_BITS))
                 || aliases.fetching.contains(&(lo >> CODE_PAGE_BITS))
+        };
+        // A page without a declared alias expands to the written range alone
+        // (`written_ranges`): queue it without building a list (xj-to9.71).
+        if !aliases.registrations.contains_key(&(lo >> CODE_PAGE_BITS)) {
+            observer.note_block_write(lo, (hi - lo) as usize);
+            let tracked = tracked(lo);
+            drop(aliases);
+            if tracked {
+                self.queue_code_writes(std::iter::once((lo, hi)));
+            }
+            return;
+        }
+        let mut dirty = aliases.written_ranges(lo, hi);
+        dirty.retain(|&(lo, hi)| {
+            observer.note_block_write(lo, (hi - lo) as usize);
+            tracked(lo)
         });
         drop(aliases);
         if dirty.is_empty() {
             return;
         }
+        self.queue_code_writes(dirty);
+    }
+
+    /// Queue code writes for the next drain and notify every dispatcher.
+    fn queue_code_writes(&self, dirty: impl IntoIterator<Item = (u64, u64)>) {
         // Serialize notification and clearing with the drain. Exit bits in
         // these words are independent and must survive every SMC update.
         let mut words = self.dispatch_words.lock().unwrap();
@@ -2506,7 +2562,9 @@ impl Memory {
         }
         let mut pages: Vec<u64> = if self.has_dirty_code() {
             let _words = self.dispatch_words.lock().unwrap();
-            self.take_dirty_code_locked()
+            let mut ranges = Vec::new();
+            self.take_dirty_code_locked(&mut ranges);
+            ranges
                 .into_iter()
                 .map(|(lo, _)| lo >> CODE_PAGE_BITS)
                 .collect()
@@ -2530,7 +2588,7 @@ impl Memory {
     /// Serialize invalidation and this vcpu's acknowledgement with notifications
     /// and other dispatchers. A running vcpu must retain its own notice until it
     /// reaches dispatch, even if another vcpu already drained the global list.
-    pub(crate) fn dispatch_smc(&self, word: &AtomicU64, invalidate: impl FnOnce(Vec<(u64, u64)>)) {
+    pub(crate) fn dispatch_smc(&self, word: &AtomicU64, invalidate: impl FnOnce(&[(u64, u64)])) {
         let notices = DISPATCH_DIRTY | crate::child::DISPATCH_CHILD_DIRTY;
         if word.load(Ordering::Acquire) & notices == 0 && !self.has_dirty_code() {
             return;
@@ -2538,7 +2596,15 @@ impl Memory {
         let _words = self.dispatch_words.lock().unwrap();
         let child_epoch = self.child_dispatch.epoch(word);
         let before = child_epoch.map(|epoch| epoch.load(Ordering::Acquire));
-        invalidate(self.take_dirty_code_locked());
+        let mut drained = self.drained.lock().unwrap();
+        self.take_dirty_code_locked(&mut drained);
+        invalidate(&drained);
+        drained.clear();
+        // Keep a buffer for an ordinary drain, not the largest burst seen.
+        if drained.capacity() > DRAINED_RETAINED {
+            *drained = Vec::new();
+        }
+        drop(drained);
         // The lock makes prior invalidation visible before acknowledgement and
         // serializes ordinary writers; child writers use the epoch check below.
         word.fetch_and(!notices, Ordering::AcqRel);
@@ -2552,13 +2618,13 @@ impl Memory {
     }
 
     // Caller holds dispatch_words through any invalidation and acknowledgement.
-    fn take_dirty_code_locked(&self) -> Vec<(u64, u64)> {
+    // `ranges` is empty; the queue keeps its buffer's capacity in exchange.
+    fn take_dirty_code_locked(&self, ranges: &mut Vec<(u64, u64)>) {
+        debug_assert!(ranges.is_empty());
         // Something's dirty: claim it. A racing vcpu may have drained it already.
-        let mut ranges = if self.dirty_flag.swap(false, Ordering::Relaxed) {
-            std::mem::take(&mut *self.dirty.lock().unwrap())
-        } else {
-            Vec::new()
-        };
+        if self.dirty_flag.swap(false, Ordering::Relaxed) {
+            std::mem::swap(&mut *self.dirty.lock().unwrap(), ranges);
+        }
         if self.child_dispatch.dirty.swap(false, Ordering::AcqRel) {
             let aliases = self.code_aliases.lock().unwrap();
             let mut journals = self.child_writes.lock().unwrap();
@@ -2578,7 +2644,6 @@ impl Memory {
                 }
             });
         }
-        ranges
     }
 
     /// Highest mapped guest address (exclusive end of the top region) at or below
@@ -6823,8 +6888,8 @@ mod child_isolation_tests {
             let other = crate::vm::EXIT_REQUESTED | crate::vm::CODE_SPACE_EXHAUSTED;
             let a = Arc::new(AtomicU64::new(other));
             let b = Arc::new(AtomicU64::new(other));
-            let invalidate = |ranges: Vec<(u64, u64)>| {
-                for (lo, hi) in ranges {
+            let invalidate = |ranges: &[(u64, u64)]| {
+                for &(lo, hi) in ranges {
                     vm.cache.invalidate_written(lo, hi, |empty| {
                         if empty {
                             vm.mem.clear_code_page(lo >> CODE_PAGE_BITS);

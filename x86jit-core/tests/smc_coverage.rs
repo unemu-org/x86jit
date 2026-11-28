@@ -55,3 +55,46 @@ fn clearing_abandoned_unaliased_code_tags_allocates_nothing() {
     assert!(!mem.is_code_page(3));
     assert_eq!(allocations, 0);
 }
+
+/// The Real16 alias's self-modifying loops of `real16_loops` (`smc-next-*`,
+/// `smc-rmw-64`): a store patches the next instruction's immediate, so every
+/// iteration drains the write, drops both overlapping blocks and relifts
+/// them. Once warm, an iteration reuses the dropped blocks' allocations and
+/// the drain's buffers, and allocates nothing (xj-to9.71).
+#[test]
+fn steady_real16_alias_smc_windows_allocate_nothing() {
+    use x86jit_core::{Prot, Reg, RegionKind, StepOptions, Vm, VmConfig};
+    // mov byte [0x7c06],0x42 / add byte [0x7c06],1; mov al,0; jmp 0x7c00
+    let next = [0xc6, 6, 6, 0x7c, 0x42, 0xb0, 0, 0xeb, 0xf7];
+    let rmw = [0x80, 6, 6, 0x7c, 1, 0xb0, 0, 0xeb, 0xf7];
+    for (code, slice) in [(next, 1), (next, 64), (rmw, 64)] {
+        let mut vm = Vm::new(VmConfig::flat(0x10_0000));
+        vm.set_cpu_mode(CpuMode::Real16);
+        vm.map(0, 0xa_0000, Prot::RWX, RegionKind::Ram).unwrap();
+        let mut cpu = vm.new_vcpu();
+        for (reg, value) in [(Reg::Cs, 0), (Reg::Rip, 0x7c00), (Reg::Ds, 0), (Reg::Ss, 0)] {
+            cpu.set_reg(reg, value);
+        }
+        vm.write_bytes(0x7c00, &code).unwrap();
+        // Three steps per iteration; run whole iterations per phase.
+        let run = |cpu: &mut x86jit_core::Vcpu, iterations: u64| {
+            let mut done = 0;
+            while done < 3 * iterations {
+                let r = cpu.run_steps(&vm, slice, StepOptions::default()).unwrap();
+                assert_eq!(r.steps(), slice);
+                done += slice;
+            }
+        };
+        run(&mut cpu, 64);
+        let misses = vm.cache.misses();
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        run(&mut cpu, 256);
+        let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
+        // Each iteration relifts the block at 0x7c00 and the one at the patch.
+        assert!(
+            vm.cache.misses() >= misses + 2 * 256,
+            "every window relifts"
+        );
+        assert_eq!(allocations, 0, "code {code:02x?}, {slice} steps per call");
+    }
+}

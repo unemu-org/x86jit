@@ -10,12 +10,47 @@ pub struct UndefinedTemp {
     pub temp: Temp,
 }
 
+/// The temporaries defined so far: the first 4096 in a bitmap on the stack,
+/// so that verifying an ordinary block allocates nothing (the debug
+/// interpreter verifies every Real16 block it runs; xj-to9.71).
+struct DefinedTemps {
+    low: [u64; 64],
+    high: std::collections::HashSet<Temp>,
+}
+
+impl Default for DefinedTemps {
+    fn default() -> Self {
+        Self {
+            low: [0; 64],
+            high: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl DefinedTemps {
+    fn contains(&self, temp: Temp) -> bool {
+        match self.low.get(temp as usize / 64) {
+            Some(word) => word & (1 << (temp % 64)) != 0,
+            None => self.high.contains(&temp),
+        }
+    }
+
+    fn insert(&mut self, temp: Temp) {
+        match self.low.get_mut(temp as usize / 64) {
+            Some(word) => *word |= 1 << (temp % 64),
+            None => {
+                self.high.insert(temp);
+            }
+        }
+    }
+}
+
 impl IrBlock {
     /// Walk ops in order, checking all inputs before recording any outputs.
     /// A fault exits the block; a retry starts another walk from its entry.
     /// Architectural registers (including vector/opmask registers) are not temps.
     pub fn verify_temp_defs(&self) -> Result<(), UndefinedTemp> {
-        let mut defined = std::collections::HashSet::new();
+        let mut defined = DefinedTemps::default();
         let mut guest_addr = self.guest_start;
         for (op_index, op) in self.ops.iter().enumerate() {
             if let IrOp::InsnStart { guest_addr: addr } = op {
@@ -24,7 +59,7 @@ impl IrBlock {
             let mut check = |reads: &[Val], writes: &[Temp]| {
                 for &value in reads {
                     if let Val::Temp(temp) = value {
-                        if !defined.contains(&temp) {
+                        if !defined.contains(temp) {
                             return Err(UndefinedTemp {
                                 op_index,
                                 guest_addr,
@@ -33,7 +68,9 @@ impl IrBlock {
                         }
                     }
                 }
-                defined.extend(writes.iter().copied());
+                for &temp in writes {
+                    defined.insert(temp);
+                }
                 Ok(())
             };
             match op {

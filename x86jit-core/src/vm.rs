@@ -1774,14 +1774,14 @@ impl Vm {
 
     #[cold]
     #[inline(never)]
-    fn invalidate_recorded(&self, dirty: Vec<(u64, u64)>) -> bool {
+    fn invalidate_recorded(&self, dirty: &[(u64, u64)]) -> bool {
         self.invalidate_dirty::<true>(dirty)
     }
 
     #[inline(always)]
-    fn invalidate_dirty<const RECORD: bool>(&self, dirty: Vec<(u64, u64)>) -> bool {
+    fn invalidate_dirty<const RECORD: bool>(&self, dirty: &[(u64, u64)]) -> bool {
         let mut invalidated = false;
-        for (lo, hi) in dirty {
+        for &(lo, hi) in dirty {
             // A patch inside a live Machine instruction field (xj-to9.46).
             // Only a recording drain can meet one: a live field exists only
             // once a private proof has. Fetch approvals are page-wide: a
@@ -1811,12 +1811,11 @@ impl Vm {
                     self.mem.clear_code_page(page);
                 }
             };
-            invalidated |= !if RECORD {
+            invalidated |= if RECORD {
                 self.cache.invalidate_written_recorded(lo, hi, on_write)
             } else {
                 self.cache.invalidate_written(lo, hi, on_write)
-            }
-            .is_empty();
+            };
         }
         invalidated
     }
@@ -4472,12 +4471,18 @@ fn resolve_interpreted_uncached<const DEFAULT: bool>(
     let compile_generation = vm.cache.publication_generation();
     let permit = vm.mem.fetch_permit();
     let mut fetch_failure = None;
+    // A block a code write dropped lends its allocation and op list, so a
+    // steady self-modifying loop relifts without allocating (xj-to9.71).
+    let mut recycled = vm.cache.take_recycled_block(key);
+    let ops = recycled.as_mut().map_or_else(Vec::new, |block| {
+        std::mem::take(&mut Arc::get_mut(block).unwrap().ops)
+    });
     let lifted = {
         let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Lift);
         let _time_lift = vm
             .time_enabled
             .then(crate::time_stats::FetchPhaseTimer::lift);
-        lift_block_watched(&vm.mem, at, mode, &mut fetch_failure, source)
+        crate::lift::lift_block_reusing(&vm.mem, at, mode, &mut fetch_failure, source, ops)
     };
     lifted
         .map_err(|e| ResolveFailure::Exit(lift_exit(e, fetch_failure, &vm.mem, at, mode)))
@@ -4490,6 +4495,7 @@ fn resolve_interpreted_uncached<const DEFAULT: bool>(
                 key,
                 pc,
                 ir,
+                recycled,
                 permit.as_ref(),
                 compile_generation,
             )
@@ -4623,6 +4629,7 @@ fn resolve_uncached<const DEFAULT: bool>(
                     key,
                     pc,
                     region.blocks.into_iter().next().unwrap(),
+                    None,
                     permit.as_ref(),
                     compile_generation,
                 )
@@ -4656,6 +4663,7 @@ fn resolve_uncached<const DEFAULT: bool>(
             key,
             pc,
             ir,
+            None,
             permit.as_ref(),
             compile_generation,
         )
@@ -4692,6 +4700,7 @@ fn finish_single(
     key: BlockKey,
     span_start: u64,
     ir: IrBlock,
+    mut recycled: Option<Arc<IrBlock>>,
     permit: Option<&crate::FetchPermit>,
     compile_generation: u64,
 ) -> Option<CachedBlock> {
@@ -4716,7 +4725,7 @@ fn finish_single(
         || vm.tier_up_after.is_some()
         || !vm.cache.code_lifetime().is_open()
     {
-        CachedBlock::Interpreted(Arc::new(ir.take().unwrap()))
+        CachedBlock::Interpreted(interpreted_block(recycled.take(), ir.take().unwrap()))
     } else {
         let _section = EngineSection::enter(exit_word, sections, CriticalSectionKind::Compile);
         vm.hold_compile();
@@ -4744,17 +4753,29 @@ fn finish_single(
     };
     if vm
         .cache
-        .insert_checked(key, materialized.clone(), vec![(start, len)], publish)
+        .insert_checked_span(key, materialized.clone(), (start, len), publish)
     {
         return Some(materialized);
     }
     discard_materialized(vm, &materialized);
     // A domain mismatch is permanent for this run. Publish valid source as
     // interpreted once, rather than repeatedly allocating rejected machine code.
-    let fallback = CachedBlock::Interpreted(Arc::new(ir?));
+    let fallback = CachedBlock::Interpreted(interpreted_block(recycled, ir?));
     vm.cache
-        .insert_checked(key, fallback.clone(), vec![(start, len)], publish)
+        .insert_checked_span(key, fallback.clone(), (start, len), publish)
         .then_some(fallback)
+}
+
+/// `ir` in `recycled`'s allocation when there is one (unshared, from
+/// `TranslationCache::take_recycled_block`), else in a new one.
+fn interpreted_block(recycled: Option<Arc<IrBlock>>, ir: IrBlock) -> Arc<IrBlock> {
+    match recycled {
+        Some(mut block) => {
+            *Arc::get_mut(&mut block).unwrap() = ir;
+            block
+        }
+        None => Arc::new(ir),
+    }
 }
 
 /// Map a lift error to its dispatcher exit (a legal exit, not a `run()` failure).
