@@ -1992,6 +1992,7 @@ impl Vm {
             time_dispatch: crate::time_stats::DispatchCounts::default(),
             time_record: self.time_registry.lock().unwrap().register(),
             time_outside: None,
+            time_run: Default::default(),
             allocations: allocations.clone(),
             _vm_lifetime: self.vcpu_lifetime.clone(),
             cpu,
@@ -2260,6 +2261,7 @@ pub struct Vcpu {
     time_dispatch: crate::time_stats::DispatchCounts,
     time_record: Arc<crate::time_stats::Record>,
     time_outside: crate::time_stats::Outside,
+    time_run: crate::time_stats::RunTimer,
     allocations: Arc<VcpuAllocations>,
     _vm_lifetime: Arc<VmLifetime>,
     pub cpu: CpuState,
@@ -2443,24 +2445,28 @@ impl DispatchGuard<'_> {
         (chains, counts)
     }
 
-    /// The normal end of a run: the counts go to `finish`, in the same
-    /// thread-local access as the run's exit (`RunGuard::finish_with_counts`).
+    /// The normal end of a run: the counts go to the run's accounting with its
+    /// exit (`RunTimer::finish_with_counts`), which the caller drops last.
     #[inline(always)]
     fn finish(
         mut self,
-        time_run: &crate::time_stats::RunGuard,
         exit: Option<&Exit>,
-    ) -> crate::time_stats::Outside {
+    ) -> (crate::time_stats::Outside, crate::time_stats::RunTimer) {
         let (chains, counts) = self.take_counts();
+        let cpu = &mut *self.cpu;
+        let finished = cpu
+            .time_run
+            .finish_with_counts(&cpu.time_record, exit, chains, &counts);
         std::mem::forget(self);
-        time_run.finish_with_counts(exit, chains, &counts)
+        finished
     }
 }
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
         let (chains, counts) = self.take_counts();
-        crate::time_stats::dispatch_counts(chains, counts);
+        let cpu = &mut *self.cpu;
+        cpu.time_run.unwind(&cpu.time_record, chains, counts);
     }
 }
 
@@ -3729,13 +3735,12 @@ impl Vcpu {
         devices: &mut device::Run<'_>,
     ) -> Result<StepRun, StepRunError> {
         if KIND == ALIAS_DISPATCH && STEPPED && budget == Some(0) {
-            let time_run = crate::time_stats::RunGuard::enter(
-                self.time_record.clone(),
-                vm.time_enabled,
-                self.time_outside.take(),
-            );
-            drop(DispatchGuard::new(self, vm));
-            self.time_outside = time_run.finish(Some(&Exit::BudgetExhausted));
+            self.time_run
+                .enter(&self.time_record, vm.time_enabled, &mut self.time_outside);
+            let (outside, time_run) =
+                DispatchGuard::new(self, vm).finish(Some(&Exit::BudgetExhausted));
+            drop(time_run);
+            self.time_outside = outside;
             return Ok(StepRun {
                 steps: 0,
                 stop: StepStop::Exit(Exit::BudgetExhausted),
@@ -3792,11 +3797,8 @@ impl Vcpu {
         if KIND == ALIAS_DISPATCH && budget != Some(0) {
             crate::legacy::REAL16_ALIAS.derive_caches(&mut self.cpu);
         }
-        let time_run = crate::time_stats::RunGuard::enter(
-            self.time_record.clone(),
-            vm.time_enabled,
-            self.time_outside.take(),
-        );
+        self.time_run
+            .enter(&self.time_record, vm.time_enabled, &mut self.time_outside);
         let dispatch = DispatchGuard::new(self, vm);
         let cpu = &mut *dispatch.cpu;
         cpu.interruption_evidence = None;
@@ -3927,13 +3929,10 @@ impl Vcpu {
         if KIND == DIRECT20_DISPATCH && cpu.rep_restart20_pending() {
             cpu.record_rep_restart20(vm);
         }
-        let outside = dispatch.finish(
-            &time_run,
-            match &result.stop {
-                StepStop::Exit(exit) => Some(exit),
-                StepStop::IrqReady => None,
-            },
-        );
+        let (outside, _time_run) = dispatch.finish(match &result.stop {
+            StepStop::Exit(exit) => Some(exit),
+            StepStop::IrqReady => None,
+        });
         // Outstanding device state is created only at a run's exit or at an
         // in-process completion, which publishes it. A budget stop with none
         // published therefore has nothing to recompute.

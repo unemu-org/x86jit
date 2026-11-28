@@ -6,7 +6,7 @@
 //! measure elapsed host time, including descheduling, not thread CPU time.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Calls with deterministic 1-in-64 timing (first call per run, then every 64th).
@@ -341,6 +341,27 @@ impl Default for Record {
         Self(std::array::from_fn(|_| AtomicU64::new(0)))
     }
 }
+impl Record {
+    // A record belongs to one vCPU, and only a run of that vCPU, which holds it
+    // exclusively, adds to it; snapshots only load. One writer needs no
+    // read-modify-write.
+    #[inline(always)]
+    fn add_owned(&self, i: usize, value: u64) {
+        let counter = &self.0[i];
+        counter.store(
+            counter.load(Ordering::Relaxed).saturating_add(value),
+            Ordering::Relaxed,
+        );
+    }
+    #[inline(always)]
+    fn add_dispatch_owned(&self, chains: u64, counts: &DispatchCounts) {
+        self.add_owned(CHAINS, chains);
+        self.add_owned(LOOKUPS, counts.lookups);
+        self.add_owned(MISSES, counts.misses);
+        self.add_owned(INDIRECT, counts.indirect);
+        self.add_owned(FETCH, counts.fetch_calls);
+    }
+}
 
 pub(crate) struct Registry {
     records: Vec<Arc<Record>>,
@@ -577,12 +598,93 @@ pub(crate) struct DispatchCounts {
 }
 
 pub(crate) type Outside = Option<(usize, MonotonicTime)>;
+
+// Live runs with detailed accounting enabled, on any thread. While there are
+// none, no thread's `LOCAL` belongs to an enabled run, so a disabled run
+// cannot be nested in one and has nothing to isolate itself from: it skips
+// `LOCAL` and adds its always-on counters straight to its record (`RunTimer`).
+// Only a same-thread nesting matters, which program order makes visible, so
+// relaxed accesses suffice.
+static DETAILED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// A vCPU run's accounting, kept in the vCPU between entry and exit so that no
+/// value of it is live across the run's dispatch loop. A run with detailed
+/// accounting disabled and no enabled run live anywhere costs one flag test and
+/// one counter load at entry, and a few relaxed adds to its vCPU's record at
+/// exit; any other run keeps its state in `LOCAL` (`RunGuard`), entered out of
+/// line. Empty outside a run.
+#[derive(Default)]
+pub(crate) struct RunTimer(Option<RunGuard>);
+impl RunTimer {
+    #[inline(always)]
+    pub(crate) fn enter(&mut self, record: &Arc<Record>, enabled: bool, outside: &mut Outside) {
+        debug_assert!(self.0.is_none(), "a vCPU run is not reentrant");
+        if !enabled && DETAILED_RUNS.load(Ordering::Relaxed) == 0 {
+            // A disabled entry excludes the outside interval, as `RunGuard::start` does.
+            *outside = None;
+            return;
+        }
+        self.0 = Some(RunGuard::enter_from(record, enabled, outside.take()));
+    }
+    /// Whether the run keeps its counters in `LOCAL`.
+    #[cfg(test)]
+    pub(crate) fn detailed(&self) -> bool {
+        self.0.is_some()
+    }
+    /// The run's exit and dispatch counts, as [`RunGuard::finish_with_counts`].
+    /// Returns the run's accounting, which publishes it when dropped.
+    #[inline(always)]
+    pub(crate) fn finish_with_counts(
+        &mut self,
+        record: &Record,
+        exit: Option<&crate::Exit>,
+        chains: u64,
+        counts: &DispatchCounts,
+    ) -> (Outside, Self) {
+        match self.0.take() {
+            Some(run) => {
+                let outside = run.finish_with_counts(exit, chains, counts);
+                (outside, Self(Some(run)))
+            }
+            None => {
+                record.add_dispatch_owned(chains, counts);
+                record.add_owned(EXITS + exit_kind(exit) * 2, 1);
+                (None, Self(None))
+            }
+        }
+    }
+    /// A run that ends without an exit (unwinding): its dispatch counts go to
+    /// its vCPU's record whichever accounting it used (a detailed run would
+    /// publish them to the same record), and its accounting ends.
+    #[cold]
+    pub(crate) fn unwind(&mut self, record: &Record, chains: u64, counts: DispatchCounts) {
+        record.add_dispatch_owned(chains, &counts);
+        drop(self.0.take());
+    }
+}
+
+#[inline(always)]
+fn exit_kind(exit: Option<&crate::Exit>) -> usize {
+    match exit {
+        Some(crate::Exit::Syscall) => 0,
+        Some(crate::Exit::UnmappedMemory { .. } | crate::Exit::Exception { .. }) => 1,
+        Some(crate::Exit::Interrupted) => 2,
+        Some(crate::Exit::PortIo { .. }) => 3,
+        Some(crate::Exit::MmioRead { .. } | crate::Exit::MmioWrite { .. }) => 4,
+        Some(crate::Exit::Hlt) => 5,
+        Some(crate::Exit::BudgetExhausted) | None => 6,
+        _ => 7,
+    }
+}
+
 pub(crate) struct RunGuard {
     // The thread's state before the run, restored at drop: an enclosing run's,
     // or one a helper scope left open outside any run. `None` when it was
     // idle, and the run used it in place.
     previous: Option<Box<Local>>,
     record: Arc<Record>,
+    // Counted in `DETAILED_RUNS` until drop.
+    enabled: bool,
 }
 impl Local {
     // No run owns it and no scope is open in it. Its counters are zero then,
@@ -598,12 +700,25 @@ impl Local {
 }
 impl RunGuard {
     pub(crate) fn enter(record: Arc<Record>, enabled: bool, outside: Outside) -> Self {
+        if enabled {
+            DETAILED_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
         LOCAL.with(|l| {
             let mut l = l.borrow_mut();
             let previous = (!l.idle()).then(|| Box::new(std::mem::replace(&mut *l, Local::EMPTY)));
             Self::start(&mut l, enabled, outside);
-            Self { previous, record }
+            Self {
+                previous,
+                record,
+                enabled,
+            }
         })
+    }
+    // `RunTimer`'s cold entry.
+    #[cold]
+    #[inline(never)]
+    fn enter_from(record: &Arc<Record>, enabled: bool, outside: Outside) -> Self {
+        Self::enter(record.clone(), enabled, outside)
     }
     #[inline(always)]
     fn start(current: &mut Local, enabled: bool, outside: Outside) {
@@ -633,6 +748,7 @@ impl RunGuard {
     // module. `LocalKey::with` is not `#[inline]`, so whether it inlines here depends
     // on which codegen unit holds its instance; `try_with` is `#[inline]`. The
     // destroyed-key path still panics through `with`, with its message.
+    #[cfg(test)]
     #[inline(never)]
     pub(crate) fn finish(&self, exit: Option<&crate::Exit>) -> Outside {
         self.finish_run(exit, None)
@@ -656,16 +772,7 @@ impl RunGuard {
         exit: Option<&crate::Exit>,
         dispatch: Option<(u64, &DispatchCounts)>,
     ) -> Outside {
-        let kind = match exit {
-            Some(crate::Exit::Syscall) => 0,
-            Some(crate::Exit::UnmappedMemory { .. } | crate::Exit::Exception { .. }) => 1,
-            Some(crate::Exit::Interrupted) => 2,
-            Some(crate::Exit::PortIo { .. }) => 3,
-            Some(crate::Exit::MmioRead { .. } | crate::Exit::MmioWrite { .. }) => 4,
-            Some(crate::Exit::Hlt) => 5,
-            Some(crate::Exit::BudgetExhausted) | None => 6,
-            _ => 7,
-        };
+        let kind = exit_kind(exit);
         LOCAL
             .try_with(|l| {
                 let mut l = l.borrow_mut();
@@ -678,9 +785,6 @@ impl RunGuard {
             .unwrap_or_else(|_| LOCAL.with(|_| unreachable!()))
     }
 }
-pub(crate) fn dispatch_counts(chains: u64, counts: DispatchCounts) {
-    LOCAL.with(|l| add_dispatch(&mut l.borrow_mut().values, chains, &counts));
-}
 #[inline(always)]
 fn add_dispatch(values: &mut Counters, chains: u64, counts: &DispatchCounts) {
     add(values, CHAINS, chains);
@@ -692,6 +796,9 @@ fn add_dispatch(values: &mut Counters, chains: u64, counts: &DispatchCounts) {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
+        if self.enabled {
+            DETAILED_RUNS.fetch_sub(1, Ordering::Relaxed);
+        }
         match self.previous.take() {
             None => LOCAL.with(|l| {
                 let mut l = l.borrow_mut();
@@ -1107,6 +1214,56 @@ mod tests {
         assert_eq!((count(&outer, 5), count(&outer, 0)), (3, 0));
         assert_eq!((count(&inner, 5), count(&inner, 0)), (0, 1));
         LOCAL.with(|l| assert!(l.borrow().idle()));
+    }
+
+    #[test]
+    fn disabled_run_timer_publishes_always_on_counts() {
+        let mut registry = Registry::default();
+        let record = registry.register();
+        let mut outside = Some((6, MonotonicTime::now()));
+        // Either path: another test thread may hold an enabled run.
+        let mut run = RunTimer::default();
+        run.enter(&record, false, &mut outside);
+        assert!(outside.is_none());
+        let counts = DispatchCounts {
+            lookups: 3,
+            misses: 1,
+            fetch_calls: 2,
+            indirect: 4,
+        };
+        let exit = Some(&crate::Exit::Hlt);
+        let (outside, finished) = run.finish_with_counts(&record, exit, 5, &counts);
+        assert!(outside.is_none() && !run.detailed());
+        drop(finished);
+        let stats = registry.snapshot();
+        assert_eq!(stats.exits.hlt.count, 1);
+        assert_eq!(
+            (stats.block_lookups, stats.block_misses, stats.chain_hits),
+            (3, 1, 5)
+        );
+        assert_eq!(
+            (stats.fetch_translate.calls, stats.indirect_branch_resolves),
+            (2, 4)
+        );
+    }
+
+    #[test]
+    fn disabled_run_inside_an_enabled_run_keeps_its_own_local() {
+        let mut registry = Registry::default();
+        let (outer, inner) = (registry.register(), registry.register());
+        let run = RunGuard::enter(outer, true, None);
+        let mut nested = RunTimer::default();
+        nested.enter(&inner, false, &mut None);
+        assert!(nested.detailed());
+        LOCAL.with(|l| assert!(l.borrow().active && !l.borrow().enabled));
+        let exit = Some(&crate::Exit::Syscall);
+        let (_, finished) = nested.finish_with_counts(&inner, exit, 0, &DispatchCounts::default());
+        LOCAL.with(|l| assert!(!l.borrow().enabled));
+        drop(finished);
+        LOCAL.with(|l| assert!(l.borrow().enabled));
+        drop(run);
+        LOCAL.with(|l| assert!(l.borrow().idle()));
+        assert_eq!(registry.snapshot().exits.syscall.count, 1);
     }
 
     #[test]
