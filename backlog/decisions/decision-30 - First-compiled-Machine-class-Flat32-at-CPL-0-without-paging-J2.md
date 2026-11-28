@@ -577,3 +577,13 @@ No single item is larger than about a tenth of the turn. Keeping the previous tu
 reference across turns to skip the `Arc` count measured no change. The turn stays above 400,
 so Q8's trigger for J2b holds: the remaining gap to done-when 2 (register ≤ 102, callret
 ≤ 326) is per-turn overhead that only chaining removes. Memory is at 138, next to its gate.
+
+## Note: the Machine block key names the block's extent (2026-11-28, xj-to9.80)
+
+`MachineBlockKey` (§2) gains the block's guest length and instruction count. A unit's
+sources are its own bytes, so the non-ordinary instruction that ended its block is not among
+them: when the guest patched that instruction in place into an ordinary one, a later lift at
+the same start ran further but was handed the short unit, which fell through at its old end
+while the long block's count was charged (an embedder saw retired counts drift ahead of
+execution). With the extent in the key a lift of a different extent never enters another
+extent's unit; chain descriptors already pair each entry with its own IR.

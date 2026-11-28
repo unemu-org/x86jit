@@ -173,3 +173,4 @@ x86jit-tests::legacy machine_sparse::every_lowered_family_runs_compiled_on_spars
 x86jit-tests::legacy machine_sparse::hole_accesses_on_sparse_backing_equal_the_interpreter
 x86jit-tests::legacy machine_determinism::an_operating_system_with_the_delivery_log_equals_the_interpreter
 x86jit-tests::legacy machine_determinism::routine_shapes_equal_the_interpreter
+x86jit-tests::legacy machine_determinism::routine_shapes_with_devices_equal_the_interpreter

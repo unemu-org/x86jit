@@ -296,6 +296,57 @@ fn routine(a: &mut CodeAssembler, twin: bool) {
     a.ret().unwrap();
 }
 
+/// The compared variable of [`compare_first`] and [`compare_second`]: in
+/// RAM, or with [`DEVICES`] a register of the device page.
+fn compared() -> u64 {
+    if DEVICES.with(std::cell::Cell::get) {
+        HIGH + MMIO + 0x10
+    } else {
+        HIGH + 0x9710
+    }
+}
+
+/// `push edx; push ecx; mov edx,[m]; add edx,ebx; add [edx+8],ecx;
+/// cmp ebx,[v]; jne; mov ecx,[edx+8]; cmp ecx,[edx+8]; jne; call [m'];
+/// pop ecx; pop edx; ret`.
+fn compare_first(a: &mut CodeAssembler) {
+    let mut out = a.create_label();
+    a.push(edx).unwrap();
+    a.push(ecx).unwrap();
+    a.mov(edx, dword_ptr(DATA + 0x70)).unwrap();
+    a.add(edx, ebx).unwrap();
+    a.add(dword_ptr(edx + 8), ecx).unwrap();
+    a.cmp(ebx, dword_ptr(compared())).unwrap();
+    a.jne(out).unwrap();
+    a.mov(ecx, dword_ptr(edx + 8)).unwrap();
+    a.cmp(ecx, dword_ptr(edx + 8)).unwrap();
+    a.jne(out).unwrap();
+    a.call(dword_ptr(DATA + 0x68)).unwrap();
+    a.set_label(&mut out).unwrap();
+    a.pop(ecx).unwrap();
+    a.pop(edx).unwrap();
+    a.ret().unwrap();
+}
+
+/// `movzx edx,byte [eax+d32]; mov edx,[edx*4+d32]; cmp ebx,[v]; jne; ...`.
+fn compare_second(a: &mut CodeAssembler) {
+    let mut out = a.create_label();
+    a.push(eax).unwrap();
+    a.push(edx).unwrap();
+    a.and(eax, 0x3f).unwrap();
+    a.movzx(edx, byte_ptr(eax + (DATA + 0x400) as i32)).unwrap();
+    a.and(edx, 0x3f).unwrap();
+    a.mov(edx, dword_ptr(edx * 4 + (DATA + 0x500) as i32))
+        .unwrap();
+    a.cmp(ebx, dword_ptr(compared())).unwrap();
+    a.jne(out).unwrap();
+    a.inc(dword_ptr(DATA + 0x74)).unwrap();
+    a.set_label(&mut out).unwrap();
+    a.pop(edx).unwrap();
+    a.pop(eax).unwrap();
+    a.ret().unwrap();
+}
+
 /// The routines' caller, and short blocks that switch stacks with XCHG ESP:
 /// a compare and branch, a STI window, an indirect jump.
 fn shapes_loop(a: &mut CodeAssembler) {
@@ -309,6 +360,16 @@ fn shapes_loop(a: &mut CodeAssembler) {
     a.xor(dword_ptr(DATA + 0x200), 0x28).unwrap();
     a.call(HIGH + ROUTINE).unwrap();
     a.call(HIGH + ROUTINE + 0x100).unwrap();
+    a.and(ebx, 0xff0).unwrap();
+    // The compared variable's translation leaves the TLB every other pass,
+    // so the compiled load misses the view (decision-32 §3).
+    let mut kept = a.create_label();
+    a.test(byte_ptr(DATA), 1).unwrap();
+    a.je(kept).unwrap();
+    a.invlpg(byte_ptr(compared())).unwrap();
+    a.set_label(&mut kept).unwrap();
+    a.call(HIGH + ROUTINE + 0x300).unwrap();
+    a.call(HIGH + ROUTINE + 0x400).unwrap();
     a.mov(eax, dword_ptr(DATA)).unwrap();
     a.and(eax, 7).unwrap();
     a.xchg(dword_ptr(DATA + 0x30), esp).unwrap();
@@ -556,6 +617,26 @@ fn build(subject: Subject) -> (Vm, Vcpu) {
                 a.jmp(HIGH + KERNEL + 1).unwrap();
             }),
         );
+        put(
+            ROUTINE + 0x300,
+            &asm32(HIGH + ROUTINE + 0x300, compare_first),
+        );
+        put(
+            ROUTINE + 0x400,
+            &asm32(HIGH + ROUTINE + 0x400, compare_second),
+        );
+        put(
+            ROUTINE + 0x500,
+            &asm32(HIGH + ROUTINE + 0x500, |a| {
+                a.inc(dword_ptr(DATA + 0x64)).unwrap();
+                a.ret().unwrap();
+            }),
+        );
+        put(
+            DATA + 0x68,
+            &(HIGH as u32 + ROUTINE as u32 + 0x500).to_le_bytes(),
+        );
+        put(DATA + 0x70, &(HIGH as u32 + 0x7000).to_le_bytes());
         // The routines' data: flag words, a structure, an IDT image, an
         // alternate stack (`shapes_loop`).
         put(DATA + 0x40, &(DATA as u32 + 0x200).to_le_bytes());
@@ -718,6 +799,14 @@ impl DeviceIo for Device {
         self.transcript.push(r.clone());
         let n = self.transcript.len() as u64;
         let value = match (r.space, r.address) {
+            (DeviceSpace::Mmio, a) if a == MMIO + 0x10 => {
+                if n.is_multiple_of(5) {
+                    context.request_host_stop();
+                } else if n.is_multiple_of(3) {
+                    let _ = context.set_deadline(DeviceDeadline::Steps(r.position.steps + 9));
+                }
+                r.position.retired_instructions & 0xff
+            }
             (DeviceSpace::Mmio, a) if a == MMIO + 4 => {
                 if n.is_multiple_of(11) {
                     context.request_host_stop();
@@ -1101,7 +1190,8 @@ fn an_operating_system_with_the_delivery_log_equals_the_interpreter() {
 }
 
 fn run_shapes(subject: Subject, budgets: &mut dyn FnMut(usize) -> u64, total: u64, what: &str) {
-    let c = run(subject, budgets, total, 3001, what);
+    // No interrupts: the captured slices took none.
+    let c = run(subject, budgets, total, u64::MAX / 2, what);
     if subject == Subject::Mode(MachineJitMode::Forced) {
         assert!(
             c.compiled_retired > 0 && c.paged_entries > 0,
@@ -1127,4 +1217,97 @@ fn routine_shapes_equal_the_interpreter() {
     }
     DELIVERY_LOG.with(|d| d.set(false));
     SHAPES.with(|d| d.set(false));
+}
+
+/// The same shapes with the compared variable in a device page served in
+/// process (decision-28; decision-32 Q9: paged compiled accesses reach it
+/// through `in_block_access`), the device's stops and deadlines included.
+#[test]
+fn routine_shapes_with_devices_equal_the_interpreter() {
+    SHAPES.with(|d| d.set(true));
+    DEVICES.with(|d| d.set(true));
+    const MIX: [u64; 7] = [10_000, 997, 65_536, 97, 7, 4093, 1];
+    for log in [false, true] {
+        DELIVERY_LOG.with(|d| d.set(log));
+        for subject in SUBJECTS {
+            let what = format!("{subject:?} shapes devices log={log}");
+            run_shapes(subject, &mut |i| MIX[i % MIX.len()], 200_000, &what);
+        }
+    }
+    DELIVERY_LOG.with(|d| d.set(false));
+    DEVICES.with(|d| d.set(false));
+    SHAPES.with(|d| d.set(false));
+}
+
+/// xj-to9.80: a compiled unit is the block of one lift. A block ends before
+/// a non-ordinary instruction (here CLI); when the guest patches that
+/// instruction into an ordinary one (here INC ESI) — a protected-mode
+/// operating system's dynamic link patches its service traps in place — the
+/// unit's own bytes are unchanged and it stays valid, but the next lift at
+/// the same address is longer. Entering the shorter unit for the longer
+/// block would charge instructions it never ran.
+#[test]
+fn a_block_that_grows_past_a_patched_instruction_gets_its_own_unit() {
+    use super::machine_j1_lockstep::{asm, machine, same, Setup};
+    let mut patch = 0;
+    let code = asm(|a| {
+        let mut top = a.create_label();
+        let mut at = a.create_label();
+        a.mov(ebp, 400u32).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.add(eax, 1).unwrap();
+        a.add(ebx, eax).unwrap();
+        a.xor(ecx, ebx).unwrap();
+        a.add(edx, ecx).unwrap();
+        a.set_label(&mut at).unwrap();
+        a.cli().unwrap();
+        a.inc(edi).unwrap();
+        a.dec(ebp).unwrap();
+        a.jne(top).unwrap();
+        a.hlt().unwrap();
+        let _ = &mut at;
+    });
+    // The CLI: the only FAh byte of the program.
+    patch += 0x1000 + code.iter().position(|&b| b == 0xfa).unwrap() as u64;
+    let setup = Setup {
+        paged: true,
+        ..Setup::default()
+    };
+    {
+        let paged = setup.paged;
+        for subject in [
+            Subject::Mode(MachineJitMode::Forced),
+            Subject::Mode(MachineJitMode::Delayed(1)),
+            Subject::Background(1),
+        ] {
+            let what = format!("{subject:?} paged={paged}");
+            let model = CpuModel::I80486Dx;
+            let (bvm, mut b) = machine(
+                JitBackend::new(),
+                model,
+                &code,
+                Subject::Mode(MachineJitMode::Off),
+                setup,
+                5,
+            );
+            let (avm, mut a) = machine(JitBackend::new(), model, &code, subject, setup, 5);
+            for call in 0..400 {
+                let at = format!("{what} call {call}");
+                if call == 8 {
+                    // INC ESI over the CLI, then every proof lifts again.
+                    for (vm, cpu) in [(&avm, &mut a), (&bvm, &mut b)] {
+                        vm.write_bytes(patch, &[0x46]).unwrap();
+                        cpu.invalidate_paging();
+                    }
+                }
+                let ar = a.run_steps(&avm, 64, StepOptions::default()).unwrap();
+                let br = b.run_steps(&bvm, 64, StepOptions::default()).unwrap();
+                assert_eq!(format!("{ar:?}"), format!("{br:?}"), "{at}");
+                same(&a, &b, &at);
+                if matches!(br.stop(), StepStop::Exit(Exit::Hlt)) {
+                    break;
+                }
+            }
+        }
+    }
 }

@@ -76,6 +76,12 @@ pub(crate) struct MachineBlockKey {
     /// Regime, CS.D, SS.B, address bits, segment class, CPL, PG, A20, CR0.AM.
     pub(crate) flags: u32,
     pub(crate) mxcsr_mode: u32,
+    /// The block's extent: its byte length and instruction count. A unit's
+    /// sources are its own bytes, so a patch of the instruction that ended
+    /// its block leaves it valid while the next lift at the same address
+    /// runs further (xj-to9.80); the extent keeps that lift from entering it.
+    pub(crate) guest_len: u32,
+    pub(crate) icount: u32,
 }
 
 /// A compiled entry address and its allocation generation.

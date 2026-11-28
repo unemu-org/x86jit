@@ -873,7 +873,9 @@ fn paged_entry(paging: Option<&super::paging::State>, ir: &Arc<IrBlock>) -> bool
 }
 
 /// The compiled identity of a Flat32 block (decision-27 §1, decision-30 §2):
-/// everything its lift and lowering read besides its bytes.
+/// everything its lift and lowering read besides its bytes, and the extent
+/// of those bytes. The instruction that ended a block is not among its
+/// sources, so a later lift at the same address may run further.
 fn machine_key(
     ir: &IrBlock,
     physical: u64,
@@ -887,6 +889,8 @@ fn machine_key(
         model_semantics_id,
         flags: key_flags(context, cpu),
         mxcsr_mode: cpu.mxcsr & crate::jit_abi::fp::MODE_MASK,
+        guest_len: ir.guest_len,
+        icount: ir.icount,
     }
 }
 
