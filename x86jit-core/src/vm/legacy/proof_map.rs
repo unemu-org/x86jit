@@ -154,10 +154,35 @@ impl<K: Copy + Eq + Hash, V> ProofMap<K, V> {
     }
 
     /// Drop every proof whose key `drop` names, recording why.
-    pub(super) fn remove_where(&mut self, drop: impl Fn(&K) -> bool, why: Why) {
+    pub(super) fn remove_where(&mut self, drop: impl Fn(&K) -> bool, _why: Why) {
         let keys: Vec<K> = self.proofs.keys().filter(|k| drop(k)).copied().collect();
-        for key in keys {
-            self.remove_because(&key, why, None);
+        if keys.is_empty() {
+            return;
+        }
+        // As `remove_because` of each key, with one pass over each source
+        // page: a page's list holds only keys of held proofs, so `drop`
+        // names exactly the dropped ones there, and `retain` keeps the
+        // survivors in their order.
+        let mut pages = Vec::new();
+        for key in &keys {
+            self.version = self.version.wrapping_add(1);
+            let Some((_, sources, _, weight)) = self.proofs.remove(key) else {
+                continue;
+            };
+            self.weight -= weight;
+            pages.extend(source_pages(&sources));
+            #[cfg(feature = "test-hooks")]
+            self.index.remember(*key, _why, None, sources);
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        for page in pages {
+            if let Some(list) = self.index.pages.get_mut(&page) {
+                list.retain(|k| !drop(k));
+                if list.is_empty() {
+                    self.index.pages.remove(&page);
+                }
+            }
         }
     }
 

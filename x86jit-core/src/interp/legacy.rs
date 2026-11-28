@@ -1741,8 +1741,67 @@ fn push_addresses<const ROUTED: bool, const ORDER: u8>(
     context: MachineContext,
     count: usize,
     size: u8,
-) -> Result<Vec<u64>, Exit> {
+) -> Result<Slots, Exit> {
     push_slots(cpu, mem, context, count, size, true)
+}
+
+/// `push_addresses` for its checks alone, out of line, so that a caller's
+/// frame does not hold the addresses (`execute_op`).
+#[inline(never)]
+fn push_room<const ROUTED: bool, const ORDER: u8>(
+    cpu: &mut CpuState,
+    mem: &impl LegacyMemory<ROUTED, ORDER>,
+    context: MachineContext,
+    count: usize,
+    size: u8,
+) -> Result<(), Exit> {
+    push_addresses(cpu, mem, context, count, size).map(drop)
+}
+
+/// The slot addresses or values of a push frame: in place up to
+/// `Slots::INLINE`, the largest interrupt frame (a V86 exit's nine slots and
+/// an error code), on the heap above it (an ENTER display, a call gate's
+/// parameters).
+enum Slots {
+    Inline(u8, [u64; Slots::INLINE]),
+    Heap(Vec<u64>),
+}
+
+impl Slots {
+    const INLINE: usize = 10;
+
+    fn with_capacity(count: usize) -> Self {
+        if count <= Self::INLINE {
+            Self::Inline(0, [0; Self::INLINE])
+        } else {
+            Self::Heap(Vec::with_capacity(count))
+        }
+    }
+
+    fn push(&mut self, slot: u64) {
+        match self {
+            Self::Inline(len, items) if usize::from(*len) < Self::INLINE => {
+                items[usize::from(*len)] = slot;
+                *len += 1;
+            }
+            Self::Inline(len, items) => {
+                let mut heap = items[..usize::from(*len)].to_vec();
+                heap.push(slot);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(items) => items.push(slot),
+        }
+    }
+}
+
+impl std::ops::Deref for Slots {
+    type Target = [u64];
+    fn deref(&self) -> &[u64] {
+        match self {
+            Self::Inline(len, items) => &items[..usize::from(*len)],
+            Self::Heap(items) => items,
+        }
+    }
 }
 
 /// `whole_frame` checks the frame as one span before its slots; without it,
@@ -1754,14 +1813,14 @@ fn push_slots<const ROUTED: bool, const ORDER: u8>(
     count: usize,
     size: u8,
     whole_frame: bool,
-) -> Result<Vec<u64>, Exit> {
+) -> Result<Slots, Exit> {
     let old = sp(cpu, context);
     if whole_frame {
         let bytes = count as u8 * size;
         let start = old.wrapping_sub(u64::from(bytes)) & mask(context.stack_address_bits / 8);
         segment_access(cpu, context, SegmentId::Ss, start, bytes, AccessKind::Write)?;
     }
-    let mut addresses = Vec::with_capacity(count);
+    let mut addresses = Slots::with_capacity(count);
     for i in 1..=count {
         let offset =
             old.wrapping_sub(i as u64 * u64::from(size)) & mask(context.stack_address_bits / 8);
@@ -1854,6 +1913,9 @@ fn pop_frame_limit<const ROUTED: bool, const ORDER: u8>(
     Ok(())
 }
 
+// Out of line: its slot addresses would grow the frame of `execute_op`,
+// whose PUSH arm calls it, for every op.
+#[inline(never)]
 fn push_values<const ROUTED: bool, const ORDER: u8>(
     cpu: &mut CpuState,
     mem: &impl LegacyMemory<ROUTED, ORDER>,
@@ -2055,15 +2117,14 @@ fn deliver_protected<const ROUTED: bool, const ORDER: u8, const V86: bool>(
     if context.generation == crate::CpuGeneration::I386 && event.fault {
         flags |= 1 << 16;
     }
-    let mut frame = vec![
+    let frame = [
         u64::from(flags),
         u64::from(cpu.cs),
         u64::from(event.saved_ip),
+        event.error_code.map_or(0, u64::from),
     ];
-    if let Some(code) = event.error_code {
-        frame.push(u64::from(code));
-    }
-    push(cpu, mem, context, &frame, size)?;
+    let slots = 3 + usize::from(event.error_code.is_some());
+    push(cpu, mem, context, &frame[..slots], size)?;
     if kind & 1 == 0 {
         cpu.flags.if_ = false;
     }
@@ -2375,6 +2436,15 @@ fn atomic_device_exit<const ROUTED: bool, const ORDER: u8>(
     Exit::unknown_instruction(cpu.rip, bytes, ir.guest_len as u8)
 }
 
+/// The ops a checked Machine context executes; any other refuses the block
+/// before its first effect.
+///
+/// No op admitted here may write the vector register file (`xmm`, `ymm_hi`,
+/// `zmm_hi`, `kmask`): the paged transaction lane's rollback images leave
+/// those fields out (`paging::instruction_images!`), and only debug builds
+/// check it at run time. Admitting a vector op means adding its fields to
+/// those images; `paging::tests::supported_admits_no_vector_op` fails until
+/// then.
 pub(crate) fn supported(op: &IrOp) -> bool {
     matches!(
         op,
@@ -4333,6 +4403,148 @@ fn loop_ip(
     Ok(ip)
 }
 
+/// ENTER (SDM Vol 2A §3.3 ENTER pp. 3-295–297), out of `execute_op`, whose
+/// frame its display buffers would otherwise grow for every op.
+#[inline(never)]
+fn enter<const ROUTED: bool, const ORDER: u8, const PAGED: bool>(
+    cpu: &mut CpuState,
+    mem: &LegacyAccess<'_, ROUTED, ORDER, PAGED>,
+    context: MachineContext,
+    size: u8,
+    alloc: u16,
+    level: u8,
+) -> Result<(), Exit>
+where
+    PagingMode<PAGED>: PagingStorage,
+{
+    if !PAGED {
+        prepare_enter_displays(cpu, context, mem.physical_mask, size, alloc, level);
+    }
+    // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3: operand size
+    // selects frame values independently of stack address size.
+    let stack_mask = mask(context.stack_address_bits / 8);
+    let frame_sp = sp(cpu, context).wrapping_sub(u64::from(size)) & stack_mask;
+    let frame = if size == 4 && context.stack_address_bits == 16 {
+        (cpu.gpr[RSP] & 0xffff_0000) | frame_sp
+    } else {
+        frame_sp & mask(size)
+    };
+    let pushes = if level == 0 {
+        1
+    } else {
+        usize::from(level) + 1
+    };
+    let final_sp = sp(cpu, context)
+        .wrapping_sub(pushes as u64 * u64::from(size))
+        .wrapping_sub(u64::from(alloc))
+        & stack_mask;
+    let final_address = segment_access(cpu, context, SegmentId::Ss, final_sp, 1, AccessKind::Write)
+        .map_err(|_| exception(cpu, 12))?;
+    let addresses = push_addresses(cpu, mem, context, pushes, size)?;
+    let mut values = Slots::with_capacity(pushes);
+    values.push(cpu.gpr[RBP] & mask(size));
+    let mut overlay = Vec::new();
+    for i in 1..level {
+        // Display reads see earlier frame pushes, even if
+        // BP aliases SP or the A20 gate aliases their backing.
+        // Stage those bytes until every faultable read succeeds.
+        let value = values[usize::from(i - 1)];
+        let pushed = addresses[usize::from(i - 1)];
+        for byte in 0..size {
+            let linear = u64::from((pushed as u32).wrapping_add(u32::from(byte)));
+            let physical = if PAGED {
+                paging::byte_bus(cpu, mem, linear, AccessKind::Write)?
+            } else {
+                legacy::physical_span(cpu, mem.physical_mask, linear, 1).0
+            };
+            overlay.push((physical, (value >> (byte * 8)) as u8));
+        }
+        let offset = cpu.gpr[RBP].wrapping_sub(u64::from(i) * u64::from(size)) & stack_mask;
+        let address = segment_access(cpu, context, SegmentId::Ss, offset, size, AccessKind::Read)?;
+        let physical = if PAGED {
+            (0..size)
+                .map(|byte| {
+                    let linear = u64::from((address as u32).wrapping_add(u32::from(byte)));
+                    paging::byte_bus(cpu, mem, linear, AccessKind::Read)
+                })
+                .collect::<Result<Vec<_>, Exit>>()?
+        } else {
+            (0..size)
+                .map(|byte| {
+                    legacy::physical_span(
+                        cpu,
+                        mem.physical_mask,
+                        u64::from((address as u32).wrapping_add(u32::from(byte))),
+                        1,
+                    )
+                    .0
+                })
+                .collect::<Vec<_>>()
+        };
+        let cached = if PAGED { None } else { enter_display(cpu, i) };
+        let first = mem.read_index.get();
+        let partial = physical
+            .iter()
+            .any(|at| overlay.iter().any(|(p, _)| p == at));
+        let value = if partial {
+            let mut value = 0;
+            for (byte, at) in physical.into_iter().enumerate() {
+                let part = if let Some((_, value)) = overlay.iter().rev().find(|(p, _)| *p == at) {
+                    u64::from(*value)
+                } else if cached.is_some() {
+                    mem.skip_read(
+                        cpu,
+                        u64::from((address as u32).wrapping_add(byte as u32)),
+                        1,
+                    )?;
+                    0
+                } else {
+                    read(
+                        cpu,
+                        mem,
+                        u64::from((address as u32).wrapping_add(byte as u32)),
+                        1,
+                    )?
+                };
+                value |= part << (byte * 8);
+            }
+            value
+        } else if cached.is_some() {
+            mem.skip_read(cpu, address, size)?;
+            0
+        } else {
+            read(cpu, mem, address, size)?
+        };
+        let value = cached.unwrap_or(value);
+        if !PAGED && cached.is_none() {
+            record_enter_display(
+                cpu,
+                mem.physical_mask,
+                first..mem.read_index.get(),
+                i,
+                address,
+                size,
+                partial,
+                value,
+            );
+        }
+        values.push(value);
+    }
+    if level != 0 {
+        values.push(frame);
+    }
+    if PAGED {
+        // SDM Vol 2A §3.3 ENTER pp. 3-295–297: display
+        // reads and frame pushes precede the allocation check.
+        paging::check_write_permission(cpu, mem, final_address)?;
+    }
+    push(cpu, mem, context, &values, size)?;
+    cpu.write_gpr(RBP, frame, size);
+    adjust(cpu, context, 0u32.wrapping_sub(u32::from(alloc)));
+    cpu.clear_mmio_parts();
+    Ok(())
+}
+
 // The shared opcode iterator delegates only the Machine-specific accesses and
 // system helpers here; scalar arithmetic has one interpretation (spec.md §8.1).
 #[allow(clippy::too_many_arguments)]
@@ -4931,149 +5143,7 @@ where
                     }
                 }
                 L::Enter { size, alloc, level } => {
-                    if !PAGED {
-                        prepare_enter_displays(
-                            cpu,
-                            context,
-                            mem.physical_mask,
-                            *size,
-                            *alloc,
-                            *level,
-                        );
-                    }
-                    // SDM Vol 2A §3.3 ENTER; Vol 1 §6.2.3: operand size
-                    // selects frame values independently of stack address size.
-                    let stack_mask = mask(context.stack_address_bits / 8);
-                    let frame_sp = sp(cpu, context).wrapping_sub(u64::from(*size)) & stack_mask;
-                    let frame = if *size == 4 && context.stack_address_bits == 16 {
-                        (cpu.gpr[RSP] & 0xffff_0000) | frame_sp
-                    } else {
-                        frame_sp & mask(*size)
-                    };
-                    let pushes = if *level == 0 {
-                        1
-                    } else {
-                        usize::from(*level) + 1
-                    };
-                    let final_sp = sp(cpu, context)
-                        .wrapping_sub(pushes as u64 * u64::from(*size))
-                        .wrapping_sub(u64::from(*alloc))
-                        & stack_mask;
-                    let final_address =
-                        segment_access(cpu, context, SegmentId::Ss, final_sp, 1, AccessKind::Write)
-                            .map_err(|_| exception(cpu, 12))?;
-                    let addresses = push_addresses(cpu, mem, context, pushes, *size)?;
-                    let mut values = vec![cpu.gpr[RBP] & mask(*size)];
-                    let mut overlay = Vec::new();
-                    for i in 1..*level {
-                        // Display reads see earlier frame pushes, even if
-                        // BP aliases SP or the A20 gate aliases their backing.
-                        // Stage those bytes until every faultable read succeeds.
-                        let value = values[usize::from(i - 1)];
-                        let pushed = addresses[usize::from(i - 1)];
-                        for byte in 0..*size {
-                            let linear = u64::from((pushed as u32).wrapping_add(u32::from(byte)));
-                            let physical = if PAGED {
-                                paging::byte_bus(cpu, mem, linear, AccessKind::Write)?
-                            } else {
-                                legacy::physical_span(cpu, mem.physical_mask, linear, 1).0
-                            };
-                            overlay.push((physical, (value >> (byte * 8)) as u8));
-                        }
-                        let offset =
-                            cpu.gpr[RBP].wrapping_sub(u64::from(i) * u64::from(*size)) & stack_mask;
-                        let address = segment_access(
-                            cpu,
-                            context,
-                            SegmentId::Ss,
-                            offset,
-                            *size,
-                            AccessKind::Read,
-                        )?;
-                        let physical = if PAGED {
-                            (0..*size)
-                                .map(|byte| {
-                                    let linear =
-                                        u64::from((address as u32).wrapping_add(u32::from(byte)));
-                                    paging::byte_bus(cpu, mem, linear, AccessKind::Read)
-                                })
-                                .collect::<Result<Vec<_>, Exit>>()?
-                        } else {
-                            (0..*size)
-                                .map(|byte| {
-                                    legacy::physical_span(
-                                        cpu,
-                                        mem.physical_mask,
-                                        u64::from((address as u32).wrapping_add(u32::from(byte))),
-                                        1,
-                                    )
-                                    .0
-                                })
-                                .collect::<Vec<_>>()
-                        };
-                        let cached = if PAGED { None } else { enter_display(cpu, i) };
-                        let first = mem.read_index.get();
-                        let partial = physical
-                            .iter()
-                            .any(|at| overlay.iter().any(|(p, _)| p == at));
-                        let value = if partial {
-                            let mut value = 0;
-                            for (byte, at) in physical.into_iter().enumerate() {
-                                let part = if let Some((_, value)) =
-                                    overlay.iter().rev().find(|(p, _)| *p == at)
-                                {
-                                    u64::from(*value)
-                                } else if cached.is_some() {
-                                    mem.skip_read(
-                                        cpu,
-                                        u64::from((address as u32).wrapping_add(byte as u32)),
-                                        1,
-                                    )?;
-                                    0
-                                } else {
-                                    read(
-                                        cpu,
-                                        mem,
-                                        u64::from((address as u32).wrapping_add(byte as u32)),
-                                        1,
-                                    )?
-                                };
-                                value |= part << (byte * 8);
-                            }
-                            value
-                        } else if cached.is_some() {
-                            mem.skip_read(cpu, address, *size)?;
-                            0
-                        } else {
-                            read(cpu, mem, address, *size)?
-                        };
-                        let value = cached.unwrap_or(value);
-                        if !PAGED && cached.is_none() {
-                            record_enter_display(
-                                cpu,
-                                mem.physical_mask,
-                                first..mem.read_index.get(),
-                                i,
-                                address,
-                                *size,
-                                partial,
-                                value,
-                            );
-                        }
-                        values.push(value);
-                    }
-                    if *level != 0 {
-                        values.push(frame);
-                    }
-                    if PAGED {
-                        // SDM Vol 2A §3.3 ENTER pp. 3-295–297: display
-                        // reads and frame pushes precede the allocation check.
-                        paging::check_write_permission(cpu, mem, final_address)?;
-                    }
-                    push(cpu, mem, context, &values, *size)?;
-                    cpu.write_gpr(RBP, frame, *size);
-                    adjust(cpu, context, 0u32.wrapping_sub(u32::from(*alloc)));
-                    cpu.clear_mmio_parts();
+                    enter::<ROUTED, ORDER, PAGED>(cpu, mem, context, *size, *alloc, *level)?
                 }
                 L::Table {
                     addr,
@@ -5578,7 +5648,7 @@ where
                     }
                     if let Some(d) = &descriptor {
                         if return_ip.is_some() {
-                            push_addresses(cpu, mem, context, 2, *size)?;
+                            push_room(cpu, mem, context, 2, *size)?;
                         }
                         code_limit(cpu, d.cache, ip)?;
                     } else if cs.is_some() {

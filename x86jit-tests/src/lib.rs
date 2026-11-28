@@ -34,6 +34,7 @@ pub mod native;
 pub mod oracle;
 // The paged TLB-churn loop shared by a relift witness and a measurement.
 pub mod paged_churn;
+pub mod paged_retry;
 // Guest snippets shared by the differential and JIT suites — one copy, so the two
 // legs cannot drift onto different programs.
 pub mod snippets;

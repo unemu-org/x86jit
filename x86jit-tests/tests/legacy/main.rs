@@ -37,6 +37,7 @@ mod legacy_nec_v20;
 mod legacy_nec_v20_bcd_overlap;
 mod legacy_nec_v20_extensions;
 mod legacy_one_pass;
+mod legacy_paged_rollback;
 mod legacy_paging;
 mod legacy_privilege;
 mod legacy_protected;

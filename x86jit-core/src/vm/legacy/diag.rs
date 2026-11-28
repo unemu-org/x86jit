@@ -388,17 +388,21 @@ pub(crate) fn note_context(note: ContextNote) {
 
 /// Move this thread's context notes into `diag`.
 pub(crate) fn drain_contexts(diag: &Diag) {
-    let notes = NOTES.with(|n| {
+    let mut notes = NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+    if !notes.is_empty() {
+        record_contexts(diag, notes.drain(..));
+    }
+    // Hand the emptied buffer back with its capacity, so that the notes of a
+    // warm dispatch allocate nothing.
+    NOTES.with(|n| {
         let mut n = n.borrow_mut();
         if n.is_empty() {
-            Vec::new()
-        } else {
-            std::mem::take(&mut *n)
+            *n = notes;
         }
     });
-    if notes.is_empty() {
-        return;
-    }
+}
+
+fn record_contexts(diag: &Diag, notes: impl Iterator<Item = ContextNote>) {
     let mut c = diag.contexts.lock().unwrap();
     for note in notes {
         match note {

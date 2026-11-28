@@ -1231,7 +1231,7 @@ fn translate_linear<const ROUTED: bool, const ORDER: u8>(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Fragment {
     linear: u32,
     bus: u64,
@@ -1239,6 +1239,83 @@ struct Fragment {
     shift: u8,
     translation: Translation,
     dirty_complete: bool,
+}
+
+/// The widest access `plan` translates, in bytes: reads and writes carry a
+/// `u64`.
+const MAX_ACCESS_BYTES: usize = 8;
+
+/// The bus spans of one planned access, in place. A span covers at least a
+/// byte, so an access has at most `MAX_ACCESS_BYTES` of them.
+#[derive(Clone, Copy)]
+struct Fragments {
+    len: u8,
+    items: [Fragment; MAX_ACCESS_BYTES],
+}
+
+impl Fragments {
+    const EMPTY: Fragment = Fragment {
+        linear: 0,
+        bus: 0,
+        bytes: 0,
+        shift: 0,
+        translation: Translation {
+            physical: 0,
+            bytes: 0,
+            pte_address: 0,
+            pte: 0,
+        },
+        dirty_complete: false,
+    };
+
+    fn new() -> Self {
+        Self {
+            len: 0,
+            items: [Self::EMPTY; MAX_ACCESS_BYTES],
+        }
+    }
+
+    fn push(&mut self, fragment: Fragment) {
+        self.items[usize::from(self.len)] = fragment;
+        self.len += 1;
+    }
+}
+
+impl std::ops::Deref for Fragments {
+    type Target = [Fragment];
+    fn deref(&self) -> &[Fragment] {
+        &self.items[..usize::from(self.len)]
+    }
+}
+
+impl std::ops::DerefMut for Fragments {
+    fn deref_mut(&mut self) -> &mut [Fragment] {
+        &mut self.items[..usize::from(self.len)]
+    }
+}
+
+impl IntoIterator for Fragments {
+    type Item = Fragment;
+    type IntoIter = std::iter::Take<std::array::IntoIter<Fragment, MAX_ACCESS_BYTES>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter().take(usize::from(self.len))
+    }
+}
+
+impl<'a> IntoIterator for &'a Fragments {
+    type Item = &'a Fragment;
+    type IntoIter = std::slice::Iter<'a, Fragment>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Fragments {
+    type Item = &'a mut Fragment;
+    type IntoIter = std::slice::IterMut<'a, Fragment>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
 }
 
 fn complete_dirty<const ROUTED: bool, const ORDER: u8>(
@@ -1284,7 +1361,8 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
     size: u8,
     access: AccessKind,
     dirty: bool,
-) -> Result<Vec<Fragment>, Exit> {
+) -> Result<Fragments, Exit> {
+    debug_assert!(usize::from(size) <= MAX_ACCESS_BYTES);
     // SDM Vol 3A §5.6.1 p. 5-33; 80386 PRM §6.5 p. 6-22:
     // implicit table/TSS and inner-stack accesses are supervisor at any CPL.
     let privilege = if cpu.legacy.cpl == 3 && !mem.supervisor() {
@@ -1306,21 +1384,21 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
             .plans
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, fragments)| fragments.clone());
+            .map(|(_, fragments)| *fragments);
         if let Some(mut fragments) = cached {
             if !dirty || preparing(mem) {
                 return Ok(fragments);
             }
             if complete_dirty(cpu, mem, &mut fragments)? {
                 let mut tx = tx.borrow_mut();
-                tx.plans.iter_mut().find(|(k, _)| *k == key).unwrap().1 = fragments.clone();
+                tx.plans.iter_mut().find(|(k, _)| *k == key).unwrap().1 = fragments;
                 return Ok(fragments);
             }
             tx.borrow_mut().plans.retain(|(k, _)| *k != key);
         }
     }
     'restart: loop {
-        let mut fragments = Vec::new();
+        let mut fragments = Fragments::new();
         let mut consumed = 0;
         while consumed < size {
             let linear = (addr as u32).wrapping_add(u32::from(consumed));
@@ -1366,7 +1444,7 @@ fn plan<const ROUTED: bool, const ORDER: u8>(
             }
         }
         if let Some(tx) = mem.transaction() {
-            tx.borrow_mut().plans.push((key, fragments.clone()));
+            tx.borrow_mut().plans.push((key, fragments));
         }
         return Ok(fragments);
     }
@@ -1377,16 +1455,15 @@ fn commit_ram<const ROUTED: bool, const ORDER: u8>(
     mem: &impl LegacyMemory<ROUTED, ORDER>,
 ) -> Result<(), Exit> {
     let mut tx = mem.transaction().expect("paged transaction").borrow_mut();
-    let linears: Vec<_> = tx
-        .plans
-        .iter()
-        .flat_map(|(_, spans)| spans)
-        .map(|f| (f.bus, f.linear))
-        .collect();
-    for (bus, bytes, value, committed) in &mut tx.writes {
+    let Transaction { plans, writes, .. } = &mut *tx;
+    for (bus, bytes, value, committed) in writes {
         if !*committed {
             if let Err(trap) = mem.raw().write(*bus, *value, *bytes) {
-                let linear = linears.iter().find(|f| f.0 == *bus).map_or(0, |f| f.1);
+                let linear = plans
+                    .iter()
+                    .flat_map(|(_, spans)| spans)
+                    .find(|f| f.bus == *bus)
+                    .map_or(0, |f| f.linear);
                 let StepResult::Exit(exit) =
                     trap_out(cpu, cpu.rip, trap, *bus, *bytes, AccessKind::Write, *value)
                         .into_step()
@@ -1656,15 +1733,12 @@ pub(super) fn read_frame<const ROUTED: bool, const ORDER: u8>(
 
 // Only bus completion outputs cross from a preparation preview. Architectural
 // destinations remain in the original image until the complete return succeeds.
+// `cpu` holds the preview's ledger and the restored destinations; the write
+// acknowledgement is the one outside the frame answers.
 #[cold]
 #[inline(never)]
-fn retain_frame_answers(cpu: &mut CpuState, preview: &CpuState) {
-    cpu.pending_mmio = preview.pending_mmio;
-    cpu.mmio_parts = preview.mmio_parts;
-    cpu.mmio_parts_len = preview.mmio_parts_len;
-    cpu.mmio_parts_rip = preview.mmio_parts_rip;
-    cpu.mmio_retry_active = preview.mmio_retry_active;
-    cpu.mmio_retry_cs = preview.mmio_retry_cs;
+fn retain_frame_answers(cpu: &mut CpuState, before: &Ledger) {
+    cpu.pending_mmio_write = before.pending_mmio_write;
 }
 
 pub(super) fn write<const ROUTED: bool, const ORDER: u8>(
@@ -1948,7 +2022,7 @@ impl PortPlan {
 #[derive(Default)]
 pub(crate) struct Transaction {
     mapping_identity: Option<std::sync::Arc<()>>,
-    plans: Vec<(PlanKey, Vec<Fragment>)>,
+    plans: Vec<(PlanKey, Fragments)>,
     overlay: Vec<(u64, u8)>,
     preparing: bool,
     device_dummy: bool,
@@ -1963,7 +2037,50 @@ pub(crate) struct Transaction {
     pending_mmio_linear: Option<u32>,
 }
 
+std::thread_local! {
+    /// The buffers of the last transaction this thread completed
+    /// (`Transaction::recycle`), emptied, for the next one.
+    static SPARE_TRANSACTION: Cell<Option<Transaction>> = const { Cell::new(None) };
+}
+
 impl Transaction {
+    /// A new transaction over the mapping `mapping_identity`, still preparing:
+    /// the default, with the emptied buffers of the last one this thread
+    /// completed, so a steady stream of instructions allocates none.
+    fn begin(mapping_identity: std::sync::Arc<()>, device_dummy: bool) -> Self {
+        Self {
+            mapping_identity: Some(mapping_identity),
+            preparing: true,
+            device_dummy,
+            ..SPARE_TRANSACTION.take().unwrap_or_default()
+        }
+    }
+
+    /// Keep a completed transaction's buffers, emptied, for the next `begin`.
+    fn recycle(self) {
+        let Self {
+            mut plans,
+            mut overlay,
+            mut reads,
+            mut prepared_reads,
+            mut writes,
+            ..
+        } = self;
+        plans.clear();
+        overlay.clear();
+        reads.clear();
+        prepared_reads.clear();
+        writes.clear();
+        SPARE_TRANSACTION.set(Some(Self {
+            plans,
+            overlay,
+            reads,
+            prepared_reads,
+            writes,
+            ..Self::default()
+        }));
+    }
+
     pub(crate) fn matches_memory(&self, memory: &Memory) -> bool {
         same_arc(&self.mapping_identity, &Some(memory.mapping_identity()))
     }
@@ -2108,6 +2225,35 @@ fn finish_plan<const ROUTED: bool, const ORDER: u8>(
     Ok(!dirtied)
 }
 
+/// Temporaries kept on the stack (`with_preview_temps`, `with_zeroed_temps`);
+/// more go on the heap. A block numbers its temporaries per instruction and
+/// keeps the largest count.
+const INLINE_TEMPS: usize = 64;
+
+/// Run `f` on a copy of the walk's temporaries, which a preview must leave
+/// as they were.
+#[inline(always)]
+fn with_preview_temps<R>(temps: &[u64], f: impl FnOnce(&mut [u64]) -> R) -> R {
+    if temps.len() <= INLINE_TEMPS {
+        let mut copy = [0; INLINE_TEMPS];
+        let copy = &mut copy[..temps.len()];
+        copy.copy_from_slice(temps);
+        f(copy)
+    } else {
+        f(&mut temps.to_vec())
+    }
+}
+
+/// Run `f` on `count` zeroed temporaries.
+#[inline(always)]
+fn with_zeroed_temps<R>(count: usize, f: impl FnOnce(&mut [u64]) -> R) -> R {
+    if count <= INLINE_TEMPS {
+        f(&mut [0; INLINE_TEMPS][..count])
+    } else {
+        f(&mut vec![0; count])
+    }
+}
+
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -2168,37 +2314,37 @@ where
         }
         let retained = retry.take();
         let resuming = retained.is_some();
-        let tx = std::cell::RefCell::new(retained.unwrap_or_else(|| Transaction {
-            mapping_identity: Some(original.raw().mapping_identity()),
-            preparing: true,
-            device_dummy: ir.ops.iter().all(|op| match op {
-                IrOp::Legacy(op) => matches!(
-                    op,
-                    L::Checkpoint
-                        | L::I486Gate
-                        | L::Address { .. }
-                        | L::Flat32Address { .. }
-                        | L::SegmentedAddress { .. }
-                        | L::ReadSelector { .. }
-                        | L::LiveField { .. }
-                        | L::Push { .. }
-                        | L::Pop { .. }
-                        | L::AdjustStack { .. }
-                        | L::String { .. }
-                        | L::Enter { .. }
-                        | L::Leave { .. }
-                        | L::All { .. }
-                        | L::Flags { .. }
-                        | L::Table { .. }
-                        | L::Privileged { .. }
-                        | L::LoadMsw { .. }
-                        | L::Coprocessor { .. }
-                        | L::CoprocessorOverrun { .. }
-                ),
-                IrOp::Jump { .. } | IrOp::Branch { .. } => false,
-                _ => true,
-            }),
-            ..Transaction::default()
+        let tx = std::cell::RefCell::new(retained.unwrap_or_else(|| {
+            Transaction::begin(
+                original.raw().mapping_identity(),
+                ir.ops.iter().all(|op| match op {
+                    IrOp::Legacy(op) => matches!(
+                        op,
+                        L::Checkpoint
+                            | L::I486Gate
+                            | L::Address { .. }
+                            | L::Flat32Address { .. }
+                            | L::SegmentedAddress { .. }
+                            | L::ReadSelector { .. }
+                            | L::LiveField { .. }
+                            | L::Push { .. }
+                            | L::Pop { .. }
+                            | L::AdjustStack { .. }
+                            | L::String { .. }
+                            | L::Enter { .. }
+                            | L::Leave { .. }
+                            | L::All { .. }
+                            | L::Flags { .. }
+                            | L::Table { .. }
+                            | L::Privileged { .. }
+                            | L::LoadMsw { .. }
+                            | L::Coprocessor { .. }
+                            | L::CoprocessorOverrun { .. }
+                    ),
+                    IrOp::Jump { .. } | IrOp::Branch { .. } => false,
+                    _ => true,
+                }),
+            )
         }));
         {
             let mut tx = tx.borrow_mut();
@@ -2226,41 +2372,69 @@ where
                 tx.borrow_mut().prepared_reads.clear();
                 tx.borrow_mut().overlay.clear();
             }
-            let mut preview_cpu = cpu.clone();
+            // The preview runs on the instruction's own state and is rolled
+            // back from its images: only destinations and the ledger change
+            // (`Destinations`), so restoring both is the copy it ran on.
+            let destinations = Destinations::of(cpu);
+            let ledger = Ledger::of(cpu);
+            #[cfg(debug_assertions)]
+            let untouched = Untouched::of(cpu);
             let mut preview_tasks = task_switch.clone();
-            let mut preview_temps = temps.to_vec();
-            let preview = execute_instruction::<ROUTED, ORDER, true, V86>(
-                block,
-                ir,
-                &mut preview_cpu,
-                &mem,
-                &mut preview_temps,
-                context,
-                &mut preview_tasks,
-            );
+            let guard = PreviewGuard {
+                cpu: &mut *cpu,
+                destinations: &destinations,
+                ledger: &ledger,
+            };
+            let preview = with_preview_temps(temps, |preview_temps| {
+                execute_instruction::<ROUTED, ORDER, true, V86>(
+                    block,
+                    ir,
+                    guard.cpu,
+                    &mem,
+                    preview_temps,
+                    context,
+                    &mut preview_tasks,
+                )
+            });
+            std::mem::forget(guard);
+            #[cfg(debug_assertions)]
+            untouched.check(cpu);
+            destinations.restore(cpu);
             if let Err(exit) = preview {
                 if tx.borrow().frame_reads && matches!(exit, Exit::MmioRead { .. }) {
-                    retain_frame_answers(cpu, &preview_cpu);
+                    retain_frame_answers(cpu, &ledger);
                     tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
                     *retry = Some(tx.into_inner());
                     return Err(exit);
                 }
+                ledger.restore(cpu);
                 if !preview_tasks.committed {
                     publish_cr2(cpu, &exit);
+                    tx.into_inner().recycle();
                     return Err(exit);
                 }
                 // Hardware task switches have their own commit boundary. Replay the
                 // outgoing saves and incoming commit even when the new task faults
                 // (80386 PRM §7.5 pp. 7-8–9; design §3.7).
+            } else {
+                ledger.restore(cpu);
             }
-            if !finish_plan(cpu, &mem, &tx)? {
-                continue;
+            match finish_plan(cpu, &mem, &tx) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tx.into_inner().recycle();
+                    continue;
+                }
+                Err(exit) => {
+                    tx.into_inner().recycle();
+                    return Err(exit);
+                }
             }
             let mut tx = tx.borrow_mut();
             tx.preparing = false;
             tx.read_cursor = 0;
         }
-        let before_commit = cpu.clone();
+        let before_commit = Destinations::of(cpu);
         let result = execute_instruction::<ROUTED, ORDER, true, V86>(
             block,
             ir,
@@ -2279,6 +2453,8 @@ where
                 ) {
                     tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
                     *retry = Some(tx.into_inner());
+                } else {
+                    tx.into_inner().recycle();
                 }
                 return Err(exit);
             }
@@ -2291,7 +2467,7 @@ where
         }
         if let Err(exit) = commit_ram(cpu, &mem) {
             if !task_switch.committed {
-                restore_destinations(cpu, before_commit);
+                restore_destinations(cpu, &before_commit);
             }
             tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
             *retry = Some(tx.into_inner());
@@ -2309,7 +2485,7 @@ where
                 })
                 .expect("preflighted INS destination")
                 .1
-                .clone();
+                .to_vec();
             PortPlan {
                 inputs: Box::new(cpu.clone()),
                 mapping_identity: original.raw().mapping_identity(),
@@ -2318,6 +2494,7 @@ where
                 pending_mmio_linear: None,
             }
         });
+        tx.into_inner().recycle();
         return Ok((outcome, input));
     }
 }
@@ -2452,22 +2629,209 @@ pub(super) fn locked<const ROUTED: bool, const ORDER: u8>(
     Ok(old)
 }
 
+/// Declares [`Destinations`] and [`Ledger`] over named `CpuState` fields.
+/// The capture destructures `CpuState` without `..`, so a field appended to it
+/// does not compile until it is placed in one of the two images or in the
+/// excluded list below, with the reason it is excluded.
+macro_rules! instruction_images {
+    (
+        destinations { $($dest:ident: $dest_ty:ty),* $(,)? }
+        ledger { $($part:ident: $part_ty:ty),* $(,)? }
+    ) => {
+        /// Every `CpuState` field a Machine instruction can write, outside the
+        /// bus-handoff [`Ledger`]: what an instruction that ends early is
+        /// rolled back to. Fixed-size and allocation-free.
+        #[derive(Clone, Copy)]
+        pub(super) struct Destinations {
+            $($dest: $dest_ty,)*
+        }
+
+        /// The bus-handoff ledger (`CpuState::mmio_parts` and its completion
+        /// slots). A rollback of an instruction's destinations keeps it: an
+        /// already consumed device answer must not come back.
+        #[derive(Clone, Copy)]
+        pub(super) struct Ledger {
+            $($part: $part_ty,)*
+        }
+
+        impl Destinations {
+            #[inline(always)]
+            pub(super) fn of(cpu: &CpuState) -> Self {
+                let CpuState {
+                    $($dest,)*
+                    $($part: _,)*
+                    // The vector register file. Only vector IR ops (and the
+                    // FXRSTOR/XRSTOR helpers, IR ops of their own) write it;
+                    // none is a Machine op (`supported`). Paging needs PE
+                    // (`legacy::derive_legacy_context`), so a paged context is
+                    // checked, and `execute_instruction` refuses a block with
+                    // any other op before its first effect.
+                    xmm: _,
+                    ymm_hi: _,
+                    zmm_hi: _,
+                    kmask: _,
+                    // Embedder configuration that no instruction writes.
+                    cpuid_table: _,
+                    cpuid_overrides: _,
+                    cpu_source: _,
+                } = cpu;
+                Self {
+                    $($dest: *$dest,)*
+                }
+            }
+
+            #[inline(always)]
+            pub(super) fn restore(&self, cpu: &mut CpuState) {
+                $(cpu.$dest = self.$dest;)*
+            }
+        }
+
+        impl Ledger {
+            #[inline(always)]
+            pub(super) fn of(cpu: &CpuState) -> Self {
+                Self {
+                    $($part: cpu.$part,)*
+                }
+            }
+
+            #[inline(always)]
+            pub(super) fn restore(&self, cpu: &mut CpuState) {
+                $(cpu.$part = self.$part;)*
+            }
+        }
+    };
+}
+
+instruction_images! {
+    destinations {
+        gpr: [u64; 16],
+        rip: u64,
+        fs_base: u64,
+        gs_base: u64,
+        flags: crate::state::Flags,
+        fpr: [[u8; 10]; 8],
+        fpu_top: u32,
+        fpu_cw: u16,
+        fpu_pad: u16,
+        pending_port_in: Option<u8>,
+        features: crate::features::GuestCpuFeatures,
+        x87_precision: crate::state::X87Precision,
+        cs: u16,
+        ds: u16,
+        es: u16,
+        ss: u16,
+        fpu_empty: u8,
+        fpu_sw: u16,
+        fpu_fip: u64,
+        fpu_fdp: u64,
+        fpu_fop: u16,
+        fpu_fcs: u16,
+        fpu_fds: u16,
+        source_id: u64,
+        random_state: u64,
+        rflags_system: u64,
+        fs: u16,
+        gs: u16,
+        mxcsr: u32,
+        x87_pointer_model: crate::state::X87PointerModel,
+        port_string_in: Option<crate::state::PortStringIn>,
+        legacy: crate::legacy::LegacyCpuState,
+        fpu_model: crate::state::FpuModel,
+        fpu_emulation: bool,
+        task_io_map_base: u16,
+        task_debug_trap: u8,
+        debug_test_registers: [u32; 8],
+        machine_flags_mask: u32,
+        numeric_error_route: crate::state::NumericErrorRoute,
+        external_numeric_error: crate::state::ExternalNumericErrorState,
+    }
+    ledger {
+        pending_mmio: Option<u64>,
+        pending_mmio_write: bool,
+        mmio_parts: [(u64, u64); 64],
+        mmio_parts_len: u8,
+        mmio_parts_rip: u64,
+        mmio_retry_active: bool,
+        mmio_retry_cs: u16,
+    }
+}
+
+/// The fields [`Destinations`] leaves out, as they were: a Machine
+/// instruction must leave them unchanged (debug builds check it).
+#[cfg(debug_assertions)]
+pub(super) struct Untouched {
+    xmm: [u128; 32],
+    ymm_hi: [u128; 32],
+    zmm_hi: [[u128; 2]; 32],
+    kmask: [u64; 8],
+    cpuid_table: Option<*const crate::features::CpuidTable>,
+    cpuid_overrides: (usize, Option<u64>),
+    cpu_source: Option<*const ()>,
+}
+
+#[cfg(debug_assertions)]
+impl Untouched {
+    pub(super) fn of(cpu: &CpuState) -> Self {
+        Self {
+            xmm: cpu.xmm,
+            ymm_hi: cpu.ymm_hi,
+            zmm_hi: cpu.zmm_hi,
+            kmask: cpu.kmask,
+            cpuid_table: cpu.cpuid_table.as_ref().map(std::sync::Arc::as_ptr),
+            cpuid_overrides: (cpu.cpuid_overrides.leaves.len(), cpu.cpuid_overrides.xcr0),
+            cpu_source: cpu
+                .cpu_source
+                .as_ref()
+                .map(|s| std::sync::Arc::as_ptr(s).cast::<()>()),
+        }
+    }
+
+    pub(super) fn check(&self, cpu: &CpuState) {
+        let now = Self::of(cpu);
+        assert!(
+            self.xmm == now.xmm
+                && self.ymm_hi == now.ymm_hi
+                && self.zmm_hi == now.zmm_hi
+                && self.kmask == now.kmask
+                && self.cpuid_table == now.cpuid_table
+                && self.cpuid_overrides == now.cpuid_overrides
+                && self.cpu_source == now.cpu_source,
+            "a Machine instruction wrote state outside its rollback image"
+        );
+    }
+}
+
+/// A preview in progress on the instruction's own state: unwinding out of it
+/// rolls the state back from its images, so that a panic leaves the inputs
+/// as the copy the preview once ran on left them. A completed preview is
+/// `std::mem::forget`ed and rolls back itself; the guard costs nothing then.
+struct PreviewGuard<'a> {
+    cpu: &'a mut CpuState,
+    destinations: &'a Destinations,
+    ledger: &'a Ledger,
+}
+
+impl Drop for PreviewGuard<'_> {
+    #[cold]
+    fn drop(&mut self) {
+        self.destinations.restore(self.cpu);
+        self.ledger.restore(self.cpu);
+    }
+}
+
 // Architectural rollback must not resurrect an already consumed device answer.
 // The translated transaction and its transfer visits live outside CpuState.
-fn restore_destinations(cpu: &mut CpuState, mut before: CpuState) {
-    std::mem::swap(&mut before.pending_mmio, &mut cpu.pending_mmio);
-    std::mem::swap(&mut before.pending_mmio_write, &mut cpu.pending_mmio_write);
-    std::mem::swap(&mut before.mmio_parts, &mut cpu.mmio_parts);
-    std::mem::swap(&mut before.mmio_parts_len, &mut cpu.mmio_parts_len);
-    std::mem::swap(&mut before.mmio_parts_rip, &mut cpu.mmio_parts_rip);
-    std::mem::swap(&mut before.mmio_retry_active, &mut cpu.mmio_retry_active);
-    std::mem::swap(&mut before.mmio_retry_cs, &mut cpu.mmio_retry_cs);
-    *cpu = before;
+fn restore_destinations(cpu: &mut CpuState, before: &Destinations) {
+    before.restore(cpu);
 }
+
+// The largest x87 memory image: FRSTOR/FNSAVE's 108 bytes (SDM Vol 1
+// §8.1.10 Fig. 8-13; `x87::mem_operand_bytes`).
+const FP_IMAGE_BYTES: usize = 108;
 
 struct FpBuffer {
     base: u64,
-    bytes: std::cell::RefCell<Vec<u8>>,
+    bytes: std::cell::RefCell<[u8; FP_IMAGE_BYTES]>,
     stored: Cell<bool>,
 }
 impl crate::x87::FpMem for FpBuffer {
@@ -2497,7 +2861,7 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
     let writing = crate::x87::mem_write_bytes(kind).is_some();
     // Strong image restart is engine policy (design §3.4). SDM Vol 3A
     // §11.1.1 pp. 11-2–3 permits partial stores for some x87 instructions.
-    let mut data = vec![0; bytes];
+    let mut data = [0; FP_IMAGE_BYTES];
     for offset in (0..bytes).step_by(8) {
         let linear = u64::from((address as u32).wrapping_add(offset as u32));
         let size = (bytes - offset).min(8) as u8;
@@ -2519,14 +2883,14 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
         bytes: std::cell::RefCell::new(data),
         stored: Cell::new(false),
     };
-    let before = cpu.clone();
+    let before = Destinations::of(cpu);
     let fault = crate::x87::exec_x87(cpu, &fp, kind, address, sti);
     debug_assert!(fault.is_none());
     if fp.stored.get() {
         for offset in (0..bytes).step_by(8) {
             let linear = u64::from((address as u32).wrapping_add(offset as u32));
             if let Err(exit) = probe(cpu, mem, linear, (bytes - offset).min(8) as u8) {
-                restore_destinations(cpu, before);
+                restore_destinations(cpu, &before);
                 return Err(exit);
             }
         }
@@ -2537,7 +2901,7 @@ pub(super) fn x87<const ROUTED: bool, const ORDER: u8>(
             value[..size].copy_from_slice(&data[offset..offset + size]);
             let linear = u64::from((address as u32).wrapping_add(offset as u32));
             if let Err(exit) = write(cpu, mem, linear, size as u8, u64::from_le_bytes(value)) {
-                restore_destinations(cpu, before);
+                restore_destinations(cpu, &before);
                 return Err(exit);
             }
         }
@@ -2576,11 +2940,9 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
         }
         let retained = retry.take();
         let resuming = retained.is_some();
-        let tx = std::cell::RefCell::new(retained.unwrap_or_else(|| Transaction {
-            mapping_identity: Some(memory.mapping_identity()),
-            preparing: true,
-            ..Transaction::default()
-        }));
+        let tx = std::cell::RefCell::new(
+            retained.unwrap_or_else(|| Transaction::begin(memory.mapping_identity(), false)),
+        );
         {
             let mut tx = tx.borrow_mut();
             // Task continuations resume their saved phase; ordinary instructions
@@ -2601,27 +2963,51 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
         mem.paging.transaction = Some(&tx);
         mem.paging.tlb = Some(tlb);
         if !resuming {
-            let mut preview_cpu = cpu.clone();
+            // As `execute_with_retry`'s preview: in place, rolled back from
+            // its images.
+            let destinations = Destinations::of(cpu);
+            let ledger = Ledger::of(cpu);
+            #[cfg(debug_assertions)]
+            let untouched = Untouched::of(cpu);
             let mut preview_tasks = task_switch.clone();
-            let preview = if preview_tasks.context().is_some() {
-                tasks::resume(&mut preview_cpu, &mem.address_keyed(), &mut preview_tasks)
-            } else {
-                deliver(&mut preview_cpu, &mem, context, event, &mut preview_tasks)
+            let guard = PreviewGuard {
+                cpu: &mut *cpu,
+                destinations: &destinations,
+                ledger: &ledger,
             };
+            let preview = if preview_tasks.context().is_some() {
+                tasks::resume(guard.cpu, &mem.address_keyed(), &mut preview_tasks)
+            } else {
+                deliver(guard.cpu, &mem, context, event, &mut preview_tasks)
+            };
+            std::mem::forget(guard);
+            #[cfg(debug_assertions)]
+            untouched.check(cpu);
+            destinations.restore(cpu);
+            ledger.restore(cpu);
             if let Err(exit) = preview {
                 if !preview_tasks.committed {
                     publish_cr2(cpu, &exit);
+                    tx.into_inner().recycle();
                     return Err(exit);
                 }
             }
-            if !finish_plan(cpu, &mem, &tx)? {
-                continue;
+            match finish_plan(cpu, &mem, &tx) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tx.into_inner().recycle();
+                    continue;
+                }
+                Err(exit) => {
+                    tx.into_inner().recycle();
+                    return Err(exit);
+                }
             }
             let mut tx = tx.borrow_mut();
             tx.preparing = false;
             tx.read_cursor = 0;
         }
-        let before_commit = cpu.clone();
+        let before_commit = Destinations::of(cpu);
         let mut result = if task_switch.context().is_some() {
             tasks::resume(cpu, &mem.address_keyed(), task_switch)
         } else {
@@ -2634,7 +3020,7 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
             }
             if let Err(exit) = commit_ram(cpu, &mem) {
                 if !task_switch.committed {
-                    restore_destinations(cpu, before_commit);
+                    restore_destinations(cpu, &before_commit);
                 }
                 result = Err(exit);
             } else {
@@ -2649,8 +3035,10 @@ pub(crate) fn deliver_interrupt<const ROUTED: bool, const ORDER: u8>(
             ) {
                 tx.borrow_mut().inputs = Some(Box::new(cpu.clone()));
                 *retry = Some(tx.into_inner());
+                return result;
             }
         }
+        tx.into_inner().recycle();
         return result;
     }
 }
@@ -2904,7 +3292,6 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
     if let Some(result) = lane {
         return result.map(|outcome| (outcome, None));
     }
-    let mut scratch = vec![0; ir.temp_count as usize];
     let mut mem = LegacyAccess::<ROUTED, ORDER, true>::new(memory, u32::MAX);
     mem.paging.tlb = Some(tlb);
     let view = InstructionView {
@@ -2913,16 +3300,18 @@ pub(crate) fn execute_retained<const ROUTED: bool, const ORDER: u8, const V86: b
         ops: &ir.ops,
         proven: false,
     };
-    execute_with_retry::<ROUTED, ORDER, true, V86>(
-        ir,
-        &view,
-        cpu,
-        &mem,
-        &mut scratch,
-        context,
-        task_switch,
-        retry,
-    )
+    with_zeroed_temps(ir.temp_count as usize, |scratch| {
+        execute_with_retry::<ROUTED, ORDER, true, V86>(
+            ir,
+            &view,
+            cpu,
+            &mem,
+            scratch,
+            context,
+            task_switch,
+            retry,
+        )
+    })
 }
 
 /// Effect proof for the RAM-free lane (decision-27 interpreter checkpoint).
@@ -4135,6 +4524,206 @@ fn execute_ordinary_from<const ROUTED: bool, const ORDER: u8, const V86: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rollback from `Destinations` reverts an edit of every field but the
+    /// ledger and the excluded ones, and the ledger image reverts the ledger.
+    /// The capture names every `CpuState` field, so a new one must be placed.
+    #[test]
+    fn instruction_images_restore_every_field_an_instruction_writes() {
+        let base = CpuState::default();
+        macro_rules! restored {
+            ($($edit:expr),* $(,)?) => {$({
+                let mut changed = base.clone();
+                let edit: fn(&mut CpuState) = $edit;
+                edit(&mut changed);
+                assert_ne!(format!("{changed:?}"), format!("{base:?}"), "{}", stringify!($edit));
+                Destinations::of(&base).restore(&mut changed);
+                Ledger::of(&base).restore(&mut changed);
+                assert_eq!(format!("{changed:?}"), format!("{base:?}"), "{}", stringify!($edit));
+            })*};
+        }
+        restored!(
+            |c| c.gpr[15] = 1,
+            |c| c.rip = 1,
+            |c| c.fs_base = 1,
+            |c| c.gs_base = 1,
+            |c| c.flags.cf = !c.flags.cf,
+            |c| c.flags.set_pf(!c.flags.pf()),
+            |c| c.flags.set_af(!c.flags.af()),
+            |c| c.flags.if_ = !c.flags.if_,
+            |c| c.fpr[7][9] = 1,
+            |c| c.fpu_top ^= 1,
+            |c| c.fpu_cw ^= 1,
+            |c| c.fpu_pad ^= 1,
+            |c| c.pending_mmio = Some(1),
+            |c| c.pending_mmio_write = true,
+            |c| c.pending_port_in = Some(1),
+            |c| c.features = crate::features::GuestCpuFeatures::empty(),
+            |c| c.x87_precision = crate::state::X87Precision::Extended,
+            |c| c.cs ^= 1,
+            |c| c.ds ^= 1,
+            |c| c.es ^= 1,
+            |c| c.ss ^= 1,
+            |c| c.fpu_empty ^= 1,
+            |c| c.fpu_sw ^= 1,
+            |c| c.fpu_fip ^= 1,
+            |c| c.fpu_fdp ^= 1,
+            |c| c.fpu_fop ^= 1,
+            |c| c.fpu_fcs ^= 1,
+            |c| c.fpu_fds ^= 1,
+            |c| c.mmio_parts[63] = (1, 2),
+            |c| c.mmio_parts_len = 1,
+            |c| c.mmio_parts_rip = 1,
+            |c| c.mmio_retry_active = true,
+            |c| c.mmio_retry_cs = 1,
+            |c| c.source_id ^= 1,
+            |c| c.random_state ^= 1,
+            |c| c.rflags_system ^= 0x10000,
+            |c| c.fs ^= 1,
+            |c| c.gs ^= 1,
+            |c| c.mxcsr ^= 1,
+            |c| c.x87_pointer_model = crate::state::X87PointerModel::Amd,
+            |c| {
+                c.port_string_in = Some(crate::state::PortStringIn {
+                    rip: 1,
+                    next_ip: 2,
+                    instruction_end: 2,
+                    base: 0,
+                    offset: 0,
+                    next_index: 0,
+                    next_count: 0,
+                    addr_bits: 32,
+                    elem: 1,
+                    rep: false,
+                    value: None,
+                })
+            },
+            |c| c.legacy.cr2 ^= 1,
+            |c| c.legacy.segments[5].base ^= 1,
+            |c| c.legacy.tr.cache.limit ^= 1,
+            |c| c.fpu_model = crate::state::FpuModel::None,
+            |c| c.fpu_emulation = !c.fpu_emulation,
+            |c| c.task_io_map_base ^= 1,
+            |c| c.task_debug_trap ^= 1,
+            |c| c.debug_test_registers[7] ^= 1,
+            |c| c.machine_flags_mask ^= 1,
+            |c| c.numeric_error_route = crate::state::NumericErrorRoute::External,
+            |c| c.external_numeric_error.held = !c.external_numeric_error.held,
+        );
+        // The destinations alone keep the ledger: a consumed device answer
+        // stays consumed (`restore_destinations`).
+        let mut changed = base.clone();
+        changed.gpr[0] = 1;
+        changed.mmio_parts_len = 1;
+        changed.pending_mmio = Some(2);
+        Destinations::of(&base).restore(&mut changed);
+        assert_eq!(changed.gpr[0], 0);
+        assert_eq!((changed.mmio_parts_len, changed.pending_mmio), (1, Some(2)));
+    }
+
+    /// `supported` admits no op that writes the vector register file, which
+    /// `Destinations` leaves out. Every op of the scalar and x87 lifts below
+    /// writes none; each vector-writing instruction below lifts to at least
+    /// one op of another kind, and `supported` must refuse every such op.
+    #[test]
+    fn supported_admits_no_vector_op() {
+        use crate::lift::{lift_one, CpuMode, FetchAddr};
+        use crate::{Memory, MemoryModel, Prot, RegionKind};
+        const AT: u64 = 0x1000;
+        let lift = |bytes: &[u8]| {
+            let mut mem = Memory::new(MemoryModel::Flat { size: 0x4000 });
+            mem.map(0, 0x4000, Prot::RWX, RegionKind::Ram).unwrap();
+            mem.write_bytes(AT, bytes).unwrap();
+            lift_one(&mem, FetchAddr::flat(AT), CpuMode::Long64).map(|ir| ir.ops)
+        };
+        let scalar: &[&[u8]] = &[
+            &[0x01, 0xc8],             // add eax, ecx
+            &[0x01, 0x08],             // add [rax], ecx
+            &[0x13, 0x08],             // adc ecx, [rax]
+            &[0x2b, 0xc8],             // sub ecx, eax
+            &[0x1b, 0xc8],             // sbb ecx, eax
+            &[0x21, 0xc8],             // and eax, ecx
+            &[0x09, 0xc8],             // or eax, ecx
+            &[0x31, 0xc8],             // xor eax, ecx
+            &[0x8b, 0x08],             // mov ecx, [rax]
+            &[0x89, 0x08],             // mov [rax], ecx
+            &[0x0f, 0xb6, 0xc8],       // movzx ecx, al
+            &[0x0f, 0xbe, 0xc8],       // movsx ecx, al
+            &[0xd3, 0xe0],             // shl eax, cl
+            &[0xd3, 0xe8],             // shr eax, cl
+            &[0xd3, 0xf8],             // sar eax, cl
+            &[0xd3, 0xc0],             // rol eax, cl
+            &[0xd3, 0xc8],             // ror eax, cl
+            &[0xd3, 0xd0],             // rcl eax, cl
+            &[0xd3, 0xd8],             // rcr eax, cl
+            &[0x0f, 0xa5, 0xc8],       // shld eax, ecx, cl
+            &[0xf7, 0xe1],             // mul ecx
+            &[0xf7, 0xf1],             // div ecx
+            &[0x0f, 0xaf, 0xc1],       // imul eax, ecx
+            &[0x0f, 0xbc, 0xc1],       // bsf eax, ecx
+            &[0x0f, 0xa3, 0xc8],       // bt eax, ecx
+            &[0x0f, 0xab, 0x08],       // bts [rax], ecx
+            &[0x0f, 0x94, 0xc0],       // sete al
+            &[0x74, 0x00],             // je
+            &[0x50],                   // push rax
+            &[0x58],                   // pop rax
+            &[0xe8, 0, 0, 0, 0],       // call
+            &[0xc3],                   // ret
+            &[0xf3, 0xa4],             // rep movsb
+            &[0xab],                   // stosd
+            &[0xf0, 0x0f, 0xc1, 0x08], // lock xadd [rax], ecx
+            &[0x0f, 0xb1, 0x08],       // cmpxchg [rax], ecx
+            &[0x0f, 0xc8],             // bswap eax
+            &[0x9f],                   // lahf
+            &[0x9e],                   // sahf
+            &[0xf8],                   // clc
+            &[0xfc],                   // cld
+            &[0x98],                   // cwde
+            &[0xdd, 0x00],             // fld qword [rax]
+            &[0xdd, 0x18],             // fstp qword [rax]
+            &[0xd8, 0xc1],             // fadd st0, st1
+            &[0xd9, 0x30],             // fnstenv [rax]
+        ];
+        let known: std::collections::HashSet<_> = scalar
+            .iter()
+            .flat_map(|bytes| lift(bytes).unwrap_or_else(|e| panic!("{bytes:02x?}: {e:?}")))
+            .map(|op| std::mem::discriminant(&op))
+            .collect();
+        let vector: &[&[u8]] = &[
+            &[0x0f, 0x28, 0xc1],                   // movaps xmm0, xmm1
+            &[0x0f, 0x28, 0x00],                   // movaps xmm0, [rax]
+            &[0x0f, 0x58, 0xc1],                   // addps xmm0, xmm1
+            &[0x66, 0x0f, 0xef, 0xc1],             // pxor xmm0, xmm1
+            &[0x66, 0x0f, 0x6e, 0xc0],             // movd xmm0, eax
+            &[0x66, 0x0f, 0xc4, 0xc0, 0x01],       // pinsrw xmm0, eax, 1
+            &[0x66, 0x0f, 0x70, 0xc1, 0x1b],       // pshufd xmm0, xmm1, 1bh
+            &[0xf2, 0x0f, 0x2a, 0xc0],             // cvtsi2sd xmm0, eax
+            &[0x66, 0x0f, 0x38, 0xdc, 0xc1],       // aesenc xmm0, xmm1
+            &[0x0f, 0xae, 0x08],                   // fxrstor [rax]
+            &[0x0f, 0xae, 0x28],                   // xrstor [rax]
+            &[0xc5, 0xf0, 0x58, 0xc2],             // vaddps xmm0, xmm1, xmm2
+            &[0xc5, 0xf4, 0x58, 0xc2],             // vaddps ymm0, ymm1, ymm2
+            &[0xc5, 0xfe, 0x6f, 0x00],             // vmovdqu ymm0, [rax]
+            &[0xc5, 0xf8, 0x77],                   // vzeroupper
+            &[0xc4, 0xe2, 0x7d, 0x58, 0xc1],       // vpbroadcastd ymm0, xmm1
+            &[0xc5, 0xf8, 0x92, 0xc8],             // kmovw k1, eax
+            &[0x62, 0xf1, 0x75, 0x48, 0xef, 0xc2], // vpxord zmm0, zmm1, zmm2
+        ];
+        for bytes in vector {
+            let ops = lift(bytes).unwrap_or_else(|e| panic!("{bytes:02x?}: {e:?}"));
+            let own: Vec<_> = ops
+                .iter()
+                .filter(|op| !known.contains(&std::mem::discriminant(*op)))
+                .collect();
+            assert!(
+                !own.is_empty(),
+                "{bytes:02x?} lifts to scalar ops only: {ops:?}"
+            );
+            for op in own {
+                assert!(!supported(op), "{bytes:02x?}: Machine admits {op:?}");
+            }
+        }
+    }
 
     /// The lane classes of one instruction's ops (`classify`), for the
     /// shapes the lifter gives register, load, store, read-modify-write,
