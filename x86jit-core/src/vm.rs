@@ -735,6 +735,10 @@ pub struct Vm {
     /// Test-only admission of compiled Machine blocks (decision-29 §9); `Off`
     /// in every production build.
     pub(crate) machine_jit: legacy::MachineJitMode,
+    /// Whether a Machine run may compile at all (decision-30 §2): a test
+    /// mode, or background tier-up. Kept by the setters of those settings,
+    /// so a run that cannot compile tests one byte (xj-to9.66).
+    pub(crate) machine_compile_requested: bool,
     /// Test-only: compiled Machine blocks return to the turn after every
     /// block (decision-31 §8, the chain-off reference).
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1192,6 +1196,13 @@ impl Vm {
     #[doc(hidden)]
     pub fn set_machine_jit_for_test(&mut self, mode: legacy::MachineJitMode) {
         self.machine_jit = mode;
+        self.refresh_machine_compile_requested();
+    }
+
+    /// Recompute `machine_compile_requested` after a setting it names changed.
+    fn refresh_machine_compile_requested(&mut self) {
+        self.machine_compile_requested = self.machine_jit != legacy::MachineJitMode::Off
+            || (self.tier_up_after.is_some() && self.tier_up_background);
     }
 
     /// Test-only (decision-31 §8): whether compiled Machine blocks chain to
@@ -1207,6 +1218,7 @@ impl Vm {
     /// `self` for builder-style setup.
     pub fn set_tier_up_after(&mut self, n: Option<u32>) {
         self.tier_up_after = n;
+        self.refresh_machine_compile_requested();
         // The backend tunes its codegen to this: with tier-up everything it compiles
         // has already proved hot. Reported here rather than read at compile time so a
         // JIT can bake it into an ISA it builds once.
@@ -1220,6 +1232,7 @@ impl Vm {
     /// compiler thread; on an `Unsupported` backend it degrades to inline tier-up.
     pub fn set_tier_up_background(&mut self, on: bool) {
         self.tier_up_background = on;
+        self.refresh_machine_compile_requested();
     }
 
     /// Set the adaptive region tier-up threshold T2: a hot loop tiers up to a
@@ -1486,6 +1499,7 @@ impl Vm {
             consistency: self.consistency,
             tier_up_after: self.tier_up_after,
             machine_jit: self.machine_jit,
+            machine_compile_requested: self.machine_compile_requested,
             #[cfg(any(test, feature = "test-hooks"))]
             machine_chain_off: self.machine_chain_off,
             tier_up_background: self.tier_up_background,
@@ -1536,6 +1550,7 @@ impl Vm {
     /// Assemble a fresh `Vm` around already-built guest memory — the shared body of the
     /// public constructors, holding the default tier-up policy and CPU features in one place.
     fn from_mem(mem: Memory, backend: Box<dyn Backend>, consistency: MemConsistency) -> Self {
+        let machine_jit = legacy::MachineJitMode::from_environment();
         Self {
             time_enabled: false,
             time_registry: Mutex::default(),
@@ -1556,7 +1571,9 @@ impl Vm {
             backend,
             consistency,
             tier_up_after: None,
-            machine_jit: legacy::MachineJitMode::from_environment(),
+            machine_jit,
+            // No tier-up yet: only a test mode compiles.
+            machine_compile_requested: machine_jit != legacy::MachineJitMode::Off,
             #[cfg(any(test, feature = "test-hooks"))]
             machine_chain_off: false,
             tier_up_background: false,

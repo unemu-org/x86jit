@@ -2812,15 +2812,11 @@ impl Vcpu {
         Ok(context)
     }
 
+    // An exhausted budget with no retry, task switch or A20 change pending
+    // has nothing to finish: tested at the run's return, the rest out of
+    // line (xj-to9.66).
+    #[inline(always)]
     pub(super) fn finish_machine_run(&mut self, result: &mut StepRun) {
-        if let StepStop::Exit(Exit::Device(crate::DeviceStop::Fault { .. })) = &result.stop {
-            let mut underlying = StepRun {
-                steps: result.steps,
-                stop: StepStop::Exit(self.device_request().expect("fault request").handoff()),
-            };
-            self.finish_machine_run(&mut underlying);
-            return;
-        }
         if matches!(result.stop, StepStop::Exit(Exit::BudgetExhausted))
             && !self.cpu.mmio_retry_active
         {
@@ -2831,6 +2827,20 @@ impl Vcpu {
             {
                 return;
             }
+        }
+        self.finish_machine_exit(result);
+    }
+
+    // `finish_machine_run` past its fast return.
+    #[inline(never)]
+    fn finish_machine_exit(&mut self, result: &mut StepRun) {
+        if let StepStop::Exit(Exit::Device(crate::DeviceStop::Fault { .. })) = &result.stop {
+            let mut underlying = StepRun {
+                steps: result.steps,
+                stop: StepStop::Exit(self.device_request().expect("fault request").handoff()),
+            };
+            self.finish_machine_run(&mut underlying);
+            return;
         }
         if matches!(
             result.stop,
@@ -3593,19 +3603,6 @@ impl Vcpu {
         } else {
             None
         };
-        // Decision-30 §2: compiled Flat32 blocks, in production or under a
-        // test-only mode. Off, this costs two tests per run.
-        let machine_compile = KIND == MACHINE_DISPATCH
-            && (vm.tier_up_after.is_some() || vm.machine_jit != compiled::MachineJitMode::Off)
-            && compiled::compiles(vm);
-        if machine_compile {
-            // Decision-29: compiled Machine units live in the VM's code lifetime.
-            self.legacy_execution
-                .as_mut()
-                .unwrap()
-                .machine_jit
-                .begin_run(vm.cache.code_lifetime(), vm.mem.mapping_identity());
-        }
         let mxcsr_mode = if DEFAULT { 0 } else { self.fast_mxcsr_mode };
         let mut shared_reason = origin;
         let mut blocks_run: u64 = 0;
@@ -3619,20 +3616,11 @@ impl Vcpu {
         if KIND == MACHINE_DISPATCH {
             // Compiled Machine stores test it (decision-29 §4, access helper).
             ctx.dispatch_word_ptr = exit_word as *const AtomicU64 as u64;
-            if machine_compile {
-                // Decision-30 §4: compiled loads and stores probe the view
-                // (Machine code has no shadow return stack).
-                ctx.ret_stack = std::ptr::from_ref::<crate::jit_abi::machine::MachineTlb>(
-                    &self
-                        .legacy_execution
-                        .as_ref()
-                        .unwrap()
-                        .machine_jit
-                        .compiling
-                        .as_deref()
-                        .unwrap()
-                        .tlb,
-                ) as u64;
+            // Decision-30 §2: compiled Flat32 blocks, in production or under
+            // a test-only mode. A VM configured for neither tests one byte
+            // per run; the rest is out of line (xj-to9.66).
+            if vm.machine_compile_requested {
+                ctx.ret_stack = self.begin_machine_compile(vm);
             }
         }
         if KIND == APPLICATION_DISPATCH {
@@ -4029,32 +4017,12 @@ impl Vcpu {
                 let dirty = exit_word.load(Ordering::Relaxed) & crate::memory::DISPATCH_DIRTY != 0;
                 let dropped = dirty.then(|| vm.cache.invalidated_blocks());
                 vm.handle_smc(exit_word);
+                let dropped = dropped.is_some_and(|before| before != vm.cache.invalidated_blocks());
+                if KIND == MACHINE_DISPATCH && dropped && ctx.ret_stack != 0 && !direct {
+                    self.note_machine_code_drop(context.paging_enabled, physical_mask);
+                }
                 let execution = self.legacy_execution.as_mut().unwrap();
-                if dropped.is_some_and(|before| before != vm.cache.invalidated_blocks()) {
-                    if KIND == MACHINE_DISPATCH && ctx.ret_stack != 0 && !direct {
-                        // Decision-27 §2.5: shared units dropped by a code write.
-                        // The page the compiled key names: a Flat32 EIP
-                        // through the bus mask, or with paging through the
-                        // TLB entry its fetch used (`compiled::block_bus`).
-                        let eip = self.cpu.rip & 0xffff_ffff;
-                        let fetched = if context.paging_enabled {
-                            execution.paging.as_deref().and_then(|state| {
-                                crate::interp::legacy::paging::fetched_bus(
-                                    &self.cpu,
-                                    &state.tlb.borrow(),
-                                    eip as u32,
-                                )
-                            })
-                        } else {
-                            Some(crate::legacy::physical_span(&self.cpu, physical_mask, eip, 1).0)
-                        };
-                        if let Some(fetched) = fetched {
-                            execution.machine_jit.note_code_drop(
-                                fetched >> crate::memory::CODE_PAGE_BITS,
-                                self.retired,
-                            );
-                        }
-                    }
+                if dropped {
                     if let Some(last) = execution.last_direct_fetch {
                         // This bounded page hint is only a lowering choice. Precise
                         // source invalidation and byte revalidation remain authoritative.

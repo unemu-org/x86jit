@@ -614,9 +614,7 @@ pub(super) fn production(vm: &Vm) -> bool {
 
 /// Whether this run of a Machine VM compiles: in production, or under a test
 /// mode. Scripted units run no generated code, so they need no admission.
-#[cold]
-#[inline(never)]
-pub(super) fn compiles(vm: &Vm) -> bool {
+fn compiles(vm: &Vm) -> bool {
     production(vm)
         || match vm.machine_jit {
             MachineJitMode::Off => false,
@@ -809,6 +807,53 @@ pub(super) fn drain(vm: &Vm, exit_word: &AtomicU64, sections: &AtomicU64) -> u64
 }
 
 impl Vcpu {
+    /// Run entry of a Machine run on a VM that requests compilation
+    /// (`Vm::machine_compile_requested`): whether this run compiles
+    /// ([`compiles`]), and if so `State::begin_run` (decision-29: compiled
+    /// units live in the VM's code lifetime). Returns the compiled TLB view
+    /// that `MemCtx::ret_stack` holds for compiled loads and stores
+    /// (decision-30 §4; Machine code has no shadow return stack), or 0 when
+    /// this run does not compile.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn begin_machine_compile(&mut self, vm: &Vm) -> u64 {
+        if !compiles(vm) {
+            return 0;
+        }
+        let state = &mut self.legacy_execution.as_mut().unwrap().machine_jit;
+        state.begin_run(vm.cache.code_lifetime(), vm.mem.mapping_identity());
+        std::ptr::from_ref::<crate::jit_abi::machine::MachineTlb>(
+            &state.compiling.as_deref().unwrap().tlb,
+        ) as u64
+    }
+
+    /// Decision-27 §2.5: a drained code write dropped shared units while this
+    /// vCPU ran a compiling turn at its EIP. Notes the page the compiled key
+    /// names: the Flat32 EIP through the bus mask, or with paging through the
+    /// TLB entry its fetch used ([`block_bus`]).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_machine_code_drop(&mut self, paging_enabled: bool, physical_mask: u32) {
+        let execution = self.legacy_execution.as_mut().unwrap();
+        let eip = self.cpu.rip & 0xffff_ffff;
+        let fetched = if paging_enabled {
+            execution.paging.as_deref().and_then(|state| {
+                crate::interp::legacy::paging::fetched_bus(
+                    &self.cpu,
+                    &state.tlb.borrow(),
+                    eip as u32,
+                )
+            })
+        } else {
+            Some(crate::legacy::physical_span(&self.cpu, physical_mask, eip, 1).0)
+        };
+        if let Some(fetched) = fetched {
+            execution
+                .machine_jit
+                .note_code_drop(fetched >> crate::memory::CODE_PAGE_BITS, self.retired);
+        }
+    }
+
     /// The compiled-Machine counters of this vCPU since it was created.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
