@@ -46,6 +46,8 @@ const KERNEL: u64 = 0x10000;
 const AFTER_USER: u64 = 0x11000;
 const AFTER_V86: u64 = 0x11800;
 const KSUB: u64 = 0x12000;
+/// The routines of [`shapes_loop`] at `ROUTINE` and `ROUTINE + 100h`.
+const ROUTINE: u64 = 0x14000;
 /// `cli; inc eax; sti; ret` and `pushfd; cli; inc [6018h]; popfd; ret`:
 /// returns in the STI shadow and right after POPFD sets IF.
 const WINDOWS: u64 = 0x13000;
@@ -247,6 +249,91 @@ fn kernel_loop(a: &mut CodeAssembler) {
     a.push(0x1b).unwrap();
     a.push(USER_CODE as u32).unwrap();
     a.iretd().unwrap();
+}
+
+/// Two near-twin ring-0 routines: PUSHAD, a flag word tested and changed by
+/// BTR (BTS), a structure read through it, LIDT, two backward REP MOVSD
+/// after STD, CLD, a read-modify-write, POPAD, RET.
+fn routine(a: &mut CodeAssembler, twin: bool) {
+    let mut out = a.create_label();
+    a.pushad().unwrap();
+    a.mov(ebx, dword_ptr(DATA + 0x40)).unwrap();
+    if twin {
+        a.bts(dword_ptr(ebx), 5).unwrap();
+        a.jb(out).unwrap();
+    } else {
+        a.btr(dword_ptr(ebx), 3).unwrap();
+        a.jae(out).unwrap();
+    }
+    a.mov(edi, dword_ptr(DATA + 0x44)).unwrap();
+    if twin {
+        a.or(byte_ptr(edi + 8), 1).unwrap();
+    } else {
+        a.and(byte_ptr(edi + 8), 0xfe).unwrap();
+    }
+    a.mov(ebp, dword_ptr(ebx + 4)).unwrap();
+    a.mov(eax, dword_ptr(ebp + 8)).unwrap();
+    a.lidt(dword_ptr(DATA + 0x50)).unwrap();
+    a.std().unwrap();
+    a.lea(esi, dword_ptr(ebp + 0x7c)).unwrap();
+    a.lea(edi, dword_ptr(esi + 0x60)).unwrap();
+    a.mov(ecx, 18u32).unwrap();
+    a.rep().movsd().unwrap();
+    a.lea(esi, dword_ptr(ebp + 0x180)).unwrap();
+    a.mov(ecx, 9u32).unwrap();
+    a.rep().movsd().unwrap();
+    a.cld().unwrap();
+    a.and(eax, 0xffff_00ffu32 as i32).unwrap();
+    a.or(eax, 0x100).unwrap();
+    a.mov(dword_ptr(ebp + 8), eax).unwrap();
+    if twin {
+        a.sub(dword_ptr(DATA + 0x60), 1).unwrap();
+    } else {
+        a.add(dword_ptr(DATA + 0x60), 1).unwrap();
+    }
+    a.set_label(&mut out).unwrap();
+    a.popad().unwrap();
+    a.ret().unwrap();
+}
+
+/// The routines' caller, and short blocks that switch stacks with XCHG ESP:
+/// a compare and branch, a STI window, an indirect jump.
+fn shapes_loop(a: &mut CodeAssembler) {
+    let mut top = a.create_label();
+    let mut equal = a.create_label();
+    let mut joined = a.create_label();
+    let mut below = a.create_label();
+    a.cli().unwrap();
+    a.set_label(&mut top).unwrap();
+    a.inc(dword_ptr(DATA)).unwrap();
+    a.xor(dword_ptr(DATA + 0x200), 0x28).unwrap();
+    a.call(HIGH + ROUTINE).unwrap();
+    a.call(HIGH + ROUTINE + 0x100).unwrap();
+    a.mov(eax, dword_ptr(DATA)).unwrap();
+    a.and(eax, 7).unwrap();
+    a.xchg(dword_ptr(DATA + 0x30), esp).unwrap();
+    a.cmp(eax, 5).unwrap();
+    a.je(equal).unwrap();
+    a.mov(ebp, esp).unwrap();
+    a.movzx(ecx, byte_ptr(ebp - 4)).unwrap();
+    a.jmp(joined).unwrap();
+    a.set_label(&mut equal).unwrap();
+    a.inc(ecx).unwrap();
+    a.set_label(&mut joined).unwrap();
+    a.xchg(dword_ptr(DATA + 0x30), esp).unwrap();
+    a.mov(edx, esp).unwrap();
+    a.xchg(esp, edx).unwrap();
+    a.sti().unwrap();
+    a.push(eax).unwrap();
+    a.cmp(ecx, 3).unwrap();
+    a.jb(below).unwrap();
+    a.mov(ebx, dword_ptr(esp)).unwrap();
+    a.set_label(&mut below).unwrap();
+    a.pop(eax).unwrap();
+    a.cli().unwrap();
+    // An indirect jump to `ROUTINE + 200h: jmp top`.
+    a.mov(eax, (HIGH + ROUTINE + 0x200) as u32).unwrap();
+    a.jmp(eax).unwrap();
 }
 
 /// After INT 80h: to the V86 task through IRETD (SDM Vol 3B §20.3: GS, FS,
@@ -456,7 +543,30 @@ fn build(subject: Subject) -> (Vm, Vcpu) {
     put(TSS + 4, &(HIGH as u32 + STACK_TOP).to_le_bytes());
     put(TSS + 8, &0x10u32.to_le_bytes());
     put(TSS + 0x66, &0x68u16.to_le_bytes());
-    put(KERNEL, &asm32(HIGH + KERNEL, kernel_loop));
+    if SHAPES.with(std::cell::Cell::get) {
+        put(KERNEL, &asm32(HIGH + KERNEL, shapes_loop));
+        put(ROUTINE, &asm32(HIGH + ROUTINE, |a| routine(a, false)));
+        put(
+            ROUTINE + 0x100,
+            &asm32(HIGH + ROUTINE + 0x100, |a| routine(a, true)),
+        );
+        put(
+            ROUTINE + 0x200,
+            &asm32(HIGH + ROUTINE + 0x200, |a| {
+                a.jmp(HIGH + KERNEL + 1).unwrap();
+            }),
+        );
+        // The routines' data: flag words, a structure, an IDT image, an
+        // alternate stack (`shapes_loop`).
+        put(DATA + 0x40, &(DATA as u32 + 0x200).to_le_bytes());
+        put(DATA + 0x44, &(DATA as u32 + 0x300).to_le_bytes());
+        put(DATA + 0x204, &(HIGH as u32 + 0x7000).to_le_bytes());
+        put(DATA + 0x50, &0x7ffu16.to_le_bytes());
+        put(DATA + 0x52, &(IDT as u32).to_le_bytes());
+        put(DATA + 0x30, &(HIGH as u32 + 0xd000).to_le_bytes());
+    } else {
+        put(KERNEL, &asm32(HIGH + KERNEL, kernel_loop));
+    }
     put(AFTER_USER, &asm32(HIGH + AFTER_USER, after_user));
     put(AFTER_V86, &asm32(HIGH + AFTER_V86, after_v86));
     put(KSUB, &asm32(HIGH + KSUB, ksub));
@@ -568,6 +678,9 @@ fn build(subject: Subject) -> (Vm, Vcpu) {
     // IOPL 3 in ring 0, as some protected-mode operating systems run.
     cpu.cpu.rflags_system |= 0x3000;
     cpu.set_a20_enabled(true);
+    if DELIVERY_LOG.with(std::cell::Cell::get) {
+        cpu.enable_delivery_log(64).unwrap();
+    }
     (vm, cpu)
 }
 
@@ -586,6 +699,10 @@ fn hash(vm: &Vm) -> u64 {
 thread_local! {
     /// Whether [`run_with`] serves the device in process.
     static DEVICES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether [`build`] runs [`shapes_loop`] instead of [`kernel_loop`].
+    static SHAPES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether [`build`] enables the delivery log (spec.md §17.10).
+    static DELIVERY_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The in-process device: reads answer from the request's address and
@@ -751,7 +868,8 @@ fn run_with(
     let word = |at: usize| u32::from_le_bytes(vars[at..at + 4].try_into().unwrap());
     // The guest went round: ring 3, V86, timer ticks and demand faults.
     assert!(
-        word(0x20) > 0 && word(0x24) > 0 && word(0x100) > 0 && word(0x104) > 0,
+        SHAPES.with(std::cell::Cell::get)
+            || (word(0x20) > 0 && word(0x24) > 0 && word(0x100) > 0 && word(0x104) > 0),
         "{what}: iterations {} int80 {} int81 {} ticks {} faults {}",
         word(0),
         word(0x20),
@@ -967,4 +1085,46 @@ fn an_operating_system_with_in_process_devices_equals_the_interpreter() {
         );
     }
     DEVICES.with(|d| d.set(false));
+}
+
+/// With the delivery log on, compiled blocks take the cold epilogue: no
+/// chains, and every completion goes through the outcome arm.
+#[test]
+fn an_operating_system_with_the_delivery_log_equals_the_interpreter() {
+    DELIVERY_LOG.with(|d| d.set(true));
+    const MIX: [u64; 7] = [10_000, 997, 65_536, 97, 7, 4093, 1];
+    for subject in SUBJECTS {
+        let what = format!("{subject:?} delivery log");
+        run(subject, &mut |i| MIX[i % MIX.len()], 300_000, 2003, &what);
+    }
+    DELIVERY_LOG.with(|d| d.set(false));
+}
+
+fn run_shapes(subject: Subject, budgets: &mut dyn FnMut(usize) -> u64, total: u64, what: &str) {
+    let c = run(subject, budgets, total, 3001, what);
+    if subject == Subject::Mode(MachineJitMode::Forced) {
+        assert!(
+            c.compiled_retired > 0 && c.paged_entries > 0,
+            "{what}: {c:?}"
+        );
+    }
+}
+
+/// The shapes an embedder's operating system accrued phantom counts in:
+/// PUSHAD ... LIDT, STD, backward REP MOVSD, CLD ... POPAD, RET twins, and
+/// XCHG ESP blocks around a compare, a STI window and an indirect jump,
+/// with the delivery log off and on.
+#[test]
+fn routine_shapes_equal_the_interpreter() {
+    SHAPES.with(|d| d.set(true));
+    const MIX: [u64; 7] = [10_000, 997, 65_536, 97, 7, 4093, 1];
+    for log in [false, true] {
+        DELIVERY_LOG.with(|d| d.set(log));
+        for subject in SUBJECTS {
+            let what = format!("{subject:?} shapes log={log}");
+            run_shapes(subject, &mut |i| MIX[i % MIX.len()], 200_000, &what);
+        }
+    }
+    DELIVERY_LOG.with(|d| d.set(false));
+    SHAPES.with(|d| d.set(false));
 }

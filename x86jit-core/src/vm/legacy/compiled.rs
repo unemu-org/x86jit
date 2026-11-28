@@ -1505,6 +1505,11 @@ impl Vcpu {
             let chain_edge = edge_key(chain_flags, ir.guest_start, slot.bus);
             loop {
                 let completed = cur.map_or(n, |t| u64::from(t.icount));
+                debug_assert!(
+                    static_successor(cur.map_or(&**ir, |t| &*t.ir), self.cpu.rip),
+                    "a chained block completed at {:#x}, no successor of its block",
+                    self.cpu.rip
+                );
                 // SAFETY: a filled Machine slot holds a `MachineTarget`,
                 // published with Release and loaded with acquire; this vCPU
                 // has participated in `epoch` since before that load, so the
@@ -1535,6 +1540,7 @@ impl Vcpu {
                     census(counters, reason);
                     break;
                 }
+                debug_assert_eq!(self.cpu.rip, t.ir.guest_start, "a chained block's entry");
                 #[cfg(any(test, feature = "test-hooks"))]
                 {
                     counters.continues += 1;
@@ -1699,6 +1705,12 @@ impl Vcpu {
             .counters();
         match code {
             RET_CONTINUE | RET_CHAIN | RET_LINK | RET_RETURN_MISS => {
+                debug_assert!(
+                    static_successor(ir, self.cpu.rip),
+                    "a completed block left RIP at {:#x}, no successor of {:#x}",
+                    self.cpu.rip,
+                    ir.guest_start
+                );
                 #[cfg(any(test, feature = "test-hooks"))]
                 {
                     counters.continues += 1;
@@ -1718,6 +1730,11 @@ impl Vcpu {
                 }
             }
             RET_MACHINE_STOP => {
+                debug_assert_eq!(
+                    self.cpu.rip,
+                    instruction_addr(ir, ordinal),
+                    "a STOP leaves RIP at its ordinal's instruction"
+                );
                 counters.stops += 1;
                 counters.compiled_retired += ordinal;
                 census(counters, CHAIN_END_STOP);
@@ -1787,6 +1804,19 @@ impl Vcpu {
                 from,
             )
         };
+        // Ordinary blocks hold no string instruction: every step the suffix
+        // took retired one, and RIP stands where the merged count says.
+        debug_assert_eq!(
+            suffix.steps, suffix.retired,
+            "a suffix step that retired nothing"
+        );
+        debug_assert!(
+            c + suffix.retired >= u64::from(ir.icount)
+                || self.cpu.rip == instruction_addr(ir, c + suffix.retired),
+            "a suffix stopped at {:#x} after {} instructions",
+            self.cpu.rip,
+            c + suffix.retired
+        );
         let execution = self.legacy_execution.as_mut().unwrap();
         let counters = execution.machine_jit.counters();
         counters.compiled_retired += c;
@@ -2085,5 +2115,42 @@ fn tier_up(
         slot.hot = 0;
         slot.request = Request::Waiting(seen);
         None
+    }
+}
+
+/// The address of instruction `ordinal` of `ir` (its `InsnStart`).
+fn instruction_addr(ir: &IrBlock, ordinal: u64) -> u64 {
+    match ir.ops[machine_jit::instruction_op(ir, ordinal)] {
+        IrOp::InsnStart { guest_addr } => guest_addr,
+        _ => unreachable!("an instruction marker"),
+    }
+}
+
+/// Whether `rip` is where a block that completed may leave it: a static
+/// target of its last transfer, its end after a fall-through, or anywhere
+/// after an indirect one. A count charged for a block that stopped short
+/// would leave RIP inside it (xj-to9.80).
+fn static_successor(ir: &IrBlock, rip: u64) -> bool {
+    use crate::legacy::LegacyOp;
+    let last = ir
+        .ops
+        .iter()
+        .rev()
+        .find(|op| !matches!(op, IrOp::Legacy(LegacyOp::SharedWalk)));
+    match last {
+        Some(IrOp::Branch {
+            taken, fallthrough, ..
+        })
+        | Some(IrOp::LoopCx {
+            taken, fallthrough, ..
+        }) => rip == *taken || rip == *fallthrough,
+        Some(IrOp::Legacy(LegacyOp::Loop { taken, next, .. })) => {
+            rip == u64::from(*taken) || rip == u64::from(*next)
+        }
+        Some(IrOp::Jump {
+            target: crate::ir::Val::Imm(target),
+        }) => rip == *target,
+        Some(IrOp::Jump { .. }) => true,
+        _ => rip == ir.guest_start + u64::from(ir.guest_len),
     }
 }
